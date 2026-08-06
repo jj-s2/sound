@@ -172,6 +172,18 @@ class FiLMCRNExtractor(nn.Module):
         Hidden size of the bottleneck GRU.
     gru_layers
         Number of stacked GRU layers.
+    with_presence
+        When ``True`` an enrollment-conditioned presence head is added. It
+        pools the FiLM-modulated GRU output over time, concatenates the
+        enrollment embedding, and predicts a single presence logit (target
+        speaker present in the mixture). The head is trained jointly with the
+        reconstruction objective (BCE on target-present/absent rows) so the
+        reject score is calibrated against the *enhanced* representation. When
+        ``False`` (default) the model is identical to the original extractor and
+        old checkpoints continue to load with ``strict=True``.
+
+    The presence head is deliberately a light MLP on the bottleneck so no extra
+    frozen encoder forward is required at train or inference time.
     """
 
     def __init__(
@@ -184,6 +196,7 @@ class FiLMCRNExtractor(nn.Module):
         win_length: int | None = None,
         gru_hidden: int = 256,
         gru_layers: int = 2,
+        with_presence: bool = False,
     ) -> None:
         super().__init__()
         self.embedding_dim = embedding_dim
@@ -192,6 +205,7 @@ class FiLMCRNExtractor(nn.Module):
         self.hop_length = hop_length
         self.win_length = win_length if win_length is not None else n_fft
         self.gru_hidden = gru_hidden
+        self.with_presence = bool(with_presence)
 
         # --- Compute bottleneck frequency dimension -----------------------
         kernel_f, pad_f, stride_f = 5, 2, 2
@@ -245,10 +259,25 @@ class FiLMCRNExtractor(nn.Module):
             else:
                 self.decoder_c.append(None)  # type: ignore[arg-type]
 
+        # --- Presence head (optional, R6) -------------------------------------
+        # Pools the FiLM-modulated GRU output over time and concatenates the raw
+        # enrollment embedding so the head sees both the mixture evidence
+        # (modulated by enrollment) and the enrollment identity itself.
+        if self.with_presence:
+            self.presence_head = nn.Sequential(
+                nn.Linear(gru_hidden + embedding_dim, gru_hidden),
+                nn.GELU(),
+                nn.Linear(gru_hidden, 1),
+            )
+
     def forward(
-        self, complex_spec: torch.Tensor, enrollment_embedding: torch.Tensor
-    ) -> torch.Tensor:
-        """Predict a complex ratio mask.
+        self,
+        complex_spec: torch.Tensor,
+        enrollment_embedding: torch.Tensor,
+        *,
+        return_presence: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Predict a complex ratio mask (and optionally a presence logit).
 
         Parameters
         ----------
@@ -256,11 +285,20 @@ class FiLMCRNExtractor(nn.Module):
             Complex spectrogram ``[batch, freq, frames]``.
         enrollment_embedding
             Real tensor ``[batch, embedding_dim]``.
+        return_presence
+            When ``True`` (requires ``with_presence``) also return the presence
+            logit ``[batch, 1]`` computed from the FiLM-modulated bottleneck.
 
         Returns
         -------
-        Complex mask ``[batch, freq, frames]`` (``tanh``-bounded).
+        Complex mask ``[batch, freq, frames]`` (``tanh``-bounded), or
+        ``(mask, presence_logit)`` when ``return_presence`` is set.
         """
+        if return_presence and not self.with_presence:
+            raise ValueError(
+                "return_presence=True requires the model to be built with "
+                "with_presence=True"
+            )
         # Stack real/imag as input channels: [batch, 2, freq, frames]
         x = torch.stack([complex_spec.real, complex_spec.imag], dim=1)
 
@@ -280,7 +318,15 @@ class FiLMCRNExtractor(nn.Module):
         # FiLM conditioning from enrollment embedding
         gamma = self.film_gamma(enrollment_embedding)  # [batch, gru_hidden]
         beta = self.film_beta(enrollment_embedding)  # [batch, gru_hidden]
-        x = gamma.unsqueeze(1) * gru_out + beta.unsqueeze(1)  # [batch, T, gru_hidden]
+        film_out = gamma.unsqueeze(1) * gru_out + beta.unsqueeze(1)  # [batch, T, gru_hidden]
+        x = film_out
+
+        # Presence logit from the pooled FiLM-GRU output + enrollment identity.
+        presence_logit = None
+        if return_presence:
+            pooled = film_out.mean(dim=1)  # [batch, gru_hidden]
+            presence_input = torch.cat([pooled, enrollment_embedding], dim=-1)
+            presence_logit = self.presence_head(presence_input)  # [batch, 1]
 
         # Project back to bottleneck dimension and reshape
         x = self.proj(x)  # [batch, T, C*F]
@@ -296,7 +342,10 @@ class FiLMCRNExtractor(nn.Module):
 
         # x: [batch, 2, freq, frames] -> bounded complex mask
         mask = torch.tanh(x)
-        return torch.complex(mask[:, 0], mask[:, 1])
+        mask = torch.complex(mask[:, 0], mask[:, 1])
+        if return_presence:
+            return mask, presence_logit
+        return mask
 
 
 # ---------------------------------------------------------------------------
@@ -350,6 +399,54 @@ def enhance_waveform(
         win_length=model.win_length,
         length=length,
     )
+
+
+def enhance_waveform_with_presence(
+    model: FiLMCRNExtractor,
+    waveform: torch.Tensor,
+    enrollment_embedding: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Enhance a mixture and return the calibrated presence logit.
+
+    Mirrors :func:`enhance_waveform` but asks the model for its presence logit
+    so inference can emit a reject score consistent with the enhanced path. The
+    logit is returned raw (caller applies ``sigmoid`` to get a probability).
+
+    Raises
+    ------
+    ValueError
+        If the model was not built with ``with_presence=True``.
+    """
+    if not getattr(model, "with_presence", False):
+        raise ValueError("enhance_waveform_with_presence requires with_presence=True")
+    if waveform.ndim != 2:
+        raise ValueError(f"waveform must be 2-D [batch, samples], got shape {waveform.shape}")
+    if enrollment_embedding.ndim != 2:
+        raise ValueError(
+            f"enrollment_embedding must be 2-D [batch, dim], got shape {enrollment_embedding.shape}"
+        )
+    if waveform.shape[0] != enrollment_embedding.shape[0]:
+        raise ValueError(
+            f"batch mismatch: waveform {waveform.shape[0]} vs embedding {enrollment_embedding.shape[0]}"
+        )
+
+    length = waveform.shape[-1]
+    spec = stft_waveform(
+        waveform,
+        n_fft=model.n_fft,
+        hop_length=model.hop_length,
+        win_length=model.win_length,
+    )
+    mask, presence_logit = model(spec, enrollment_embedding, return_presence=True)
+    enhanced_spec = mask * spec
+    enhanced = istft_waveform(
+        enhanced_spec,
+        n_fft=model.n_fft,
+        hop_length=model.hop_length,
+        win_length=model.win_length,
+        length=length,
+    )
+    return enhanced, presence_logit
 
 
 # ---------------------------------------------------------------------------

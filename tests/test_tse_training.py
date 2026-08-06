@@ -20,14 +20,22 @@ import torch
 
 from scripts.train_tse import (
     TSEDataset,
+    TSEJointDataset,
+    assert_class_balance,
+    calibrate_presence_threshold,
     check_audio,
     composite_loss,
     crop_pair,
     evaluate,
+    evaluate_joint,
+    joint_loss,
     load_positive_rows,
+    load_training_rows,
     manifest_digest,
+    presence_bce_loss,
     run_training,
     train_step,
+    train_step_joint,
 )
 from xh202615.target_extractor import FiLMCRNExtractor, stft_waveform
 from xh202615.training_data import TrainingManifestRow
@@ -511,6 +519,275 @@ class RunTrainingMetadataTests(unittest.TestCase):
                     reuse_cache=False,
                     embedding_provider=_mock_provider(dim=8),
                 )
+
+
+# ---------------------------------------------------------------------------
+# R6 joint presence objective: negative rows, class balance, calibration,
+# joint train/eval, checkpoint metadata, malformed rows, cache reuse.
+# ---------------------------------------------------------------------------
+
+class LoadTrainingRowsTests(unittest.TestCase):
+    def test_returns_present_and_absent_rows(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            dataset_a = tmp / "datasetA_root"
+            dataset_a.mkdir()
+            manifest, _ = _write_fixture(tmp)  # 2 pos + 1 neg per split
+            rows = load_training_rows(manifest, dataset_a)
+            self.assertEqual(len(rows), 9)
+            present = sum(1 for r in rows if r.target_present)
+            absent = sum(1 for r in rows if not r.target_present)
+            self.assertEqual(present, 6)
+            self.assertEqual(absent, 3)
+
+    def test_absent_row_with_text_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            dataset_a = tmp / "datasetA_root"
+            dataset_a.mkdir()
+            manifest, _ = _write_fixture(tmp)
+            # Corrupt a negative row by giving it a text (forbidden: text must
+            # be null when target_present is false).
+            lines = [json.loads(l) for l in manifest.read_text(encoding="utf-8").splitlines() if l.strip()]
+            for row in lines:
+                if not row["target_present"]:
+                    row["text"] = "不应存在的文本"
+            manifest.write_text(
+                "\n".join(json.dumps(r, ensure_ascii=False, sort_keys=True) for r in lines) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "target_absent_text|validation failed"):
+                load_training_rows(manifest, dataset_a)
+
+
+class ClassBalanceTests(unittest.TestCase):
+    def test_balanced_passes(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest, _ = _write_fixture(tmp)
+            rows = load_training_rows(manifest, tmp / "da_root")
+            counts = assert_class_balance(rows)
+            for split in ("train", "val", "test"):
+                self.assertGreater(counts[split]["present"], 0)
+                self.assertGreater(counts[split]["absent"], 0)
+
+    def test_imbalanced_split_fails(self):
+        rows = [
+            TrainingManifestRow(
+                row_id="train-pos", split="train", source="t",
+                enrollment_audio=Path("a"), target_audio=Path("b"), mixture_audio=Path("c"),
+                target_speaker_id="S1", interferer_speaker_id="I1", target_present=True,
+                overlap_ratio=0.5, snr_db=5.0, sir_db=0.0, text=None, seed=1,
+            ),
+            TrainingManifestRow(
+                row_id="val-pos", split="val", source="t",
+                enrollment_audio=Path("a"), target_audio=Path("b"), mixture_audio=Path("c"),
+                target_speaker_id="S2", interferer_speaker_id="I2", target_present=True,
+                overlap_ratio=0.5, snr_db=5.0, sir_db=0.0, text=None, seed=1,
+            ),
+        ]
+        with self.assertRaisesRegex(ValueError, "class-imbalanced"):
+            assert_class_balance(rows)
+
+
+class CalibratePresenceThresholdTests(unittest.TestCase):
+    def test_perfect_separation(self):
+        scores = np.array([0.1, 0.2, 0.8, 0.9])
+        labels = np.array([0.0, 0.0, 1.0, 1.0])
+        cal = calibrate_presence_threshold(scores, labels)
+        self.assertAlmostEqual(cal["auc"], 1.0, places=6)
+        self.assertGreater(cal["threshold"], 0.2)
+        self.assertLessEqual(cal["threshold"], 0.8)
+        self.assertEqual(cal["rr_at_threshold"], 1.0)
+        self.assertEqual(cal["false_accept_rate"], 0.0)
+
+    def test_single_class_raises(self):
+        with self.assertRaisesRegex(ValueError, "cannot calibrate"):
+            calibrate_presence_threshold(np.array([0.1, 0.2]), np.array([1.0, 1.0]))
+
+    def test_auc_random_is_half(self):
+        # Scores uncorrelated with labels -> AUC ~ 0.5 (exact for this tie set).
+        scores = np.array([0.1, 0.2, 0.1, 0.2])
+        labels = np.array([0.0, 1.0, 1.0, 0.0])
+        cal = calibrate_presence_threshold(scores, labels)
+        self.assertAlmostEqual(cal["auc"], 0.5, places=6)
+
+
+class PresenceBceLossTests(unittest.TestCase):
+    def test_finite_and_differentiable(self):
+        logit = torch.randn(4, 1, requires_grad=True)
+        labels = torch.tensor([1.0, 0.0, 1.0, 0.0])
+        loss = presence_bce_loss(logit, labels)
+        self.assertEqual(loss.ndim, 0)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertIsNotNone(logit.grad)
+        self.assertTrue(torch.isfinite(logit.grad).all())
+
+
+class JointTrainStepTests(unittest.TestCase):
+    def test_cpu_step_finite_and_produces_gradients(self):
+        torch.manual_seed(0)
+        model = FiLMCRNExtractor(
+            embedding_dim=8, channels=(4, 8), n_fft=512, hop_length=128,
+            win_length=None, gru_hidden=8, gru_layers=1, with_presence=True,
+        )
+        model.train()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+        mixture = torch.randn(4, 8000)
+        target = torch.randn(4, 8000)
+        embedding = torch.randn(4, 8)
+        # 2 present, 2 absent.
+        labels = torch.tensor([1.0, 1.0, 0.0, 0.0])
+        loss_value, components = train_step_joint(
+            model, optimizer, mixture, target, embedding, labels,
+            use_amp=False, scaler=None, grad_clip=5.0,
+            stft_weight=1.0, si_sdr_weight=1.0, presence_weight=1.0,
+        )
+        self.assertIsNotNone(loss_value)
+        self.assertTrue(np.isfinite(loss_value))
+        self.assertIn("recon", components)
+        self.assertIn("presence", components)
+        has_grad = any(
+            p.grad is not None and p.grad.abs().sum().item() > 0
+            for p in model.parameters()
+        )
+        self.assertTrue(has_grad, "no parameter received a non-zero gradient")
+
+
+class JointEvaluateTests(unittest.TestCase):
+    def test_returns_recon_and_presence_metrics(self):
+        torch.manual_seed(0)
+        model = FiLMCRNExtractor(
+            embedding_dim=8, channels=(4, 8), n_fft=512, hop_length=128,
+            win_length=None, gru_hidden=8, gru_layers=1, with_presence=True,
+        )
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest, _ = _write_fixture(tmp)
+            from xh202615.training_data import read_training_manifest
+
+            rows = tuple(r for r in read_training_manifest(manifest) if r.split == "train")
+            embeddings = {str(r.enrollment_audio): np.zeros(8, dtype=np.float32) for r in rows}
+            dataset = TSEJointDataset(rows, embeddings, 8000, seed=1, epoch=0)
+            metrics = evaluate_joint(
+                model, dataset, device=torch.device("cpu"), use_amp=False,
+                batch_size=2, stft_weight=1.0, si_sdr_weight=1.0,
+            )
+        self.assertIn("recon", metrics)
+        self.assertIn("presence", metrics)
+        self.assertIn("auc", metrics["presence"])
+        self.assertIn("threshold", metrics["presence"])
+        self.assertEqual(metrics["n_rows"], len(rows))
+        self.assertGreater(metrics["n_present"], 0)
+        self.assertGreater(metrics["n_absent"], 0)
+
+
+class RunTrainingJointMetadataTests(unittest.TestCase):
+    def _run(self, tmp: Path, **overrides):
+        dataset_a = tmp / "datasetA_root"
+        dataset_a.mkdir()
+        manifest, _ = _write_fixture(tmp, pos_per_split=2, neg_per_split=2)
+        kwargs = dict(
+            manifest=manifest,
+            output_dir=tmp / "tse_out",
+            dataset_a_root=dataset_a,
+            embedding_dim=8,
+            channels=(4, 8),
+            gru_hidden=8,
+            gru_layers=1,
+            epochs=1,
+            batch_size=2,
+            segment_seconds=0.5,
+            seed=20260805,
+            device="cpu",
+            reuse_cache=False,
+            embedding_provider=_mock_provider(dim=8),
+            with_presence=True,
+        )
+        kwargs.update(overrides)
+        return run_training(**kwargs)
+
+    def test_writes_checkpoint_and_summary_with_presence_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            summary = self._run(tmp)
+            self.assertTrue(summary["with_presence"])
+            self.assertIn("presence_threshold", summary)
+            self.assertIn("presence_auc", summary)
+            self.assertEqual(summary["presence_threshold_source"], "public_val_youden_j")
+            self.assertIn("class_balance", summary)
+            self.assertEqual(summary["model_config"]["with_presence"], True)
+            self.assertIn("absent", summary["data_boundary"])
+            # positive_split_rows counts only present rows.
+            self.assertEqual(summary["positive_split_rows"], {"train": 2, "val": 2, "test": 2})
+
+            ckpt = torch.load(tmp / "tse_out" / "best.pt", map_location="cpu", weights_only=False)
+            self.assertTrue(ckpt["with_presence"])
+            self.assertIn("presence_threshold", ckpt)
+            self.assertIn("presence_auc", ckpt)
+            self.assertEqual(ckpt["model_config"]["with_presence"], True)
+            self.assertTrue(any("presence_head" in k for k in ckpt["model_state_dict"]))
+            self.assertIn("absent", ckpt["data_boundary"])
+
+            # Strict load into a with_presence model of matching config.
+            cfg = ckpt["model_config"]
+            rebuilt = FiLMCRNExtractor(
+                embedding_dim=cfg["embedding_dim"], channels=tuple(cfg["channels"]),
+                n_fft=cfg["n_fft"], hop_length=cfg["hop_length"], win_length=cfg["win_length"],
+                gru_hidden=cfg["gru_hidden"], gru_layers=cfg["gru_layers"], with_presence=True,
+            )
+            rebuilt.load_state_dict(ckpt["model_state_dict"], strict=True)
+
+    def test_old_checkpoint_still_loads_strict_without_presence(self):
+        # The default (with_presence=False) path produces a checkpoint with no
+        # presence head; an old-style model must still strict-load it.
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            dataset_a = tmp / "datasetA_root"
+            dataset_a.mkdir()
+            manifest, _ = _write_fixture(tmp, pos_per_split=2, neg_per_split=1)
+            run_training(
+                manifest=manifest, output_dir=tmp / "old_out", dataset_a_root=dataset_a,
+                embedding_dim=8, channels=(4, 8), gru_hidden=8, gru_layers=1,
+                epochs=1, batch_size=2, segment_seconds=0.5, seed=20260805,
+                device="cpu", reuse_cache=False, embedding_provider=_mock_provider(dim=8),
+            )
+            ckpt = torch.load(tmp / "old_out" / "best.pt", map_location="cpu", weights_only=False)
+            self.assertFalse(ckpt["model_config"].get("with_presence", False))
+            self.assertNotIn("presence_threshold", ckpt)
+            rebuilt = FiLMCRNExtractor(
+                embedding_dim=8, channels=(4, 8), n_fft=512, hop_length=128,
+                win_length=None, gru_hidden=8, gru_layers=1,
+            )
+            rebuilt.load_state_dict(ckpt["model_state_dict"], strict=True)
+
+
+class JointCacheReuseTests(unittest.TestCase):
+    def test_embedding_cache_reused_across_runs(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            dataset_a = tmp / "datasetA_root"
+            dataset_a.mkdir()
+            manifest, _ = _write_fixture(tmp, pos_per_split=2, neg_per_split=2)
+            kwargs = dict(
+                manifest=manifest, output_dir=tmp / "out", dataset_a_root=dataset_a,
+                embedding_dim=8, channels=(4, 8), gru_hidden=8, gru_layers=1,
+                epochs=1, batch_size=2, segment_seconds=0.5, seed=20260805,
+                device="cpu", embedding_provider=_mock_provider(dim=8), with_presence=True,
+            )
+            run_training(reuse_cache=False, **kwargs)
+            cache_path = tmp / "out" / "enrollment_embeddings.pt"
+            self.assertTrue(cache_path.is_file())
+            payload = torch.load(cache_path, map_location="cpu", weights_only=False)
+            # Cache must include enrollment paths for absent rows too.
+            self.assertGreater(len(payload["embeddings"]), 6)
+            # Second run reuses the cache (same digest + model name).
+            run_training(reuse_cache=True, **kwargs)
+            payload2 = torch.load(cache_path, map_location="cpu", weights_only=False)
+            self.assertEqual(set(payload["embeddings"]), set(payload2["embeddings"]))
+            for key, vec in payload["embeddings"].items():
+                self.assertTrue(np.allclose(vec, payload2["embeddings"][key]))
 
 
 if __name__ == "__main__":

@@ -26,7 +26,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from xh202615.target_extractor import FiLMCRNExtractor, enhance_waveform
+from xh202615.target_extractor import (
+    FiLMCRNExtractor,
+    enhance_waveform,
+    enhance_waveform_with_presence,
+)
 
 
 SAMPLE_RATE = 16_000
@@ -168,6 +172,7 @@ def load_checkpoint(path: str | Path, device: torch.device) -> FiLMCRNExtractor:
     required = {"embedding_dim", "channels", "n_fft", "hop_length", "win_length", "gru_hidden", "gru_layers"}
     if not required.issubset(config):
         raise ValueError(f"checkpoint model_config missing: {sorted(required - set(config))}")
+    with_presence = bool(config.get("with_presence", False))
     model = FiLMCRNExtractor(
         embedding_dim=int(config["embedding_dim"]),
         channels=tuple(int(x) for x in config["channels"]),
@@ -176,6 +181,7 @@ def load_checkpoint(path: str | Path, device: torch.device) -> FiLMCRNExtractor:
         win_length=int(config["win_length"]),
         gru_hidden=int(config["gru_hidden"]),
         gru_layers=int(config["gru_layers"]),
+        with_presence=with_presence,
     ).to(device)
     model.load_state_dict(state, strict=True)
     if not all(torch.isfinite(value).all() for value in model.parameters()):
@@ -289,6 +295,8 @@ def run_inference(
         read_audio(row.command_audio)
     torch_device = torch.device(device)
     model = load_checkpoint(checkpoint, torch_device)
+    with_presence = bool(getattr(model, "with_presence", False))
+    presence_meta = read_presence_metadata(checkpoint) if with_presence else {}
     provider = embedding_provider or build_wespeaker_provider(model_name, torch_device)
     cache = load_or_build_cache(
         rows, cache_path=Path(embedding_cache), manifest_digest=manifest_digest,
@@ -320,6 +328,9 @@ def run_inference(
                 "latency_ms": 0.0,
                 "error": "",
             }
+            if with_presence:
+                # Mark the calibrated reject score as pending; filled on success.
+                record["presence_score"] = None
             if output_path.resolve(strict=False) == row.command_audio.resolve(strict=False):
                 raise ValueError("refusing to overwrite original command audio")
             try:
@@ -328,7 +339,15 @@ def run_inference(
                 waveform = torch.from_numpy(mixture).reshape(1, -1).to(torch_device)
                 start = time.perf_counter()
                 with torch.inference_mode():
-                    enhanced = enhance_waveform(model, waveform, embedding)
+                    if with_presence:
+                        enhanced, presence_logit = enhance_waveform_with_presence(
+                            model, waveform, embedding
+                        )
+                        record["presence_score"] = float(
+                            torch.sigmoid(presence_logit.reshape(-1)[0]).item()
+                        )
+                    else:
+                        enhanced = enhance_waveform(model, waveform, embedding)
                 result = enhanced.detach().float().cpu().numpy().reshape(-1)
                 if result.size != mixture.size or not np.isfinite(result).all():
                     raise ValueError("non-finite or length-changing enhanced output")
@@ -343,7 +362,42 @@ def run_inference(
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
             handle.flush()
             count += 1
-    return {"rows": count, "errors": errors, "skipped": len(done), "output_map": str(out_map), "embedding_cache": str(embedding_cache)}
+    summary = {
+        "rows": count,
+        "errors": errors,
+        "skipped": len(done),
+        "output_map": str(out_map),
+        "embedding_cache": str(embedding_cache),
+    }
+    if with_presence:
+        summary["with_presence"] = True
+        summary.update(presence_meta)
+    return summary
+
+
+def read_presence_metadata(checkpoint: str | Path) -> dict:
+    """Read the calibrated presence threshold/source from a checkpoint.
+
+    Returns ``{presence_threshold, presence_threshold_source, presence_auc}``
+    for a with-presence checkpoint; keys are absent if not stored. Called once
+    per inference run so the audio map + summary carry the gating threshold
+    without inference needing to re-tune it.
+    """
+    payload = torch.load(
+        Path(checkpoint).expanduser().resolve(strict=False),
+        map_location="cpu",
+        weights_only=False,
+    )
+    meta: dict = {}
+    for key in (
+        "presence_threshold",
+        "presence_threshold_source",
+        "presence_auc",
+        "presence_weight",
+    ):
+        if key in payload:
+            meta[key] = payload[key]
+    return meta
 
 
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:

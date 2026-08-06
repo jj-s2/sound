@@ -63,6 +63,40 @@ def _checkpoint(path: Path) -> None:
     )
 
 
+def _checkpoint_with_presence(path: Path, threshold: float = 0.5) -> None:
+    """A with-presence checkpoint carrying calibrated presence metadata."""
+    model = FiLMCRNExtractor(
+        embedding_dim=256,
+        channels=(4, 8),
+        n_fft=64,
+        hop_length=16,
+        win_length=64,
+        gru_hidden=8,
+        gru_layers=1,
+        with_presence=True,
+    )
+    torch.save(
+        {
+            "model_state_dict": model.state_dict(),
+            "model_config": {
+                "embedding_dim": 256,
+                "channels": [4, 8],
+                "n_fft": 64,
+                "hop_length": 16,
+                "win_length": 64,
+                "gru_hidden": 8,
+                "gru_layers": 1,
+                "with_presence": True,
+            },
+            "with_presence": True,
+            "presence_threshold": threshold,
+            "presence_threshold_source": "public_val_youden_j",
+            "presence_auc": 0.81,
+        },
+        path,
+    )
+
+
 def _fixture(tmp: Path) -> tuple[Path, Path, Path, Path]:
     wake = tmp / "wake.wav"
     command = tmp / "command.wav"
@@ -162,6 +196,78 @@ class InferenceTests(unittest.TestCase):
             self.assertEqual(second["rows"], 0)
             self.assertEqual(second["skipped"], 1)
             self.assertEqual(len((tmp / "map.jsonl").read_text(encoding="utf-8").splitlines()), 1)
+
+
+class PresenceScoreTests(unittest.TestCase):
+    def _fixture_with_presence(self, tmp: Path) -> tuple[Path, Path, Path, Path]:
+        wake = tmp / "wake.wav"
+        command = tmp / "command.wav"
+        _wav(wake, freq=220.0)
+        _wav(command, freq=440.0)
+        manifest = tmp / "input.jsonl"
+        manifest.write_text(
+            json.dumps({"id": "sample-1", "split": "pos",
+                        "wakeup_audio": wake.name, "command_audio": command.name})
+            + "\n",
+            encoding="utf-8",
+        )
+        checkpoint = tmp / "model.pt"
+        _checkpoint_with_presence(checkpoint, threshold=0.42)
+        return manifest, wake, command, checkpoint
+
+    def test_presence_score_emitted_for_with_presence_checkpoint(self):
+        with tempfile.TemporaryDirectory() as value:
+            tmp = Path(value)
+            manifest, _, _, checkpoint = self._fixture_with_presence(tmp)
+            row = read_input_jsonl(manifest)[0]
+            summary = run_inference(
+                [row], checkpoint=checkpoint, output_root=tmp / "enhanced",
+                output_map=tmp / "map.jsonl", embedding_cache=tmp / "cache.pt",
+                device="cpu", model_name="mock", embedding_provider=_provider,
+                manifest_digest="fixture-digest",
+            )
+            self.assertTrue(summary["with_presence"])
+            self.assertAlmostEqual(summary["presence_threshold"], 0.42)
+            self.assertEqual(summary["presence_threshold_source"], "public_val_youden_j")
+            record = json.loads((tmp / "map.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            self.assertIn("presence_score", record)
+            self.assertIsInstance(record["presence_score"], float)
+            self.assertTrue(np.isfinite(record["presence_score"]))
+            self.assertFalse(record.get("error"))
+
+    def test_old_checkpoint_emits_no_presence_score(self):
+        with tempfile.TemporaryDirectory() as value:
+            tmp = Path(value)
+            manifest, _, _, _ = _fixture(tmp)  # old-style checkpoint, no presence
+            row = read_input_jsonl(manifest)[0]
+            summary = run_inference(
+                [row], checkpoint=tmp / "model.pt", output_root=tmp / "enhanced",
+                output_map=tmp / "map.jsonl", embedding_cache=tmp / "cache.pt",
+                device="cpu", model_name="mock", embedding_provider=_provider,
+                manifest_digest="fixture-digest",
+            )
+            self.assertNotIn("with_presence", summary)
+            record = json.loads((tmp / "map.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            self.assertNotIn("presence_score", record)
+
+    def test_resume_preserves_presence_score(self):
+        with tempfile.TemporaryDirectory() as value:
+            tmp = Path(value)
+            manifest, _, _, checkpoint = self._fixture_with_presence(tmp)
+            row = read_input_jsonl(manifest)[0]
+            kwargs = dict(
+                checkpoint=checkpoint, output_root=tmp / "enhanced",
+                output_map=tmp / "map.jsonl", embedding_cache=tmp / "cache.pt",
+                device="cpu", model_name="mock", embedding_provider=_provider,
+                manifest_digest="fixture-digest",
+            )
+            run_inference([row], **kwargs)
+            second = run_inference([row], **kwargs, resume=True)
+            self.assertEqual(second["rows"], 0)
+            self.assertEqual(second["skipped"], 1)
+            record = json.loads((tmp / "map.jsonl").read_text(encoding="utf-8").splitlines()[0])
+            # Resumed (kept) record retains its presence score.
+            self.assertIsInstance(record.get("presence_score"), float)
 
 
 if __name__ == "__main__":
