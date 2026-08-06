@@ -1,0 +1,43 @@
+# Local environments and IDE state
+.venv/
+.idea/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Local datasets, archives, generated audio and model caches
+data/
+data_aishell*/
+datasetA/
+output/
+tmp/
+*.tgz
+*.zip
+*.tar
+*.tar.gz
+*.wav
+*.flac
+*.mp3
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Internal orchestration/review artifacts
+.superpowers/
+arena/
+docs/superpowers/
+
+# Local-only files and reports
+experiments/
+*.log
+*.jsonl
+*.csv
+!configs/*.jsonl
+技术路线.png
+*.pdf
+XH-202615_pdf_text*.txt
+
+# Non-portable local extraction helper
+scripts/_extract_aishell.py

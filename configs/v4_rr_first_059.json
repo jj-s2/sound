@@ -1,0 +1,39 @@
+{
+  "version": "V4",
+  "name": "RR-first V4: energy fallback ASR + command correction + speaker threshold 0.59",
+  "audio_probe": {
+    "enabled": false
+  },
+  "postprocess": {
+    "enabled": true,
+    "domain_context_required": true
+  },
+  "command_corrector": {
+    "enabled": true,
+    "short_text_max_length": 8,
+    "max_phrase_text_length": 16,
+    "min_similarity": 0.88,
+    "max_phrase_changes": 1
+  },
+  "router": {
+    "mode": "safe",
+    "reject": {
+      "target_probability_max": 0.98,
+      "global_similarity_max": 0.59,
+      "topk_similarity_max": 0.59,
+      "target_frame_ratio_max": 0.00,
+      "audio_quality_min": 0.00,
+      "min_votes": 2
+    }
+  },
+  "text_router": {
+    "enabled": true,
+    "reject": {
+      "speaker_similarity_max": 0.60,
+      "target_probability_max": 0.98,
+      "min_speaker_votes": 2,
+      "min_text_length": 11,
+      "max_domain_score": 0
+    }
+  }
+}

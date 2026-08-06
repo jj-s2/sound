@@ -1,0 +1,32 @@
+{
+  "version": "V2",
+  "name": "Text-aware speaker routing + conservative ASR postprocess",
+  "audio_probe": {
+    "enabled": false
+  },
+  "postprocess": {
+    "enabled": true,
+    "domain_context_required": true
+  },
+  "router": {
+    "mode": "safe",
+    "reject": {
+      "target_probability_max": 0.98,
+      "global_similarity_max": 0.55,
+      "topk_similarity_max": 0.55,
+      "target_frame_ratio_max": 0.00,
+      "audio_quality_min": 0.00,
+      "min_votes": 2
+    }
+  },
+  "text_router": {
+    "enabled": true,
+    "reject": {
+      "speaker_similarity_max": 0.60,
+      "target_probability_max": 0.98,
+      "min_speaker_votes": 2,
+      "min_text_length": 11,
+      "max_domain_score": 0
+    }
+  }
+}

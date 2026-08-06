@@ -1,0 +1,18 @@
+{
+  "version": "V1",
+  "name": "Safe Baseline: conservative speaker rejection + raw ASR",
+  "audio_probe": {
+    "enabled": false
+  },
+  "router": {
+    "mode": "safe",
+    "reject": {
+      "target_probability_max": 0.98,
+      "global_similarity_max": 0.55,
+      "topk_similarity_max": 0.55,
+      "target_frame_ratio_max": 0.00,
+      "audio_quality_min": 0.00,
+      "min_votes": 2
+    }
+  }
+}

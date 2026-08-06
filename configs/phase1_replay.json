@@ -1,0 +1,11 @@
+{
+  "purpose": "contract_fixture_only_not_competition_calibration",
+  "policy": {
+    "version": "phase1-fixture-v1",
+    "reject_probability_max": 0.0,
+    "raw_probability_min": 1.0,
+    "enhancement_overlap_min": 1.0
+  },
+  "enhancement_available": false,
+  "command_corrector": {"enabled": false}
+}
