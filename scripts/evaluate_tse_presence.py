@@ -29,11 +29,14 @@ if str(REPO_ROOT) not in sys.path:
 
 from xh202615.data import load_dataset  # noqa: E402
 from xh202615.evaluation import evaluate_rows  # noqa: E402
+from xh202615.speaker_score import SCORE_VARIANTS, select_score_variant  # noqa: E402
 from xh202615.tse_presence import (  # noqa: E402
+    SCORE_FIELDS,
     calibrate_threshold_overall,
     gate_predictions,
+    load_all_score_fields,
     load_asr_text,
-    load_presence,
+    load_scores,
     overall_at_threshold,
     overall_from_metrics,
     samples_from_manifest,
@@ -53,10 +56,10 @@ def _resolve_threshold(args: argparse.Namespace) -> tuple[float, str]:
     """Resolve the gating threshold from an explicit value or a ``.pt`` checkpoint.
 
     ``--threshold`` (explicit numeric) always wins. ``--threshold-from-checkpoint``
-    reads ``presence_threshold`` / ``presence_threshold_source`` from a binary
-    PyTorch checkpoint via :func:`read_presence_metadata` (``torch.load`` with
-    ``weights_only=False``). Fails closed on a missing file, an unloadable
-    checkpoint, or a checkpoint without calibrated presence metadata. No labels
+    reads the R7 ``speaker_threshold`` (preferred) or the R6 ``presence_threshold``
+    from a binary PyTorch checkpoint via :func:`read_presence_metadata`
+    (``torch.load`` with ``weights_only=False``). Fails closed on a missing file,
+    an unloadable checkpoint, or a checkpoint with neither threshold. No labels
     are read and no threshold is tuned here.
     """
     if args.threshold is not None:
@@ -68,14 +71,43 @@ def _resolve_threshold(args: argparse.Namespace) -> tuple[float, str]:
             raise SystemExit(
                 f"cannot read checkpoint {args.threshold_from_checkpoint!r}: {exc}"
             ) from exc
-        if "presence_threshold" not in meta:
-            raise SystemExit(
-                f"checkpoint {args.threshold_from_checkpoint!r} has no presence_threshold"
+        if "speaker_threshold" in meta:
+            return float(meta["speaker_threshold"]), meta.get(
+                "speaker_threshold_source", "checkpoint"
             )
-        return float(meta["presence_threshold"]), meta.get(
-            "presence_threshold_source", "checkpoint"
+        if "presence_threshold" in meta:
+            return float(meta["presence_threshold"]), meta.get(
+                "presence_threshold_source", "checkpoint"
+            )
+        raise SystemExit(
+            f"checkpoint {args.threshold_from_checkpoint!r} has no "
+            f"speaker/presence threshold"
         )
     raise SystemExit("--evaluate requires --threshold or --threshold-from-checkpoint")
+
+
+def _resolve_score_field(args: argparse.Namespace) -> str:
+    """Resolve which audio-map score field gates on.
+
+    ``--score-field`` wins. Otherwise the R7 checkpoint's ``speaker_score_type``
+    is used when present, falling back to the R6 ``presence_score``. Validates
+    against the recognized score fields.
+    """
+    if args.score_field:
+        field = args.score_field
+    elif args.threshold_from_checkpoint:
+        try:
+            meta = read_presence_metadata(args.threshold_from_checkpoint)
+        except Exception:  # noqa: BLE001 - fall back to presence if unreadable
+            meta = {}
+        field = meta.get("speaker_score_type", "presence_score") if isinstance(meta, dict) else "presence_score"
+    else:
+        field = "presence_score"
+    if field not in SCORE_FIELDS:
+        raise SystemExit(
+            f"unknown score field {field!r}; expected one of {SCORE_FIELDS}"
+        )
+    return field
 
 
 def _presence_path(args: argparse.Namespace) -> str:
@@ -88,18 +120,63 @@ def _presence_path(args: argparse.Namespace) -> str:
 
 def calibrate(args: argparse.Namespace) -> dict:
     samples = _load_samples(args)
-    presence = load_presence(_presence_path(args))
+    all_scores = load_all_score_fields(_presence_path(args))
     asr = load_asr_text(args.asr_predictions)
-    result = calibrate_threshold_overall(samples, asr, presence)
+    presence_source = str(Path(_presence_path(args)).resolve(strict=False))
+    asr_source = str(Path(args.asr_predictions).resolve(strict=False))
+
+    # R7: select the cosine variant + Overall-optimal threshold when speaker
+    # variants are present. R6: fall back to the single presence_score sweep.
+    speaker_variants = [v for v in SCORE_VARIANTS if v in all_scores]
+    if speaker_variants:
+        result = select_score_variant(
+            samples,
+            asr,
+            {v: all_scores[v] for v in speaker_variants},
+            overall_at_threshold=overall_at_threshold,
+            overall_from_metrics=overall_from_metrics,
+        )
+        out = {
+            "score_type": result["score_type"],
+            "score_field": result["score_type"],
+            "threshold": result["threshold"],
+            "threshold_source": result["threshold_source"],
+            "metrics": result["metrics"],
+            "n_pos": result["n_pos"],
+            "n_neg": result["n_neg"],
+            "per_variant": result["per_variant"],
+            "asr_predictions": asr_source,
+            "presence_source": presence_source,
+            "dataset_a_used_for_training": False,
+        }
+        _write_output(args, out)
+        print(
+            f"selected variant={result['score_type']} "
+            f"threshold={result['threshold']:.6f} "
+            f"public_overall={result['metrics']['overall']:.4f} "
+            f"(CER={result['metrics']['avg_cer']:.4f}, "
+            f"RR={result['metrics']['avg_rr']:.4f})",
+            flush=True,
+        )
+        return out
+
+    if "presence_score" not in all_scores:
+        raise SystemExit(
+            f"no recognized score fields in {_presence_path(args)!r}; "
+            f"expected one of {SCORE_FIELDS}"
+        )
+    result = calibrate_threshold_overall(samples, asr, all_scores["presence_score"])
     out = {
+        "score_type": "presence_score",
+        "score_field": "presence_score",
         "threshold": result["threshold"],
         "threshold_source": result["threshold_source"],
         "metrics": result["metrics"],
         "n_pos": result["n_pos"],
         "n_neg": result["n_neg"],
         "n_candidates": result["n_candidates"],
-        "asr_predictions": str(Path(args.asr_predictions).resolve(strict=False)),
-        "presence_source": str(Path(_presence_path(args)).resolve(strict=False)),
+        "asr_predictions": asr_source,
+        "presence_source": presence_source,
         "dataset_a_used_for_training": False,
     }
     _write_output(args, out)
@@ -114,11 +191,13 @@ def calibrate(args: argparse.Namespace) -> dict:
 
 def evaluate(args: argparse.Namespace) -> dict:
     samples = _load_samples(args)
-    presence = load_presence(_presence_path(args))
+    score_field = _resolve_score_field(args)
+    scores = load_scores(_presence_path(args), score_field=score_field)
     asr = load_asr_text(args.asr_predictions)
     threshold, threshold_source = _resolve_threshold(args)
-    metrics = overall_at_threshold(samples, asr, presence, threshold)
+    metrics = overall_at_threshold(samples, asr, scores, threshold)
     out = {
+        "score_field": score_field,
         "threshold": threshold,
         "threshold_source": threshold_source,
         "metrics": metrics,
@@ -128,7 +207,7 @@ def evaluate(args: argparse.Namespace) -> dict:
         "label_usage": "audit_only" if args.dataset_root else "public_proxy",
     }
     if args.gated_predictions:
-        predictions = gate_predictions(asr, presence, threshold)
+        predictions = gate_predictions(asr, scores, threshold)
         pred_path = Path(args.gated_predictions).expanduser().resolve(strict=False)
         pred_path.parent.mkdir(parents=True, exist_ok=True)
         with pred_path.open("w", encoding="utf-8", newline="\n") as handle:
@@ -144,7 +223,8 @@ def evaluate(args: argparse.Namespace) -> dict:
     print(
         f"overall={metrics['overall']:.4f} CER={metrics['avg_cer']:.4f} "
         f"RR={metrics['avg_rr']:.4f} FAR={metrics['false_accept_rate']:.4f} "
-        f"FRR={metrics['false_reject_rate']:.4f} (threshold={threshold:.6f})",
+        f"FRR={metrics['false_reject_rate']:.4f} "
+        f"(field={score_field}, threshold={threshold:.6f})",
         flush=True,
     )
     return out
@@ -172,7 +252,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--threshold-from-checkpoint",
         default=None,
-        help="read presence_threshold from this TSE checkpoint (evaluate mode)",
+        help="read speaker_threshold (R7) or presence_threshold (R6) from this TSE checkpoint (evaluate mode)",
+    )
+    parser.add_argument(
+        "--score-field",
+        default=None,
+        help="audio-map score field to gate on (evaluate) or to report (calibrate); "
+        "one of presence_score, enhanced_cosine, mixture_cosine, max_cosine. "
+        "Defaults to the checkpoint's speaker_score_type (R7) or presence_score (R6).",
     )
     parser.add_argument("--dataset-root", default=None, help="Dataset-A root for blind official evaluation")
     parser.add_argument("--public-manifest", default=None, help="public TrainingManifest JSONL")

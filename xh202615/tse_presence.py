@@ -28,32 +28,46 @@ from .training_data import read_training_manifest
 # Rejection is an empty normalised transcript (see xh202615.metrics.is_rejection).
 REJECT_TEXT = ""
 
+# Recognized gating score fields. ``presence_score`` is the R6 absolute
+# probability; the cosine variants are the R7 domain-invariant speaker signal.
+SCORE_FIELDS: tuple[str, ...] = (
+    "presence_score",
+    "enhanced_cosine",
+    "mixture_cosine",
+    "max_cosine",
+)
+
 
 def overall_from_metrics(metrics: Mapping[str, float]) -> float:
     """Official competition Overall = ((1-CER) + RR) / 2."""
     return ((1.0 - float(metrics["avg_cer"])) + float(metrics["avg_rr"])) / 2.0
 
 
-def _finite_score(value: object) -> float:
+def _finite_score(value: object, field: str = "score") -> float:
     if value is None:
-        raise ValueError("presence_score is missing for a row")
+        raise ValueError(f"{field} is missing for a row")
     try:
         score = float(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"presence_score must be a number, got {value!r}") from exc
+        raise ValueError(f"{field} must be a number, got {value!r}") from exc
     if not math.isfinite(score):
-        raise ValueError(f"presence_score must be finite, got {score}")
+        raise ValueError(f"{field} must be finite, got {score}")
     return score
 
 
-def load_presence(path: str | Path, *, id_field: str = "id") -> dict[str, float]:
-    """Read ``{id: presence_score}`` from an audio map or presence JSONL.
+def load_scores(
+    path: str | Path,
+    *,
+    score_field: str = "presence_score",
+    id_field: str = "id",
+) -> dict[str, float]:
+    """Read ``{id: score}`` for one score field from a JSONL audio map.
 
-    Fail-closed: every record must carry a finite numeric ``presence_score``.
-    Duplicate ids raise. Used for the TSE presence head; the temporal-head path
-    can write the same JSONL shape with its own probability field.
+    Fail-closed: every record must carry a finite numeric value for
+    ``score_field``. Duplicate ids raise. Used for any gating score (R6
+    ``presence_score`` or an R7 cosine variant).
     """
-    presence: dict[str, float] = {}
+    scores: dict[str, float] = {}
     with Path(path).open("r", encoding="utf-8-sig") as handle:
         for line_no, line in enumerate(handle, start=1):
             line = line.strip()
@@ -64,12 +78,66 @@ def load_presence(path: str | Path, *, id_field: str = "id") -> dict[str, float]
             except json.JSONDecodeError as exc:
                 raise ValueError(f"invalid JSON at {path}:{line_no}: {exc}") from exc
             sample_id = str(record[id_field])
-            if sample_id in presence:
-                raise ValueError(f"duplicate presence id {sample_id!r}")
-            presence[sample_id] = _finite_score(record.get("presence_score"))
-    if not presence:
-        raise ValueError(f"no presence records in {path}")
-    return presence
+            if sample_id in scores:
+                raise ValueError(f"duplicate {id_field} {sample_id!r}")
+            scores[sample_id] = _finite_score(record.get(score_field), score_field)
+    if not scores:
+        raise ValueError(f"no records in {path}")
+    return scores
+
+
+def load_presence(path: str | Path, *, id_field: str = "id") -> dict[str, float]:
+    """Read ``{id: presence_score}`` from an audio map or presence JSONL.
+
+    Backward-compatible alias for :func:`load_scores` with the R6
+    ``presence_score`` field. Fail-closed on missing/non-finite/duplicate.
+    """
+    return load_scores(path, score_field="presence_score", id_field=id_field)
+
+
+def load_all_score_fields(
+    path: str | Path, *, id_field: str = "id"
+) -> dict[str, dict[str, float]]:
+    """Load every recognized gating score field present in a JSONL audio map.
+
+    Returns ``{field: {id: score}}``. A field that appears in any row must be
+    present and finite in *every* row (fail-closed, so a half-populated score
+    column can never look like a clean run). Fields absent from every row are
+    omitted. Duplicate ids raise.
+    """
+    rows: list[tuple[str, dict]] = []
+    with Path(path).open("r", encoding="utf-8-sig") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSON at {path}:{line_no}: {exc}") from exc
+            if id_field not in record:
+                raise ValueError(f"record at {path}:{line_no} has no {id_field!r}")
+            sample_id = str(record[id_field])
+            rows.append((sample_id, record))
+    if not rows:
+        raise ValueError(f"no records in {path}")
+    seen: set[str] = set()
+    for sample_id, _ in rows:
+        if sample_id in seen:
+            raise ValueError(f"duplicate {id_field} {sample_id!r}")
+        seen.add(sample_id)
+    present_fields = [f for f in SCORE_FIELDS if any(f in rec for _, rec in rows)]
+    result: dict[str, dict[str, float]] = {}
+    for field in present_fields:
+        field_map: dict[str, float] = {}
+        for sample_id, record in rows:
+            if field not in record:
+                raise ValueError(
+                    f"field {field!r} is missing for id {sample_id!r} in {path}"
+                )
+            field_map[sample_id] = _finite_score(record.get(field), field)
+        result[field] = field_map
+    return result
 
 
 def load_asr_text(path: str | Path, *, id_field: str = "id") -> dict[str, str]:

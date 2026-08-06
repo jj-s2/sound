@@ -18,13 +18,16 @@ import torch
 
 from xh202615.data import Sample
 from xh202615.evaluation import evaluate_rows
-from scripts.evaluate_tse_presence import _resolve_threshold, parse_args
+from scripts.evaluate_tse_presence import _resolve_threshold, _resolve_score_field, parse_args, main
 from xh202615.tse_presence import (
     REJECT_TEXT,
+    SCORE_FIELDS,
     calibrate_threshold_overall,
     gate_predictions,
+    load_all_score_fields,
     load_asr_text,
     load_presence,
+    load_scores,
     overall_at_threshold,
     overall_from_metrics,
     samples_from_manifest,
@@ -99,7 +102,7 @@ class LoadPresenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "empty.jsonl"
             path.write_text("", encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "no presence"):
+            with self.assertRaisesRegex(ValueError, "no records"):
                 load_presence(path)
 
 
@@ -331,6 +334,250 @@ class CheckpointThresholdResolutionTests(unittest.TestCase):
     def test_no_threshold_source_fails_closed(self):
         with self.assertRaises(SystemExit):
             _resolve_threshold(_ns())
+
+
+class LoadScoresTests(unittest.TestCase):
+    def _write(self, tmp: Path, rows: list[dict], name: str = "scores.jsonl") -> Path:
+        path = tmp / name
+        path.write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_loads_named_field(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._write(Path(td), [
+                {"id": "a", "enhanced_cosine": 0.6, "mixture_cosine": 0.2},
+                {"id": "b", "enhanced_cosine": 0.1, "mixture_cosine": 0.8},
+            ])
+            self.assertEqual(load_scores(path, score_field="enhanced_cosine"),
+                             {"a": 0.6, "b": 0.1})
+
+    def test_missing_named_field_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._write(Path(td), [{"id": "a", "mixture_cosine": 0.2}])
+            with self.assertRaisesRegex(ValueError, "enhanced_cosine"):
+                load_scores(path, score_field="enhanced_cosine")
+
+
+class LoadAllScoreFieldsTests(unittest.TestCase):
+    def _write(self, tmp: Path, rows: list[dict]) -> Path:
+        path = tmp / "amap.jsonl"
+        path.write_text(
+            "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    def test_loads_all_present_fields(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._write(Path(td), [
+                {"id": "a", "enhanced_cosine": 0.6, "mixture_cosine": 0.2,
+                 "max_cosine": 0.6, "presence_score": 0.9},
+                {"id": "b", "enhanced_cosine": 0.1, "mixture_cosine": 0.8,
+                 "max_cosine": 0.8, "presence_score": 0.1},
+            ])
+            fields = load_all_score_fields(path)
+            self.assertEqual(set(fields), set(SCORE_FIELDS))
+            self.assertEqual(fields["enhanced_cosine"], {"a": 0.6, "b": 0.1})
+
+    def test_half_populated_field_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._write(Path(td), [
+                {"id": "a", "enhanced_cosine": 0.6, "mixture_cosine": 0.2},
+                {"id": "b", "mixture_cosine": 0.8},  # missing enhanced_cosine
+            ])
+            with self.assertRaisesRegex(ValueError, "enhanced_cosine"):
+                load_all_score_fields(path)
+
+    def test_absent_fields_omitted(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._write(Path(td), [
+                {"id": "a", "presence_score": 0.9},
+                {"id": "b", "presence_score": 0.1},
+            ])
+            fields = load_all_score_fields(path)
+            self.assertEqual(set(fields), {"presence_score"})
+
+    def test_non_finite_fails_closed(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = self._write(Path(td), [
+                {"id": "a", "enhanced_cosine": float("nan")},
+                {"id": "b", "enhanced_cosine": 0.1},
+            ])
+            with self.assertRaisesRegex(ValueError, "finite"):
+                load_all_score_fields(path)
+
+
+class SpeakerCheckpointResolutionTests(unittest.TestCase):
+    def _write_ckpt(self, path: Path, **meta) -> None:
+        payload = {"model_state_dict": {}, "model_config": {"with_presence": True}}
+        payload.update(meta)
+        torch.save(payload, path)
+
+    def test_resolves_speaker_threshold_and_field_from_checkpoint(self):
+        with tempfile.TemporaryDirectory() as td:
+            ckpt = Path(td) / "best.pt"
+            self._write_ckpt(
+                ckpt,
+                with_speaker_score=True,
+                speaker_score_type="enhanced_cosine",
+                speaker_threshold=0.55,
+                speaker_threshold_source="public_val_max_overall",
+                speaker_auc=0.93,
+                presence_threshold=0.42,
+                presence_threshold_source="public_val_youden_j",
+            )
+            args = parse_args([
+                "--asr-predictions", "x.jsonl", "--audio-map", "m.jsonl",
+                "--threshold-from-checkpoint", str(ckpt),
+            ])
+            threshold, source = _resolve_threshold(args)
+            self.assertAlmostEqual(threshold, 0.55, places=6)
+            self.assertEqual(source, "public_val_max_overall")
+            self.assertEqual(_resolve_score_field(args), "enhanced_cosine")
+
+    def test_explicit_score_field_overrides_checkpoint(self):
+        with tempfile.TemporaryDirectory() as td:
+            ckpt = Path(td) / "best.pt"
+            self._write_ckpt(ckpt, speaker_score_type="enhanced_cosine",
+                             speaker_threshold=0.55)
+            args = parse_args([
+                "--asr-predictions", "x.jsonl", "--audio-map", "m.jsonl",
+                "--threshold-from-checkpoint", str(ckpt),
+                "--score-field", "mixture_cosine", "--threshold", "0.4",
+            ])
+            self.assertEqual(_resolve_score_field(args), "mixture_cosine")
+            threshold, _ = _resolve_threshold(args)
+            self.assertAlmostEqual(threshold, 0.4, places=6)
+
+    def test_presence_only_checkpoint_resolves_presence_field(self):
+        with tempfile.TemporaryDirectory() as td:
+            ckpt = Path(td) / "best.pt"
+            self._write_ckpt(ckpt, presence_threshold=0.42)
+            args = parse_args([
+                "--asr-predictions", "x.jsonl", "--audio-map", "m.jsonl",
+                "--threshold-from-checkpoint", str(ckpt),
+            ])
+            self.assertEqual(_resolve_score_field(args), "presence_score")
+
+    def test_unknown_score_field_fails_closed(self):
+        args = parse_args([
+            "--asr-predictions", "x.jsonl", "--audio-map", "m.jsonl",
+            "--score-field", "bogus",
+        ])
+        with self.assertRaises(SystemExit):
+            _resolve_score_field(args)
+
+
+def _write_public_manifest(tmp: Path) -> Path:
+    """2 present + 2 absent training rows (dummy audio paths; never read)."""
+    rows = []
+    for rid, present, text in [("p0", True, "你好"), ("p1", True, "世界"),
+                               ("n0", False, None), ("n1", False, None)]:
+        rows.append({
+            "row_id": rid, "split": "val", "source": "t",
+            "enrollment_audio": f"/dummy/{rid}-e.wav",
+            "target_audio": f"/dummy/{rid}-t.wav",
+            "mixture_audio": f"/dummy/{rid}-m.wav",
+            "target_speaker_id": "S1", "interferer_speaker_id": "I1",
+            "target_present": present, "overlap_ratio": 0.5,
+            "snr_db": 5.0, "sir_db": 0.0, "text": text, "seed": 1,
+        })
+    path = tmp / "manifest.jsonl"
+    path.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+                    encoding="utf-8")
+    return path
+
+
+def _write_amap_asr(tmp: Path) -> tuple[Path, Path]:
+    amap_rows = [
+        {"id": "p0", "enhanced_cosine": 0.60, "mixture_cosine": 0.20,
+         "max_cosine": 0.60, "presence_score": 0.90},
+        {"id": "p1", "enhanced_cosine": 0.55, "mixture_cosine": 0.30,
+         "max_cosine": 0.55, "presence_score": 0.85},
+        {"id": "n0", "enhanced_cosine": 0.10, "mixture_cosine": 0.80,
+         "max_cosine": 0.80, "presence_score": 0.10},
+        {"id": "n1", "enhanced_cosine": 0.15, "mixture_cosine": 0.70,
+         "max_cosine": 0.70, "presence_score": 0.15},
+    ]
+    asr_rows = [
+        {"id": "p0", "recognition_text": "你好"},
+        {"id": "p1", "recognition_text": "世界"},
+        {"id": "n0", "recognition_text": "干扰"},
+        {"id": "n1", "recognition_text": "噪音"},
+    ]
+    amap = tmp / "amap.jsonl"
+    asr = tmp / "asr.jsonl"
+    amap.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in amap_rows) + "\n",
+                    encoding="utf-8")
+    asr.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in asr_rows) + "\n",
+                   encoding="utf-8")
+    return amap, asr
+
+
+class SpeakerEvaluatorEndToEndTests(unittest.TestCase):
+    def test_calibrate_selects_best_variant_and_threshold(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            manifest = _write_public_manifest(tmp)
+            amap, asr = _write_amap_asr(tmp)
+            out = tmp / "calib.json"
+            result = main([
+                "--calibrate", "--asr-predictions", str(asr), "--audio-map", str(amap),
+                "--public-manifest", str(manifest), "--public-split", "val",
+                "--output", str(out),
+            ])
+            self.assertEqual(result["score_type"], "enhanced_cosine")
+            self.assertEqual(result["threshold_source"], "public_val_max_overall")
+            self.assertAlmostEqual(result["metrics"]["overall"], 1.0, places=6)
+            self.assertEqual(set(result["per_variant"]),
+                             {"enhanced_cosine", "mixture_cosine", "max_cosine"})
+            self.assertTrue(out.is_file())
+
+    def test_evaluate_gates_on_selected_speaker_field(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            manifest = _write_public_manifest(tmp)
+            amap, asr = _write_amap_asr(tmp)
+            out = tmp / "eval.json"
+            result = main([
+                "--asr-predictions", str(asr), "--audio-map", str(amap),
+                "--public-manifest", str(manifest), "--public-split", "val",
+                "--threshold", "0.3", "--score-field", "enhanced_cosine",
+                "--gated-predictions", str(tmp / "gated.jsonl"),
+                "--output", str(out),
+            ])
+            self.assertEqual(result["score_field"], "enhanced_cosine")
+            # At 0.3: pos accepted (CER 0), neg rejected (RR 1) -> Overall 1.0.
+            self.assertAlmostEqual(result["metrics"]["overall"], 1.0, places=6)
+            self.assertEqual(result["metrics"]["avg_rr"], 1.0)
+            self.assertIn("official_evaluator_crosscheck", result)
+
+    def test_evaluate_falls_back_to_presence_for_r6_map(self):
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            manifest = _write_public_manifest(tmp)
+            # R6-style audio map: presence_score only, no cosines.
+            amap = tmp / "amap.jsonl"
+            amap.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in [
+                {"id": "p0", "presence_score": 0.90},
+                {"id": "p1", "presence_score": 0.85},
+                {"id": "n0", "presence_score": 0.10},
+                {"id": "n1", "presence_score": 0.15},
+            ]) + "\n", encoding="utf-8")
+            # _write_amap_asr returns (amap, asr); keep the asr path, overwrite amap.
+            _, asr = _write_amap_asr(tmp)
+            out = tmp / "eval.json"
+            result = main([
+                "--asr-predictions", str(asr), "--audio-map", str(amap),
+                "--public-manifest", str(manifest), "--public-split", "val",
+                "--threshold", "0.3", "--score-field", "presence_score",
+                "--output", str(out),
+            ])
+            self.assertEqual(result["score_field"], "presence_score")
+            self.assertAlmostEqual(result["metrics"]["overall"], 1.0, places=6)
 
 
 if __name__ == "__main__":

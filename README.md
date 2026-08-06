@@ -12,19 +12,21 @@ XH-202615 experiments.
 - CUDA FunASR evidence collection with resumable output handling.
 - CER/RR/Overall-related evaluation and training utilities.
 - Public-only TSE (target speaker extraction) pilot trainer.
+- R7 enrollment-conditioned speaker-cosine rejection with deterministic
+  impostor hard negatives and public AISHELL transcript-backed calibration.
 
 ## Public-only data boundary
 
-The TSE pilot trainer (`scripts/train_tse.py`) trains on the existing public
-synthetic manifest only (`data/synthetic/aishell1_phase2_v2/manifest.jsonl`). It
-never reads Dataset-A audio, labels, IDs, paths, predictions, or metrics.
-Dataset-A is used solely as a forbidden containment root and is rejected if any
-training audio path resolves beneath it. Only `target_present == true` rows feed
-the reconstruction objective; speaker-disjoint splits are validated before
-training, and the frozen WeSpeaker enrollment encoder carries no gradient. No
-Dataset-A data is used in checkpoint selection, threshold fitting, or early
-stopping. Generated checkpoints, audio, and caches are gitignored and must not be
-uploaded.
+The TSE trainers train only on public/synthetic manifests. R7 uses
+`scripts/prepare_r7_manifest.py` to combine R3 counterfactual negatives with
+deterministic different-speaker impostors; the optional AISHELL transcript only
+supplies public positive references for calibration. Dataset-A audio, IDs, and
+labels are never placed in manifests or checkpoints and are rejected as training
+paths. After a public baseline is recorded, the competition owner has authorized
+read-only Dataset-A metric use for threshold/routing/hyperparameter tuning; such
+tuning must be logged separately and must not alter the training corpus. The
+frozen WeSpeaker encoder carries no gradient. Generated checkpoints, audio, and
+caches are gitignored and must not be uploaded.
 
 ## TSE pilot command
 
@@ -40,6 +42,28 @@ uploaded.
 `--limit-per-split` caps the positive rows per split (smoke runs). The best
 validation checkpoint is written to `best.pt` and a full audit (manifest digest,
 data boundary, model config, seed, training history) to `summary.json`.
+
+## R7 speaker-score pilot
+
+Build a public R7 manifest (the default transcript path is auto-detected):
+
+```powershell
+.venv\Scripts\python.exe scripts\prepare_r7_manifest.py `
+  --r3-manifest data\synthetic\r3_public_pilot_v1\manifest.jsonl `
+  --output data\synthetic\r3_r7_speaker_v1\manifest.jsonl `
+  --dataset-a-root datasetA\datasetA --impostor-fraction 0.5 --seed 20260806 `
+  --transcript "data_aishell (1)\data_aishell\transcript\aishell_transcript_v0.8.txt"
+
+.venv\Scripts\python.exe scripts\train_tse.py `
+  --manifest data\synthetic\r3_r7_speaker_v1\manifest.jsonl `
+  --output-dir output\tse_r7_joint --with-presence --with-speaker-score `
+  --epochs 8 --batch-size 8 --segment-seconds 2.0 --device cuda
+```
+
+R7 inference writes enhanced/mixture/max cosine scores. Calibrate the variant
+and threshold on the public val split with
+`scripts/evaluate_tse_presence.py --calibrate`; use the resulting fixed
+configuration for the official evaluation.
 
 
 Datasets, generated audio, model checkpoints, ASR outputs, and local experiment artifacts are

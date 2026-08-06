@@ -31,6 +31,12 @@ from xh202615.target_extractor import (
     enhance_waveform,
     enhance_waveform_with_presence,
 )
+from xh202615.speaker_score import (
+    SCORE_VARIANTS,
+    SpeakerEncoder,
+    build_wespeaker_encoder,
+    cosine_tensor,
+)
 
 
 SAMPLE_RATE = 16_000
@@ -283,7 +289,7 @@ def run_inference(
     output_map: str | Path, embedding_cache: str | Path, device: str = "cuda",
     model_name: str = "chinese", limit: int | None = None, resume: bool = False,
     on_error: str = "raise", embedding_provider: EmbeddingProvider | None = None,
-    manifest_digest: str = "",
+    manifest_digest: str = "", speaker_encoder: SpeakerEncoder | None = None,
 ) -> dict:
     if not rows:
         raise ValueError("no input rows")
@@ -297,6 +303,14 @@ def run_inference(
     model = load_checkpoint(checkpoint, torch_device)
     with_presence = bool(getattr(model, "with_presence", False))
     presence_meta = read_presence_metadata(checkpoint) if with_presence else {}
+    with_speaker_score = bool(presence_meta.get("with_speaker_score", False))
+    if with_speaker_score:
+        # One frozen WeSpeaker encoder backs both the enrollment cache and the
+        # speaker-cosine reject score, so the two embeddings share a space.
+        if speaker_encoder is None:
+            speaker_encoder = build_wespeaker_encoder(model_name, torch_device)
+        if embedding_provider is None:
+            embedding_provider = speaker_encoder.embed_path
     provider = embedding_provider or build_wespeaker_provider(model_name, torch_device)
     cache = load_or_build_cache(
         rows, cache_path=Path(embedding_cache), manifest_digest=manifest_digest,
@@ -331,6 +345,13 @@ def run_inference(
             if with_presence:
                 # Mark the calibrated reject score as pending; filled on success.
                 record["presence_score"] = None
+            if with_speaker_score:
+                # R7 speaker-cosine variants; filled on success. The gating
+                # variant is selected at eval time from the checkpoint's
+                # speaker_score_type, so all three are recorded here.
+                record["enhanced_cosine"] = None
+                record["mixture_cosine"] = None
+                record["max_cosine"] = None
             if output_path.resolve(strict=False) == row.command_audio.resolve(strict=False):
                 raise ValueError("refusing to overwrite original command audio")
             try:
@@ -348,6 +369,18 @@ def run_inference(
                         )
                     else:
                         enhanced = enhance_waveform(model, waveform, embedding)
+                    if with_speaker_score:
+                        enh_emb = speaker_encoder.embed_tensor(enhanced)
+                        mix_emb = speaker_encoder.embed_tensor(waveform)
+                        enh_cos = float(
+                            cosine_tensor(enh_emb, embedding).reshape(-1)[0].item()
+                        )
+                        mix_cos = float(
+                            cosine_tensor(mix_emb, embedding).reshape(-1)[0].item()
+                        )
+                        record["enhanced_cosine"] = enh_cos
+                        record["mixture_cosine"] = mix_cos
+                        record["max_cosine"] = max(enh_cos, mix_cos)
                 result = enhanced.detach().float().cpu().numpy().reshape(-1)
                 if result.size != mixture.size or not np.isfinite(result).all():
                     raise ValueError("non-finite or length-changing enhanced output")
@@ -376,12 +409,13 @@ def run_inference(
 
 
 def read_presence_metadata(checkpoint: str | Path) -> dict:
-    """Read the calibrated presence threshold/source from a checkpoint.
+    """Read the calibrated presence/speaker threshold/source from a checkpoint.
 
-    Returns ``{presence_threshold, presence_threshold_source, presence_auc}``
-    for a with-presence checkpoint; keys are absent if not stored. Called once
-    per inference run so the audio map + summary carry the gating threshold
-    without inference needing to re-tune it.
+    Returns presence keys (``presence_threshold`` etc.) for a with-presence
+    checkpoint and speaker keys (``speaker_threshold``, ``speaker_score_type``,
+    ``speaker_score_variants`` etc.) for an R7 with-speaker-score checkpoint.
+    Keys are absent when not stored. Called once per inference run so the audio
+    map + summary carry the gating threshold without inference re-tuning it.
     """
     payload = torch.load(
         Path(checkpoint).expanduser().resolve(strict=False),
@@ -394,6 +428,12 @@ def read_presence_metadata(checkpoint: str | Path) -> dict:
         "presence_threshold_source",
         "presence_auc",
         "presence_weight",
+        "with_speaker_score",
+        "speaker_score_type",
+        "speaker_threshold",
+        "speaker_threshold_source",
+        "speaker_auc",
+        "speaker_score_variants",
     ):
         if key in payload:
             meta[key] = payload[key]

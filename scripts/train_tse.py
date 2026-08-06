@@ -45,6 +45,12 @@ from xh202615.target_extractor import (
     multi_resolution_stft_loss,
     negative_si_sdr_loss,
 )
+from xh202615.speaker_score import (
+    SCORE_VARIANTS,
+    SpeakerEncoder,
+    build_wespeaker_encoder,
+    cosine_tensor,
+)
 from xh202615.training_data import (
     TrainingManifestRow,
     assert_valid_training_manifest,
@@ -410,6 +416,75 @@ def calibrate_presence_threshold(
     best["n_pos"] = float(n_pos)
     best["n_neg"] = float(n_neg)
     return best
+
+
+def calibrate_speaker_youden(
+    enhanced_scores: np.ndarray,
+    mixture_scores: np.ndarray,
+    labels: np.ndarray,
+) -> dict:
+    """Per-variant Youden-J calibration + AUC-based variant selection (surrogate).
+
+    The trainer has no ASR, so it cannot optimise the official Overall. It
+    therefore picks the speaker-score variant with the best public-val AUC and a
+    Youden-J threshold as a justified surrogate - mirroring the R6 presence
+    threshold, which was also a Youden-J surrogate stored in the checkpoint. The
+    authoritative Overall-optimal variant+threshold is produced later by the
+    ``--calibrate`` step (which has public-val ASR).
+
+    ``enhanced_scores`` / ``mixture_scores`` are the cosines between the
+    enrollment embedding and the enhanced / mixture embeddings; ``labels`` is
+    {0,1} (absent/present). Returns the selected variant, its Youden threshold,
+    AUC, and per-variant diagnostics. Fails loudly if a class is missing.
+    """
+    enhanced_scores = np.asarray(enhanced_scores, dtype=np.float64).reshape(-1)
+    mixture_scores = np.asarray(mixture_scores, dtype=np.float64).reshape(-1)
+    labels = np.asarray(labels, dtype=np.float64).reshape(-1)
+    if enhanced_scores.shape != labels.shape or mixture_scores.shape != labels.shape:
+        raise ValueError("speaker scores and labels must share a shape")
+    n_pos = int(labels.sum())
+    n_neg = int(len(labels) - n_pos)
+    if n_pos == 0 or n_neg == 0:
+        raise ValueError(
+            f"cannot calibrate speaker score with {n_pos} pos / {n_neg} neg"
+        )
+    raw = {
+        "enhanced_cosine": enhanced_scores,
+        "mixture_cosine": mixture_scores,
+        "max_cosine": np.maximum(enhanced_scores, mixture_scores),
+    }
+    per_variant: dict[str, dict] = {}
+    for variant in SCORE_VARIANTS:
+        per_variant[variant] = calibrate_presence_threshold(raw[variant], labels)
+    # Select by AUC (higher is better); tie-break toward the enhanced variant
+    # (it is the TSE-gating-aligned signal), then by Youden J.
+    order = ["enhanced_cosine", "mixture_cosine", "max_cosine"]
+    best_variant = max(
+        order,
+        key=lambda v: (per_variant[v]["auc"], per_variant[v]["youden_j"]),
+    )
+    chosen = per_variant[best_variant]
+    return {
+        "score_type": best_variant,
+        "threshold": float(chosen["threshold"]),
+        "threshold_source": "public_val_youden_j",
+        "auc": float(chosen["auc"]),
+        "youden_j": float(chosen["youden_j"]),
+        "tpr": float(chosen["tpr"]),
+        "fpr": float(chosen["fpr"]),
+        "false_reject_rate": float(chosen["false_reject_rate"]),
+        "false_accept_rate": float(chosen["false_accept_rate"]),
+        "n_pos": float(n_pos),
+        "n_neg": float(n_neg),
+        "per_variant": {
+            v: {
+                "auc": per_variant[v]["auc"],
+                "threshold": per_variant[v]["threshold"],
+                "youden_j": per_variant[v]["youden_j"],
+            }
+            for v in SCORE_VARIANTS
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -804,6 +879,7 @@ def evaluate_joint(
     batch_size: int,
     stft_weight: float,
     si_sdr_weight: float,
+    speaker_encoder: SpeakerEncoder | None = None,
 ) -> dict:
     """Evaluate reconstruction (present rows) + presence discrimination (all).
 
@@ -811,6 +887,12 @@ def evaluate_joint(
     false-accept/false-reject rates at that threshold. The threshold is a
     justified surrogate (maximises TPR-FPR on the public validation split) and
     is stored in the checkpoint so inference can gate without re-tuning.
+
+    When ``speaker_encoder`` is given (R7), additionally compute the
+    enrollment-conditioned speaker cosines (enhanced + mixture) for every row
+    and calibrate a per-variant Youden-J threshold + AUC-selected variant as a
+    surrogate reject score. This is the domain-invariant gating signal; the
+    authoritative Overall-optimal threshold is produced later by ``--calibrate``.
     """
     model.eval()
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
@@ -820,6 +902,9 @@ def evaluate_joint(
     count = 0
     scores: list[float] = []
     labels: list[float] = []
+    enh_speaker: list[float] = []
+    mix_speaker: list[float] = []
+    speaker_labels: list[float] = []
     for mixture, target, embedding, label in loader:
         mixture = mixture.to(device)
         target = target.to(device)
@@ -846,6 +931,14 @@ def evaluate_joint(
             count += batch
         scores.extend(torch.sigmoid(presence_logit.reshape(-1)).float().cpu().tolist())
         labels.extend(label.float().cpu().tolist())
+        if speaker_encoder is not None:
+            enh_emb = speaker_encoder.embed_tensor(enhanced)
+            mix_emb = speaker_encoder.embed_tensor(mixture)
+            enh_cos = cosine_tensor(enh_emb, embedding).float().cpu().tolist()
+            mix_cos = cosine_tensor(mix_emb, embedding).float().cpu().tolist()
+            enh_speaker.extend(enh_cos)
+            mix_speaker.extend(mix_cos)
+            speaker_labels.extend(label.float().cpu().tolist())
     scores_arr = np.asarray(scores, dtype=np.float64)
     labels_arr = np.asarray(labels, dtype=np.float64)
     presence = calibrate_presence_threshold(scores_arr, labels_arr)
@@ -859,13 +952,20 @@ def evaluate_joint(
         if count
         else {"loss": float("nan"), "si_sdr": float("nan"), "stft": float("nan"), "n": 0}
     )
-    return {
+    result = {
         "recon": recon,
         "presence": presence,
         "n_rows": int(len(labels_arr)),
         "n_present": int(labels_arr.sum()),
         "n_absent": int(len(labels_arr) - labels_arr.sum()),
     }
+    if speaker_encoder is not None:
+        result["speaker"] = calibrate_speaker_youden(
+            np.asarray(enh_speaker, dtype=np.float64),
+            np.asarray(mix_speaker, dtype=np.float64),
+            np.asarray(speaker_labels, dtype=np.float64),
+        )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +1001,8 @@ def run_training(
     embedding_provider: EmbeddingProvider | None = None,
     with_presence: bool = False,
     presence_weight: float = 1.0,
+    with_speaker_score: bool = False,
+    speaker_encoder: SpeakerEncoder | None = None,
 ) -> dict:
     """Run a deterministic TSE training pilot and write checkpoint + summary.
 
@@ -912,7 +1014,17 @@ def run_training(
     the checkpoint stores a calibrated presence threshold (Youden J on the
     public val split) for inference-time rejection. The default ``False``
     reproduces the original pilot exactly (backward compatible).
+
+    When ``with_speaker_score`` is ``True`` (R7, requires ``with_presence``) the
+    val evaluation additionally computes the enrollment-conditioned speaker
+    cosines (enhanced + mixture) and stores a Youden-J speaker threshold +
+    AUC-selected variant in the checkpoint as the domain-invariant reject score.
+    The authoritative Overall-optimal threshold is produced later by
+    ``--calibrate``. A single frozen WeSpeaker encoder backs both the
+    enrollment cache and the speaker score.
     """
+    if with_speaker_score and not with_presence:
+        raise ValueError("with_speaker_score=True requires with_presence=True")
     _seed_everything(seed)
     manifest_path = Path(manifest).expanduser().resolve(strict=False)
     output_path = Path(output_dir).expanduser().resolve(strict=False)
@@ -948,7 +1060,14 @@ def run_training(
     )
     use_amp = torch_device.type == "cuda"
 
-    if embedding_provider is None:
+    if with_speaker_score:
+        if speaker_encoder is None:
+            speaker_encoder = build_wespeaker_encoder(model_name, torch_device)
+        # One frozen WeSpeaker encoder backs both the enrollment cache and the
+        # speaker score, so the two embeddings live in the same space.
+        if embedding_provider is None:
+            embedding_provider = speaker_encoder.embed_path
+    elif embedding_provider is None:
         embedding_provider = wespeaker_provider(model_name, torch_device)
     cache_path = output_path / "enrollment_embeddings.pt"
     embeddings = load_or_build_embedding_cache(
@@ -1042,6 +1161,7 @@ def run_training(
                 batch_size=batch_size,
                 stft_weight=stft_weight,
                 si_sdr_weight=si_sdr_weight,
+                speaker_encoder=speaker_encoder if with_speaker_score else None,
             )
             # Test metrics are diagnostic only and never drive checkpoints.
             test_metrics = evaluate_joint(
@@ -1052,6 +1172,7 @@ def run_training(
                 batch_size=batch_size,
                 stft_weight=stft_weight,
                 si_sdr_weight=si_sdr_weight,
+                speaker_encoder=speaker_encoder if with_speaker_score else None,
             )
             val_selection_loss = val_metrics["recon"]["loss"]
         else:
@@ -1128,6 +1249,16 @@ def run_training(
                 )
                 checkpoint_payload["presence_auc"] = val_metrics["presence"]["auc"]
                 checkpoint_payload["class_balance"] = class_balance
+            if with_speaker_score and "speaker" in val_metrics:
+                speaker = val_metrics["speaker"]
+                checkpoint_payload["with_speaker_score"] = True
+                checkpoint_payload["speaker_score_type"] = speaker["score_type"]
+                checkpoint_payload["speaker_threshold"] = speaker["threshold"]
+                checkpoint_payload["speaker_threshold_source"] = (
+                    speaker["threshold_source"]
+                )
+                checkpoint_payload["speaker_auc"] = speaker["auc"]
+                checkpoint_payload["speaker_score_variants"] = list(SCORE_VARIANTS)
             torch.save(checkpoint_payload, best_path)
             saved = True
 
@@ -1195,6 +1326,20 @@ def run_training(
             summary["presence_threshold"] = presence["threshold"]
             summary["presence_threshold_source"] = "public_val_youden_j"
             summary["presence_auc"] = presence["auc"]
+    if with_speaker_score:
+        summary["with_speaker_score"] = True
+        summary["speaker_score_variants"] = list(SCORE_VARIANTS)
+        if best_epoch is not None and history:
+            best_record = next(
+                (h for h in history if h["epoch"] == best_epoch), history[-1]
+            )
+            if "speaker" in best_record["val"]:
+                speaker = best_record["val"]["speaker"]
+                summary["speaker_score_type"] = speaker["score_type"]
+                summary["speaker_threshold"] = speaker["threshold"]
+                summary["speaker_threshold_source"] = speaker["threshold_source"]
+                summary["speaker_auc"] = speaker["auc"]
+                summary["speaker_val_per_variant"] = speaker["per_variant"]
     (output_path / "summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
@@ -1241,6 +1386,14 @@ def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
         default=1.0,
         help="weight of the presence BCE objective (R6, used with --with-presence)",
     )
+    parser.add_argument(
+        "--with-speaker-score",
+        action="store_true",
+        help="R7: compute an enrollment-conditioned speaker-cosine reject score on "
+        "val (requires --with-presence) and store a calibrated speaker threshold + "
+        "variant in the checkpoint. The cosine is the domain-invariant gating signal; "
+        "presence BCE remains as an auxiliary objective.",
+    )
     return parser.parse_args(argv)
 
 
@@ -1275,6 +1428,7 @@ def train(args: argparse.Namespace, *, embedding_provider: EmbeddingProvider | N
         embedding_provider=embedding_provider,
         with_presence=args.with_presence,
         presence_weight=args.presence_weight,
+        with_speaker_score=args.with_speaker_score,
     )
 
 

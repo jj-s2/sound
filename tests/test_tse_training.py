@@ -150,6 +150,43 @@ def _mock_provider(dim: int = 8):
     return provider
 
 
+class _MockSpeakerEncoder:
+    """Content-dependent speaker encoder (no WeSpeaker) for R7 wiring tests.
+
+    ``embed_tensor`` fingerprints a waveform by averaging ``dim`` equal partitions
+    so the cosine is finite and content-dependent; ``embed_path`` reuses the
+    path-hash provider so the enrollment cache is in a comparable shape. Tests
+    only exercise plumbing (scores computed, metadata written, calibration
+    runs) - real discrimination is validated by the CUDA smoke with WeSpeaker.
+    """
+
+    def __init__(self, dim: int = 8) -> None:
+        self.dim = dim
+
+    def embed_tensor(self, waveform: torch.Tensor) -> torch.Tensor:
+        wav = waveform.float()
+        if wav.ndim != 2:
+            raise ValueError("expected [B, samples]")
+        b, n = wav.shape
+        emb = torch.zeros(b, self.dim)
+        idx = np.array_split(np.arange(n), self.dim)
+        for i, part in enumerate(idx):
+            if len(part):
+                emb[:, i] = wav[:, part].mean(dim=1)
+        return emb
+
+    def embed_audio(self, audio: np.ndarray) -> np.ndarray:
+        wav = torch.from_numpy(np.asarray(audio, dtype=np.float32)).reshape(1, -1)
+        return self.embed_tensor(wav).reshape(-1).numpy()
+
+    def embed_path(self, path) -> np.ndarray:
+        return _mock_provider(self.dim)(Path(path))
+
+
+def _mock_speaker_encoder(dim: int = 8) -> _MockSpeakerEncoder:
+    return _MockSpeakerEncoder(dim=dim)
+
+
 # ---------------------------------------------------------------------------
 # Manifest filtering and Dataset-A guard
 # ---------------------------------------------------------------------------
@@ -788,6 +825,114 @@ class JointCacheReuseTests(unittest.TestCase):
             self.assertEqual(set(payload["embeddings"]), set(payload2["embeddings"]))
             for key, vec in payload["embeddings"].items():
                 self.assertTrue(np.allclose(vec, payload2["embeddings"][key]))
+
+
+class JointEvaluateSpeakerTests(unittest.TestCase):
+    def test_returns_speaker_metrics_when_encoder_given(self):
+        torch.manual_seed(0)
+        model = FiLMCRNExtractor(
+            embedding_dim=8, channels=(4, 8), n_fft=512, hop_length=128,
+            win_length=None, gru_hidden=8, gru_layers=1, with_presence=True,
+        )
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest, _ = _write_fixture(tmp)
+            from xh202615.training_data import read_training_manifest
+
+            rows = tuple(r for r in read_training_manifest(manifest) if r.split == "train")
+            embeddings = {str(r.enrollment_audio): np.zeros(8, dtype=np.float32) for r in rows}
+            dataset = TSEJointDataset(rows, embeddings, 8000, seed=1, epoch=0)
+            metrics = evaluate_joint(
+                model, dataset, device=torch.device("cpu"), use_amp=False,
+                batch_size=2, stft_weight=1.0, si_sdr_weight=1.0,
+                speaker_encoder=_mock_speaker_encoder(dim=8),
+            )
+        self.assertIn("speaker", metrics)
+        spk = metrics["speaker"]
+        self.assertIn(spk["score_type"], ("enhanced_cosine", "mixture_cosine", "max_cosine"))
+        self.assertEqual(spk["threshold_source"], "public_val_youden_j")
+        self.assertIn("auc", spk)
+        self.assertIn("threshold", spk)
+        self.assertEqual(set(spk["per_variant"]),
+                         {"enhanced_cosine", "mixture_cosine", "max_cosine"})
+
+    def test_no_speaker_section_without_encoder(self):
+        torch.manual_seed(0)
+        model = FiLMCRNExtractor(
+            embedding_dim=8, channels=(4, 8), n_fft=512, hop_length=128,
+            win_length=None, gru_hidden=8, gru_layers=1, with_presence=True,
+        )
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            manifest, _ = _write_fixture(tmp)
+            from xh202615.training_data import read_training_manifest
+
+            rows = tuple(r for r in read_training_manifest(manifest) if r.split == "train")
+            embeddings = {str(r.enrollment_audio): np.zeros(8, dtype=np.float32) for r in rows}
+            dataset = TSEJointDataset(rows, embeddings, 8000, seed=1, epoch=0)
+            metrics = evaluate_joint(
+                model, dataset, device=torch.device("cpu"), use_amp=False,
+                batch_size=2, stft_weight=1.0, si_sdr_weight=1.0,
+            )
+        self.assertNotIn("speaker", metrics)
+
+
+class RunTrainingSpeakerScoreTests(unittest.TestCase):
+    def _run(self, tmp: Path, **overrides):
+        dataset_a = tmp / "datasetA_root"
+        dataset_a.mkdir()
+        manifest, _ = _write_fixture(tmp, pos_per_split=2, neg_per_split=2)
+        kwargs = dict(
+            manifest=manifest, output_dir=tmp / "tse_out", dataset_a_root=dataset_a,
+            embedding_dim=8, channels=(4, 8), gru_hidden=8, gru_layers=1,
+            epochs=1, batch_size=2, segment_seconds=0.5, seed=20260805,
+            device="cpu", reuse_cache=False,
+            embedding_provider=_mock_provider(dim=8),
+            with_presence=True, with_speaker_score=True,
+            speaker_encoder=_mock_speaker_encoder(dim=8),
+        )
+        kwargs.update(overrides)
+        return run_training(**kwargs)
+
+    def test_writes_speaker_metadata_in_checkpoint_and_summary(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            summary = self._run(tmp)
+            self.assertTrue(summary["with_speaker_score"])
+            self.assertIn(summary["speaker_score_type"],
+                          ("enhanced_cosine", "mixture_cosine", "max_cosine"))
+            self.assertEqual(summary["speaker_threshold_source"], "public_val_youden_j")
+            self.assertIn("speaker_threshold", summary)
+            self.assertIn("speaker_auc", summary)
+            self.assertEqual(set(summary["speaker_val_per_variant"]),
+                             {"enhanced_cosine", "mixture_cosine", "max_cosine"})
+
+            ckpt = torch.load(tmp / "tse_out" / "best.pt", map_location="cpu", weights_only=False)
+            self.assertTrue(ckpt["with_speaker_score"])
+            self.assertIn("speaker_threshold", ckpt)
+            self.assertIn("speaker_score_type", ckpt)
+            self.assertEqual(ckpt["speaker_threshold_source"], "public_val_youden_j")
+            self.assertEqual(set(ckpt["speaker_score_variants"]),
+                             {"enhanced_cosine", "mixture_cosine", "max_cosine"})
+            # Presence metadata still present (auxiliary head).
+            self.assertTrue(ckpt["with_presence"])
+            self.assertIn("presence_threshold", ckpt)
+
+    def test_with_speaker_score_requires_with_presence(self):
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp = Path(tmp_str)
+            dataset_a = tmp / "datasetA_root"
+            dataset_a.mkdir()
+            manifest, _ = _write_fixture(tmp, pos_per_split=2, neg_per_split=2)
+            with self.assertRaisesRegex(ValueError, "with_speaker_score"):
+                run_training(
+                    manifest=manifest, output_dir=tmp / "out", dataset_a_root=dataset_a,
+                    embedding_dim=8, channels=(4, 8), gru_hidden=8, gru_layers=1,
+                    epochs=1, batch_size=2, segment_seconds=0.5, seed=20260805,
+                    device="cpu", reuse_cache=False, embedding_provider=_mock_provider(dim=8),
+                    with_presence=False, with_speaker_score=True,
+                    speaker_encoder=_mock_speaker_encoder(dim=8),
+                )
 
 
 if __name__ == "__main__":
