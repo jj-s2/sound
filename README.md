@@ -64,5 +64,25 @@ scripts/r5_oracle_report.py
 xh202615/r5_oracle.py
 ```
 
+## TSE inference adapter
+
+After the public-only pilot, run the trained checkpoint to create enhanced
+command audio for the existing FunASR runner:
+
+```powershell
+.venv\Scripts\python.exe scripts\run_tse_inference.py `
+  --checkpoint output\tse_pilot\best.pt `
+  --dataset-root datasetA\datasetA `
+  --splits pos,neg `
+  --output-root output\tse_inference\enhanced `
+  --output-map output\tse_inference\audio_map.jsonl `
+  --embedding-cache output\tse_inference\enrollment_embeddings.pt `
+  --device cuda --resume
+```
+
+Pass the resulting map to `scripts\run_funasr_asr.py` with
+`--command-audio-map`. The adapter reads only input-side audio fields and keeps
+generated audio, caches, predictions, and evaluation artifacts outside Git.
+
 Use local, explicitly supplied paths for AISHELL and any permitted RIR/noise assets. Do not commit
 datasets, credentials, or generated outputs.
