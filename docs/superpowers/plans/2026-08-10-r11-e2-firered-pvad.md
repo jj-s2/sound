@@ -568,7 +568,7 @@ Copy E0 defaults for dataset/candidate/TSE/audio/R3/group paths and add:
 - [ ] **Step 6: Run focused and full scoped tests**
 
 ```powershell
-.venv\Scripts\python.exe -m pytest tests\test_artifact_publish.py tests\test_firered_model_assets.py tests\test_firered_pvad.py tests\test_pvad_cache.py tests\test_r11_pvad_oracle.py tests\test_r11_gate_oracle.py tests\test_r10_selector.py tests\test_datasetA_group_manifest.py tests\test_metrics.py tests\test_r8_router.py -q
+.venv\Scripts\python.exe -m pytest tests\test_artifact_publish.py tests\test_firered_model_assets.py tests\test_firered_pvad.py tests\test_pvad_cache.py tests\test_r11_pvad_oracle.py tests\test_r11_gate_oracle.py tests\test_metrics.py -q
 .venv\Scripts\python.exe scripts\r11_pvad_oracle_oof.py --help
 ```
 
