@@ -497,6 +497,89 @@ def _best_model_frontier(
     return best, annotated_frontier
 
 
+@dataclass(frozen=True)
+class _BootstrapModelBins:
+    """Immutable score-bin layout reused by every bootstrap replicate."""
+
+    thresholds: np.ndarray
+    order: np.ndarray
+    bin_starts: np.ndarray
+
+
+def _prepare_bootstrap_model_bins(scores: np.ndarray) -> _BootstrapModelBins:
+    order = np.argsort(-scores, kind="mergesort")
+    sorted_scores = scores[order]
+    bin_starts = np.flatnonzero(
+        np.r_[True, sorted_scores[1:] != sorted_scores[:-1]]
+    )
+    return _BootstrapModelBins(
+        thresholds=sorted_scores[bin_starts],
+        order=order,
+        bin_starts=bin_starts,
+    )
+
+
+def _bootstrap_best_point(
+    bins: _BootstrapModelBins,
+    group_multiplicities: np.ndarray,
+    row_group_codes: np.ndarray,
+    is_positive: np.ndarray,
+    error_delta: np.ndarray,
+    total_ref_chars: int,
+    negative_count: int,
+    rr_floor: float,
+) -> tuple[float, float, float, float]:
+    """Return the best feasible point without allocating frontier dictionaries."""
+
+    ordered_weights = group_multiplicities[row_group_codes[bins.order]]
+    ordered_positive = is_positive[bins.order]
+    positive_by_bin = np.add.reduceat(
+        ordered_weights * ordered_positive, bins.bin_starts
+    )
+    negative_by_bin = np.add.reduceat(
+        ordered_weights * (~ordered_positive), bins.bin_starts
+    )
+    delta_by_bin = np.add.reduceat(
+        ordered_weights * error_delta[bins.order], bins.bin_starts
+    )
+
+    accepted_negatives = np.cumsum(negative_by_bin, dtype=np.int64)
+    errors = total_ref_chars + np.cumsum(delta_by_bin, dtype=np.int64)
+    cer = errors / total_ref_chars if total_ref_chars else np.zeros_like(errors, dtype=np.float64)
+    rr = (negative_count - accepted_negatives) / negative_count
+    overall = ((1.0 - cer) + rr) / 2.0
+    feasible = np.flatnonzero(rr >= rr_floor)
+
+    # Reject-all is always feasible and supplies the initial incumbent.
+    reject_all_cer = 1.0 if total_ref_chars else 0.0
+    best = (((1.0 - reject_all_cer) + 1.0) / 2.0, 1.0, reject_all_cer, math.inf)
+    if feasible.size:
+        feasible_keys = np.lexsort(
+            (
+                bins.thresholds[feasible],
+                -cer[feasible],
+                rr[feasible],
+                overall[feasible],
+            )
+        )
+        index = int(feasible[feasible_keys[-1]])
+        candidate = (
+            float(overall[index]),
+            float(rr[index]),
+            float(cer[index]),
+            float(bins.thresholds[index]),
+        )
+        candidate_key = (
+            candidate[0],
+            candidate[1],
+            -candidate[2],
+            candidate[3],
+        )
+        if candidate_key > (best[0], best[1], -best[2], best[3]):
+            best = candidate
+    return best
+
+
 def group_bootstrap_best_frontier(
     scores_by_model: Mapping[str, Sequence[float]],
     contributions: OracleContributions,
@@ -505,8 +588,14 @@ def group_bootstrap_best_frontier(
     rr_floor: float,
     n_boot: int,
     seed: int,
+    max_attempts: int | None = None,
 ) -> dict:
-    """Group-bootstrap the best feasible model/threshold with reselection."""
+    """Group-bootstrap exactly ``n_boot`` valid model/threshold reselections.
+
+    Complete-group draws that lose a target class are deterministically rejected
+    and redrawn. Attempt and rejection counts make this conditioning auditable;
+    a bounded cap fails closed instead of looping indefinitely.
+    """
 
     n_rows = _validate_contributions(contributions)
     group_array = np.asarray(groups)
@@ -516,58 +605,100 @@ def group_bootstrap_best_frontier(
         raise ValueError("n_boot must be positive")
     if not scores_by_model:
         raise ValueError("scores_by_model must not be empty")
+    if max_attempts is None:
+        max_attempts = max(n_boot * 10, n_boot + 1000)
+    if max_attempts < n_boot:
+        raise ValueError("max_attempts must be at least n_boot")
 
-    frozen_scores: dict[str, np.ndarray] = {}
+    model_bins: dict[str, _BootstrapModelBins] = {}
     for model_name, scores in scores_by_model.items():
         score_array = np.asarray(scores, dtype=np.float64)
         if score_array.ndim != 1 or len(score_array) != n_rows:
             raise ValueError(f"scores for {model_name} must match contributions")
         if not np.isfinite(score_array).all():
             raise ValueError(f"scores for {model_name} must be finite")
-        frozen_scores[model_name] = score_array
+        model_bins[model_name] = _prepare_bootstrap_model_bins(score_array)
 
-    group_to_indices: dict[object, list[int]] = {}
-    for index, group in enumerate(group_array.tolist()):
-        group_to_indices.setdefault(group, []).append(index)
-    group_names = sorted(group_to_indices, key=str)
-    if not group_names:
+    group_names, row_group_codes = np.unique(group_array, return_inverse=True)
+    if not len(group_names):
         raise ValueError("at least one group is required")
-    group_indices = {
-        group: np.asarray(indices, dtype=np.int64)
-        for group, indices in group_to_indices.items()
-    }
+    is_positive = np.asarray(contributions.is_positive, dtype=np.bool_)
+    if np.unique(is_positive).size != 2:
+        raise ValueError("bootstrap input must contain both target classes")
+    ref_chars = np.asarray(contributions.ref_chars, dtype=np.int64)
+    accepted_errors = (
+        np.asarray(contributions.substitutions, dtype=np.int64)
+        + np.asarray(contributions.insertions, dtype=np.int64)
+        + np.asarray(contributions.deletions, dtype=np.int64)
+    )
+    error_delta = np.where(is_positive, accepted_errors - ref_chars, 0)
+    group_ref_chars = np.bincount(
+        row_group_codes, weights=ref_chars, minlength=len(group_names)
+    ).astype(np.int64)
+    group_negatives = np.bincount(
+        row_group_codes, weights=(~is_positive), minlength=len(group_names)
+    ).astype(np.int64)
+    group_positives = np.bincount(
+        row_group_codes, weights=is_positive, minlength=len(group_names)
+    ).astype(np.int64)
+
     rng = np.random.default_rng(seed)
     overall_samples: list[float] = []
     selected_models: list[str] = []
     selected_thresholds: list[float] = []
+    attempted_replicates = 0
+    rejected_replicates = 0
 
-    for _ in range(n_boot):
+    while len(overall_samples) < n_boot:
+        if attempted_replicates >= max_attempts:
+            raise RuntimeError(
+                "group bootstrap exhausted "
+                f"max_attempts={max_attempts} after {rejected_replicates} "
+                f"class-degenerate draws and {len(overall_samples)} valid replicates"
+            )
         sampled_positions = rng.integers(0, len(group_names), size=len(group_names))
-        sampled_names = [group_names[int(position)] for position in sampled_positions]
-        sampled_indices = np.concatenate(
-            [group_indices[group_name] for group_name in sampled_names]
-        )
-        sampled_contributions = _subset_contributions(contributions, sampled_indices)
-        if np.unique(sampled_contributions.is_positive).size != 2:
-            raise ValueError("group bootstrap replicate lost a target class")
-        sampled_scores = {
-            model_name: scores[sampled_indices]
-            for model_name, scores in frozen_scores.items()
-        }
-        selected, _frontier = _best_model_frontier(
-            sampled_scores,
-            sampled_contributions,
-            rr_floor,
-            include_frontier=False,
-        )
-        overall_samples.append(float(selected["overall"]))
-        selected_models.append(str(selected["model"]))
-        selected_thresholds.append(float(selected["threshold"]))
+        attempted_replicates += 1
+        multiplicities = np.bincount(
+            sampled_positions, minlength=len(group_names)
+        ).astype(np.int64)
+        positive_count = int(group_positives @ multiplicities)
+        negative_count = int(group_negatives @ multiplicities)
+        if positive_count == 0 or negative_count == 0:
+            rejected_replicates += 1
+            continue
+        total_ref_chars = int(group_ref_chars @ multiplicities)
+
+        selected_model: str | None = None
+        selected_point: tuple[float, float, float, float] | None = None
+        selected_key: tuple[float, float, float] | None = None
+        for model_name in sorted(model_bins):
+            point = _bootstrap_best_point(
+                model_bins[model_name],
+                multiplicities,
+                row_group_codes,
+                is_positive,
+                error_delta,
+                total_ref_chars,
+                negative_count,
+                rr_floor,
+            )
+            key = (point[0], point[1], -point[2])
+            if selected_key is None or key > selected_key:
+                selected_model = model_name
+                selected_point = point
+                selected_key = key
+
+        overall_samples.append(selected_point[0])
+        selected_models.append(selected_model)
+        selected_thresholds.append(selected_point[3])
 
     overall_array = np.asarray(overall_samples, dtype=np.float64)
     return {
         "n_boot": n_boot,
         "n_groups": len(group_names),
+        "max_attempts": max_attempts,
+        "attempted_replicates": attempted_replicates,
+        "rejected_replicates": rejected_replicates,
         "overall_mean": float(overall_array.mean()),
         "ci_low": float(np.quantile(overall_array, 0.025)),
         "ci_high": float(np.quantile(overall_array, 0.975)),

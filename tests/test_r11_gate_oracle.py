@@ -223,33 +223,104 @@ class GateBootstrapDecisionTests(unittest.TestCase):
         }
         return rows, labels, np.asarray(groups), scores
 
+    @staticmethod
+    def _manual_best_for_sample(
+        sampled_groups: list[str],
+        rows: list[CandidateRow],
+        labels: dict[str, str | None],
+        groups: np.ndarray,
+        scores: dict[str, np.ndarray],
+        rr_floor: float,
+    ) -> tuple[str, float]:
+        indices = [
+            index
+            for sampled_group in sampled_groups
+            for index, group in enumerate(groups)
+            if group == sampled_group
+        ]
+        best = None
+        for model_name in sorted(scores):
+            sampled_scores = [float(scores[model_name][index]) for index in indices]
+            thresholds = [math.inf, *sorted(set(sampled_scores), reverse=True)]
+            model_best = None
+            for threshold in thresholds:
+                accepted = [score >= threshold for score in sampled_scores]
+                positives = [labels[rows[index].id] is not None for index in indices]
+                n_negative = sum(not positive for positive in positives)
+                accepted_negative = sum(
+                    accept and not positive
+                    for accept, positive in zip(accepted, positives)
+                )
+                rr = (n_negative - accepted_negative) / n_negative
+                errors = sum(
+                    0 if accept else 1
+                    for accept, positive in zip(accepted, positives)
+                    if positive
+                )
+                ref_chars = sum(positives)
+                cer = errors / ref_chars
+                overall = ((1.0 - cer) + rr) / 2.0
+                if rr < rr_floor:
+                    continue
+                key = (overall, rr, -cer, threshold)
+                if model_best is None or key > model_best[0]:
+                    model_best = (key, threshold)
+            candidate = (model_best[0][:3], model_name, model_best[1])
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+        return best[1], best[2]
+
     def test_group_bootstrap_reselects_model_and_threshold_per_replicate(self):
         rows, labels, groups, scores = self._literal_group_fixture()
         contributions = build_oracle_contributions(rows, labels)
+        n_boot = 16
+        seed = 17
         first = group_bootstrap_best_frontier(
             scores,
             contributions,
             groups,
             rr_floor=0.93,
-            n_boot=64,
-            seed=17,
+            n_boot=n_boot,
+            seed=seed,
         )
         second = group_bootstrap_best_frontier(
             scores,
             contributions,
             groups,
             rr_floor=0.93,
-            n_boot=64,
-            seed=17,
+            n_boot=n_boot,
+            seed=seed,
         )
 
+        rng = np.random.default_rng(seed)
+        group_names = sorted(set(groups.tolist()))
+        expected = []
+        while len(expected) < n_boot:
+            sampled = [
+                group_names[index]
+                for index in rng.integers(0, len(group_names), size=len(group_names))
+            ]
+            sampled_indices = [
+                index
+                for sampled_group in sampled
+                for index, group in enumerate(groups)
+                if group == sampled_group
+            ]
+            sampled_classes = {labels[rows[index].id] is not None for index in sampled_indices}
+            if len(sampled_classes) != 2:
+                continue
+            expected.append(
+                self._manual_best_for_sample(
+                    sampled, rows, labels, groups, scores, rr_floor=0.93
+                )
+            )
+
         self.assertEqual(first, second)
-        self.assertEqual(first["n_boot"], 64)
-        self.assertEqual(len(first["overall_samples"]), 64)
-        self.assertEqual(len(first["selected_models"]), 64)
-        self.assertEqual(len(first["selected_thresholds"]), 64)
-        self.assertEqual(set(first["selected_models"]), {"model_a", "model_b"})
-        self.assertGreater(len(set(first["selected_thresholds"])), 1)
+        self.assertEqual(first["n_boot"], n_boot)
+        self.assertEqual(first["attempted_replicates"], n_boot)
+        self.assertEqual(first["rejected_replicates"], 0)
+        self.assertEqual(first["selected_models"], [item[0] for item in expected])
+        self.assertEqual(first["selected_thresholds"], [item[1] for item in expected])
 
     def test_group_bootstrap_uses_stable_model_name_for_metric_ties(self):
         rows, labels, groups, scores = self._literal_group_fixture()
@@ -264,13 +335,34 @@ class GateBootstrapDecisionTests(unittest.TestCase):
         )
         self.assertEqual(set(tied["selected_models"]), {"a_model"})
 
-    def test_group_bootstrap_fails_closed_if_resample_loses_target_class(self):
+    def test_group_bootstrap_redraws_class_degenerate_samples(self):
         rows = [
             _row("p", "甲", r3="甲", primary="", energy="", tse=""),
             _row("n", None, r3="", primary="", energy="", tse=""),
         ]
         contributions = build_oracle_contributions(rows, {"p": "甲", "n": None})
-        with self.assertRaisesRegex(ValueError, "lost a target class"):
+        result = group_bootstrap_best_frontier(
+            {"model": np.array([0.9, 0.1])},
+            contributions,
+            np.array(["positive", "negative"]),
+            rr_floor=0.93,
+            n_boot=1,
+            seed=11,
+            max_attempts=2,
+        )
+        self.assertEqual(result["n_boot"], 1)
+        self.assertEqual(result["attempted_replicates"], 2)
+        self.assertEqual(result["rejected_replicates"], 1)
+        self.assertEqual(result["selected_models"], ["model"])
+        self.assertEqual(result["selected_thresholds"], [0.9])
+
+    def test_group_bootstrap_fails_closed_when_redraw_cap_is_exhausted(self):
+        rows = [
+            _row("p", "甲", r3="甲", primary="", energy="", tse=""),
+            _row("n", None, r3="", primary="", energy="", tse=""),
+        ]
+        contributions = build_oracle_contributions(rows, {"p": "甲", "n": None})
+        with self.assertRaisesRegex(RuntimeError, "exhausted max_attempts=1"):
             group_bootstrap_best_frontier(
                 {"model": np.array([0.9, 0.1])},
                 contributions,
@@ -278,7 +370,47 @@ class GateBootstrapDecisionTests(unittest.TestCase):
                 rr_floor=0.93,
                 n_boot=1,
                 seed=11,
+                max_attempts=1,
             )
+
+    def test_group_bootstrap_uses_best_point_path_without_full_frontiers(self):
+        rows, labels, groups, scores = self._literal_group_fixture()
+        contributions = build_oracle_contributions(rows, labels)
+        with patch(
+            "xh202615.r11_gate_oracle.gate_oracle_frontier",
+            side_effect=AssertionError("bootstrap must not allocate full frontiers"),
+        ), patch(
+            "xh202615.r11_gate_oracle._subset_contributions",
+            side_effect=AssertionError("bootstrap must not copy chosen actions"),
+        ):
+            result = group_bootstrap_best_frontier(
+                scores,
+                contributions,
+                groups,
+                rr_floor=0.93,
+                n_boot=4,
+                seed=17,
+            )
+        self.assertEqual(len(result["overall_samples"]), 4)
+
+    def test_group_bootstrap_best_point_keeps_tied_scores_atomic(self):
+        rows = [
+            _row("p0", "甲", r3="甲", primary="", energy="", tse=""),
+            _row("n0", None, r3="", primary="", energy="", tse=""),
+            _row("p1", "乙", r3="乙", primary="", energy="", tse=""),
+            _row("n1", None, r3="", primary="", energy="", tse=""),
+        ]
+        labels = {"p0": "甲", "n0": None, "p1": "乙", "n1": None}
+        contributions = build_oracle_contributions(rows, labels)
+        result = group_bootstrap_best_frontier(
+            {"model": np.array([0.8, 0.8, 0.7, 0.1])},
+            contributions,
+            np.array(["group"] * 4),
+            rr_floor=0.5,
+            n_boot=1,
+            seed=1,
+        )
+        self.assertEqual(result["selected_thresholds"], [0.7])
 
     @classmethod
     def _patched_cross_fit(cls):
