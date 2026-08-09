@@ -43,6 +43,9 @@ _SENTINEL_ACCEPTED_NEGATIVE = "__accepted_negative__"
 # JSON-safe marker for the reject-all threshold (positive infinity).
 _REJECT_ALL_THRESHOLD_MARKER = "__reject_all__"
 
+_ARTIFACT_KIND = "r11_e0_gate_oracle"
+_SCHEMA_VERSION = "v1"
+
 _ARTIFACT_NAMES = {
     "manifest": "e0_manifest.json",
     "summary": "e0_summary.json",
@@ -452,6 +455,17 @@ def _validate_result(
     for key in ("avg_cer", "avg_rr", "overall", "false_reject_rate", "false_accept_rate"):
         if key not in official:
             raise ValueError(f"official_metrics is missing {key!r}")
+        if not math.isfinite(float(official[key])):
+            raise ValueError(f"official metric {key} is not finite: {official[key]!r}")
+
+    selected = result["selected_point"]
+    for key, custom_key in (("avg_cer", "cer"), ("avg_rr", "rr"), ("overall", "overall")):
+        delta = abs(float(selected[custom_key]) - float(official[key]))
+        if delta > 1e-9:
+            raise ValueError(
+                f"custom/official {key} disagreement: custom={selected[custom_key]!r}, "
+                f"official={official[key]!r}, delta={delta}"
+            )
 
     scores_by_model = result["scores_by_model"]
     if not scores_by_model:
@@ -619,10 +633,30 @@ def _build_fold_metadata_evidence(result: dict[str, Any]) -> list[dict[str, Any]
 
 
 def _is_recognized_output(path: Path) -> bool:
-    """True only if the directory contains exactly this CLI's five artifacts."""
+    """True only if the directory contains exactly this CLI's five artifact files
+    with the approved identity/schema markers in manifest and summary."""
     if not path.is_dir():
         return False
-    return {p.name for p in path.iterdir()} == set(_ARTIFACT_NAMES.values())
+    expected_names = set(_ARTIFACT_NAMES.values())
+    if {p.name for p in path.iterdir()} != expected_names:
+        return False
+    for name in expected_names:
+        child = path / name
+        if not child.is_file():
+            return False
+
+    try:
+        manifest = json.loads((path / _ARTIFACT_NAMES["manifest"]).read_text(encoding="utf-8"))
+        summary = json.loads((path / _ARTIFACT_NAMES["summary"]).read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+
+    for obj in (manifest, summary):
+        if obj.get("artifact_kind") != _ARTIFACT_KIND:
+            return False
+        if obj.get("schema_version") != _SCHEMA_VERSION:
+            return False
+    return True
 
 
 def _unique_sibling(parent: Path, prefix: str) -> Path:
@@ -710,6 +744,8 @@ def write_e0_artifacts(
     parity = {key: value <= 1e-9 for key, value in deltas.items()}
 
     manifest = {
+        "artifact_kind": _ARTIFACT_KIND,
+        "schema_version": _SCHEMA_VERSION,
         "config_hash": config_hash,
         "source_digest": source_digest,
         "feature_state_digest": feature_state_digest,
@@ -745,6 +781,8 @@ def write_e0_artifacts(
     }
 
     summary = {
+        "artifact_kind": _ARTIFACT_KIND,
+        "schema_version": _SCHEMA_VERSION,
         "status": "success",
         "decision": result["decision"],
         "diagnostic_only": result["diagnostic_only"],
@@ -847,6 +885,8 @@ def write_e0_artifacts(
     staging = _unique_sibling(parent, output_root.name + ".staging")
     staging.mkdir()
     backup: Path | None = None
+    publish_succeeded = False
+    restore_succeeded = False
     try:
         (staging / _ARTIFACT_NAMES["manifest"]).write_text(manifest_json, encoding="utf-8")
         (staging / _ARTIFACT_NAMES["summary"]).write_text(summary_json, encoding="utf-8")
@@ -867,16 +907,23 @@ def write_e0_artifacts(
             os.rename(output_root, backup)
 
         os.rename(staging, output_root)
-    except Exception:
+        publish_succeeded = True
+    except Exception as publish_exc:
         if backup is not None and backup.exists():
-            if output_root.exists():
-                shutil.rmtree(output_root)
-            os.rename(backup, output_root)
+            try:
+                if output_root.exists():
+                    shutil.rmtree(output_root)
+                os.rename(backup, output_root)
+                restore_succeeded = True
+            except Exception as restore_exc:
+                raise RuntimeError(
+                    f"publish failed and restore failed; recovery backup at {backup}: {restore_exc}"
+                ) from publish_exc
         raise
     finally:
         if staging.exists():
             shutil.rmtree(staging)
-        if backup is not None and backup.exists():
+        if backup is not None and backup.exists() and (publish_succeeded or restore_succeeded):
             shutil.rmtree(backup)
 
     return final_paths

@@ -35,7 +35,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.r11_gate_oracle_oof import (
+    _ARTIFACT_KIND,
     _REJECT_ALL_THRESHOLD_MARKER,
+    _SCHEMA_VERSION,
     _SENTINEL_ACCEPTED_NEGATIVE,
     _check_evaluator_parity,
     _next_branch,
@@ -721,6 +723,8 @@ class ArtifactWriterTests(unittest.TestCase):
             files = write_e0_artifacts(result, rows, groups, paths, out_root)
             manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
             for key in (
+                "artifact_kind",
+                "schema_version",
                 "config_hash",
                 "source_digest",
                 "feature_state_digest",
@@ -738,6 +742,8 @@ class ArtifactWriterTests(unittest.TestCase):
                 "bootstrap_summary",
             ):
                 self.assertIn(key, manifest, key)
+            self.assertEqual(manifest["artifact_kind"], _ARTIFACT_KIND)
+            self.assertEqual(manifest["schema_version"], _SCHEMA_VERSION)
             self.assertEqual(manifest["selected_point"]["diagnostic_only"], True)
             self.assertEqual(manifest["selected_point"]["deployable"], False)
             self.assertEqual(manifest["coverage"]["n_rows_total"], len(rows))
@@ -753,6 +759,9 @@ class ArtifactWriterTests(unittest.TestCase):
                 self.assertIn(key, parity)
             self.assertIn("false_reject_rate", parity["official"])
             self.assertIn("false_accept_rate", parity["official"])
+            summary = json.loads(files["summary"].read_text(encoding="utf-8"))
+            self.assertEqual(summary["artifact_kind"], _ARTIFACT_KIND)
+            self.assertEqual(summary["schema_version"], _SCHEMA_VERSION)
         finally:
             import shutil
             shutil.rmtree(tmp_path)
@@ -1188,7 +1197,7 @@ class ArtifactWriterTests(unittest.TestCase):
         self.assertEqual(official["false_reject_rate"], 1.0)
         self.assertEqual(official["false_accept_rate"], 0.0)
 
-    def test_official_parity_false_when_custom_official_disagree(self):
+    def test_metric_disagreement_fails_closed(self):
         rows, labels, groups = self._synthetic_rows()
         result = self._evaluate(rows, labels, groups)
         result["selected_point"]["cer"] = 0.999
@@ -1206,12 +1215,37 @@ class ArtifactWriterTests(unittest.TestCase):
         try:
             paths = self._make_paths(tmp_path)
             out_root = tmp_path / "out"
+            with self.assertRaises(ValueError):
+                write_e0_artifacts(result, rows, groups, paths, out_root)
+            self.assertFalse(out_root.exists())
+            self.assertFalse(any(p.name.startswith("out.staging") for p in tmp_path.iterdir()))
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def test_non_finite_official_metric_fails_closed(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        result["official_metrics"]["avg_cer"] = float("nan")
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            with self.assertRaises(ValueError):
+                write_e0_artifacts(result, rows, groups, paths, out_root)
+            self.assertFalse(out_root.exists())
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def test_all_parity_flags_true_in_published_package(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
             files = write_e0_artifacts(result, rows, groups, paths, out_root)
             manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
-            parity = manifest["official_parity"]
-            self.assertFalse(parity["parity"]["avg_cer"])
-            self.assertFalse(parity["parity"]["overall"])
-            self.assertNotEqual(parity["deltas"]["avg_cer"], 0.0)
+            self.assertTrue(all(manifest["official_parity"]["parity"].values()))
         finally:
             shutil.rmtree(tmp_path)
 
@@ -1453,6 +1487,95 @@ class ArtifactWriterTests(unittest.TestCase):
             restored_bytes = (out_root / "e0_manifest.json").read_bytes()
             self.assertEqual(restored_bytes, old_manifest_bytes)
             self.assertFalse(any(p.name.startswith("out.staging") for p in tmp_path.iterdir()))
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def test_double_rename_failure_retains_recovery_backup(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            write_e0_artifacts(result, rows, groups, paths, out_root)
+            old_manifest_bytes = (out_root / "e0_manifest.json").read_bytes()
+
+            mutated = list(rows)
+            mutated[0] = replace(mutated[0], audio_features={**mutated[0].audio_features, "presence_score": 9.9})
+            result2 = self._evaluate(mutated, labels, groups)
+
+            from scripts import r11_gate_oracle_oof as oof_module
+            original_rename = oof_module.os.rename
+            calls = {"count": 0}
+
+            def failing_rename(src, dst):
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    return original_rename(src, dst)
+                raise OSError("forced rename failure")
+
+            with patch.object(oof_module.os, "rename", side_effect=failing_rename):
+                with self.assertRaises(RuntimeError) as ctx:
+                    write_e0_artifacts(result2, mutated, groups, paths, out_root)
+                self.assertIn("recovery backup", str(ctx.exception).lower())
+
+            backups = [p for p in tmp_path.iterdir() if p.name.startswith("out.backup")]
+            self.assertEqual(len(backups), 1)
+            self.assertEqual((backups[0] / "e0_manifest.json").read_bytes(), old_manifest_bytes)
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def test_existing_output_with_directory_named_artifacts_is_preserved(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            out_root.mkdir()
+            for name in ("e0_manifest.json", "e0_summary.json", "e0_oof_scores.jsonl",
+                         "e0_frontier.jsonl", "e0_report.md"):
+                (out_root / name).mkdir()
+            with self.assertRaises(ValueError):
+                write_e0_artifacts(result, rows, groups, paths, out_root)
+            self.assertTrue(out_root.is_dir())
+            self.assertTrue((out_root / "e0_manifest.json").is_dir())
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def test_existing_output_with_malformed_manifest_is_preserved(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            out_root.mkdir()
+            for name in ("e0_manifest.json", "e0_summary.json", "e0_oof_scores.jsonl",
+                         "e0_frontier.jsonl", "e0_report.md"):
+                (out_root / name).write_text("not json", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                write_e0_artifacts(result, rows, groups, paths, out_root)
+            self.assertTrue(out_root.is_dir())
+            self.assertEqual((out_root / "e0_manifest.json").read_text(encoding="utf-8"), "not json")
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def test_existing_output_with_wrong_identity_is_preserved(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            out_root.mkdir()
+            for name in ("e0_manifest.json", "e0_summary.json", "e0_oof_scores.jsonl",
+                         "e0_frontier.jsonl", "e0_report.md"):
+                (out_root / name).write_text("{}", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                write_e0_artifacts(result, rows, groups, paths, out_root)
+            self.assertTrue(out_root.is_dir())
+            self.assertEqual((out_root / "e0_manifest.json").read_text(encoding="utf-8"), "{}")
         finally:
             shutil.rmtree(tmp_path)
 
