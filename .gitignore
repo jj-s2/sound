@@ -26,6 +26,7 @@ tmp/
 
 # Internal orchestration/review artifacts
 .superpowers/
+.worktrees/
 arena/
 docs/superpowers/
 
