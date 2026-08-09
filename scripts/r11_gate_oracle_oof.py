@@ -12,6 +12,8 @@ import argparse
 import hashlib
 import json
 import math
+import os
+import shutil
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -22,7 +24,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from xh202615.data import Sample, load_dataset
+from xh202615.data import Sample, load_dataset, load_split
 from xh202615.evaluation import evaluate_rows
 from xh202615.r10_selector import CandidateRow, load_candidate_bundle
 from xh202615.r11_gate_oracle import (
@@ -41,11 +43,11 @@ _SENTINEL_ACCEPTED_NEGATIVE = "__accepted_negative__"
 _REJECT_ALL_THRESHOLD_MARKER = "__reject_all__"
 
 _ARTIFACT_NAMES = {
-    "manifest": "r11_e0_manifest.json",
-    "summary": "r11_e0_summary.json",
-    "scores": "r11_e0_scores.jsonl",
-    "frontier": "r11_e0_frontier.jsonl",
-    "report": "r11_e0_report.md",
+    "manifest": "e0_manifest.json",
+    "summary": "e0_summary.json",
+    "scores": "e0_oof_scores.jsonl",
+    "frontier": "e0_frontier.jsonl",
+    "report": "e0_report.md",
 }
 
 _FIXED_DECISION_GATES = {
@@ -60,39 +62,23 @@ class _NonFiniteValueError(ValueError):
     """Raised when a value that must be JSON-serializable is non-finite."""
 
 
-class _StrictJSONEncoder(json.JSONEncoder):
-    """JSON encoder that rejects NaN and converts infinity to a safe marker."""
-
-    def encode(self, obj: Any) -> str:
-        def visit(value: Any) -> Any:
-            if isinstance(value, np.ndarray):
-                return value.tolist()
-            if isinstance(value, np.integer):
-                return int(value)
-            if isinstance(value, np.floating):
-                return float(value)
-            if isinstance(value, (tuple, list)):
-                return [visit(item) for item in value]
-            if isinstance(value, dict):
-                return {str(k): visit(v) for k, v in value.items()}
-            if is_dataclass(value) and not isinstance(value, type):
-                return visit(asdict(value))
-            if isinstance(value, float):
-                if math.isnan(value):
-                    raise _NonFiniteValueError("NaN is not JSON-serializable")
-                if math.isinf(value):
-                    if value > 0:
-                        return _REJECT_ALL_THRESHOLD_MARKER
-                    raise _NonFiniteValueError("negative infinity is not JSON-serializable")
-            if isinstance(value, Path):
-                return str(value)
-            return value
-
-        return super().encode(visit(obj))
+def _digestable_float(value: float) -> float | str:
+    """Represent a float for canonical hashing; NaN becomes a stable marker."""
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "__nan__"
+        if math.isinf(value):
+            return "__inf__" if value > 0 else "__neg_inf__"
+    return value
 
 
 def _jsonify(obj: Any) -> Any:
-    """Recursively convert dataclasses, tuples, NumPy arrays, and Paths."""
+    """Recursively convert dataclasses, tuples, NumPy arrays, and Paths.
+
+    Unlike a generic JSON encoder, this function rejects NaN and treats any
+    non-threshold infinity as an error. Threshold fields are markerized by the
+    caller before serialization.
+    """
     if isinstance(obj, np.ndarray):
         return obj.tolist()
     if isinstance(obj, np.integer):
@@ -109,11 +95,32 @@ def _jsonify(obj: Any) -> Any:
         if math.isnan(obj):
             raise _NonFiniteValueError("NaN is not JSON-serializable")
         if math.isinf(obj):
-            if obj > 0:
-                return _REJECT_ALL_THRESHOLD_MARKER
-            raise _NonFiniteValueError("negative infinity is not JSON-serializable")
+            raise _NonFiniteValueError(
+                "non-threshold infinity is not JSON-serializable"
+            )
     if isinstance(obj, Path):
         return str(obj)
+    return obj
+
+
+def _serialize_threshold(value: Any) -> Any:
+    """Encode the reject-all threshold as a JSON-safe boundary marker."""
+    if isinstance(value, float) and math.isinf(value) and value > 0:
+        return _REJECT_ALL_THRESHOLD_MARKER
+    return value
+
+
+def _apply_threshold_markers(obj: Any) -> Any:
+    """Replace every ``threshold`` field with the safe marker when it is +inf."""
+    if isinstance(obj, dict):
+        return {
+            k: _REJECT_ALL_THRESHOLD_MARKER
+            if k == "threshold" and isinstance(v, float) and math.isinf(v) and v > 0
+            else _apply_threshold_markers(v)
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_apply_threshold_markers(item) for item in obj]
     return obj
 
 
@@ -123,7 +130,6 @@ def _canonical_json(obj: Any, *, allow_nan: bool = False) -> str:
         sort_keys=True,
         ensure_ascii=False,
         allow_nan=allow_nan,
-        cls=_StrictJSONEncoder if not allow_nan else json.JSONEncoder,
     )
 
 
@@ -176,10 +182,38 @@ def _source_digest(paths: dict[str, Path]) -> str:
     return _sha256_hex(canonical.encode("utf-8"))
 
 
-def _read_jsonl_ids(path: Path) -> set[str]:
-    """Return the exact unique IDs from a JSONL file."""
+def _feature_state_digest(rows: Sequence[CandidateRow]) -> dict[str, Any]:
+    """Canonical digest of the fully joined feature-bearing row state.
+
+    Covers every candidate text and every cached acoustic feature (including
+    ``cmd_duration_sec`` derived from the WAV header), so a mutation that
+    changes gate inputs changes this digest even when source file bytes are
+    unchanged.
+    """
+    per_id: dict[str, str] = {}
+    for row in rows:
+        state = {
+            "id": row.id,
+            "texts": {k: row.texts[k] for k in sorted(row.texts)},
+            "audio_features": {
+                k: _digestable_float(row.audio_features[k])
+                for k in sorted(row.audio_features)
+            },
+        }
+        canonical = json.dumps(state, sort_keys=True, ensure_ascii=False)
+        per_id[row.id] = _sha256_hex(canonical.encode("utf-8"))
+
+    aggregate = _sha256_hex(
+        json.dumps(per_id, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    )
+    return {"aggregate": aggregate, "per_id": per_id}
+
+
+def _read_jsonl_ids(path: Path) -> list[str]:
+    """Return the exact unique IDs from a JSONL file in file order."""
 
     seen: set[str] = set()
+    ids: list[str] = []
     with Path(path).open("r", encoding="utf-8-sig") as handle:
         for line_no, line in enumerate(handle, start=1):
             line = line.strip()
@@ -192,7 +226,46 @@ def _read_jsonl_ids(path: Path) -> set[str]:
             if sid in seen:
                 raise ValueError(f"duplicate id {sid!r} in {path}")
             seen.add(sid)
-    return seen
+            ids.append(sid)
+    return ids
+
+
+def _source_id_sets(
+    paths: dict[str, Path],
+    dataset_ids: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    """Return counts and sorted-ID digests for every consumed source."""
+
+    def _id_digest(ids: Sequence[str]) -> str:
+        canonical = json.dumps(sorted(ids, key=lambda x: int(x) if x.isdigit() else x), ensure_ascii=False)
+        return _sha256_hex(canonical.encode("utf-8"))
+
+    def _ids_for_jsonl(path: Path) -> tuple[int, str]:
+        ids = _read_jsonl_ids(path)
+        return len(ids), _id_digest(ids)
+
+    def _ids_for_manifest(path: Path) -> tuple[int, str]:
+        manifest = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        ids = [str(row["id"]) for row in manifest.get("rows", [])]
+        if len(ids) != len(set(ids)):
+            raise ValueError("duplicate ids in group manifest")
+        return len(ids), _id_digest(ids)
+
+    cf_count, cf_digest = _ids_for_jsonl(paths["candidate_fusion"])
+    tse_count, tse_digest = _ids_for_jsonl(paths["tse_asr"])
+    audio_count, audio_digest = _ids_for_jsonl(paths["audio_map"])
+    r3_count, r3_digest = _ids_for_jsonl(paths["r3_predictions"])
+    manifest_count, manifest_digest = _ids_for_manifest(paths["group_manifest"])
+
+    sets: dict[str, dict[str, Any]] = {
+        "candidate_fusion": {"count": cf_count, "id_digest": cf_digest},
+        "tse_asr": {"count": tse_count, "id_digest": tse_digest},
+        "audio_map": {"count": audio_count, "id_digest": audio_digest},
+        "r3_predictions": {"count": r3_count, "id_digest": r3_digest},
+        "group_manifest": {"count": manifest_count, "id_digest": manifest_digest},
+        "dataset": {"count": len(dataset_ids), "id_digest": _id_digest(dataset_ids)},
+    }
+    return sets
 
 
 def _load_manifest_labels_and_groups(path: Path) -> tuple[dict[str, str | None], dict[str, str], list[str]]:
@@ -217,6 +290,21 @@ def _load_manifest_labels_and_groups(path: Path) -> tuple[dict[str, str | None],
 
     sample_ids = sorted(labels, key=lambda x: int(x) if x.isdigit() else x)
     return labels, groups, sample_ids
+
+
+def _validate_dataset_uniqueness(root: Path) -> list[Sample]:
+    """Load Dataset-A and reject any duplicate ID, including across splits."""
+
+    pos_samples = load_split(str(root), "pos")
+    neg_samples = load_split(str(root), "neg")
+    samples = pos_samples + neg_samples
+    seen: set[str] = set()
+    for sample in samples:
+        sid = str(sample.id)
+        if sid in seen:
+            raise ValueError(f"duplicate Dataset-A id {sid!r}")
+        seen.add(sid)
+    return samples
 
 
 def _build_samples(
@@ -266,6 +354,7 @@ def _check_evaluator_parity(
     rows: Sequence[CandidateRow],
     labels: dict[str, str | None],
     result: dict[str, Any],
+    samples: Sequence[Sample] | None = None,
 ) -> dict[str, Any]:
     """Verify that the selected point matches the official evaluator metrics."""
 
@@ -275,8 +364,8 @@ def _check_evaluator_parity(
     scores = result["scores_by_model"][model_name]
     contributions = build_oracle_contributions(rows, labels)
     predictions = _build_official_predictions(rows, labels, scores, threshold, contributions)
-    samples = _build_samples(rows, labels)
-    official = evaluate_rows(samples, predictions, missing_policy="empty").metrics
+    official_samples = _build_samples(rows, labels) if samples is None else list(samples)
+    official = evaluate_rows(official_samples, predictions, missing_policy="empty").metrics
 
     tolerance = 1e-9
     if abs(float(selected["cer"]) - official["avg_cer"]) > tolerance:
@@ -312,10 +401,147 @@ def _check_evaluator_parity(
 
 def _next_branch(decision: str) -> str:
     if decision == "continue_cached":
-        return "E1 — complete cached negative control"
+        return (
+            "E1 — complete cached negative control: compare positive-only "
+            "expected-CER regression and LambdaMART; do not tune cached-gate "
+            "hyperparameters further."
+        )
     if decision == "falsified_cached":
-        return "E2 — FireRed zero-shot and fused gate-oracle"
-    return "E2/E3 — FireRed zero-shot and fused gate-oracle"
+        return (
+            "Stop cached-gate tuning; go directly to E2 — FireRedChat-pVAD "
+            "zero-shot and fused gate-oracle."
+        )
+    return "Begin E2 — FireRedChat-pVAD zero-shot and fused gate-oracle."
+
+
+def _validate_result(
+    result: dict[str, Any],
+    rows: Sequence[CandidateRow],
+    groups: Sequence[object],
+) -> None:
+    """Fail-closed validation of the evaluation result before any file is written."""
+
+    if len(rows) != len(groups):
+        raise ValueError("rows and groups must have equal lengths")
+
+    n_rows = len(rows)
+    required_keys = (
+        "decision",
+        "selected_point",
+        "worst_fold",
+        "fold_metrics",
+        "frontier",
+        "bootstrap",
+        "model_specs",
+        "scores_by_model",
+        "fold_assignments",
+        "fold_metadata",
+    )
+    for key in required_keys:
+        if key not in result:
+            raise ValueError(f"result is missing required key {key!r}")
+
+    scores_by_model = result["scores_by_model"]
+    if not scores_by_model:
+        raise ValueError("scores_by_model must not be empty")
+    for model_name, scores in scores_by_model.items():
+        arr = np.asarray(scores, dtype=np.float64)
+        if arr.shape != (n_rows,):
+            raise ValueError(
+                f"scores for {model_name} have shape {arr.shape}, expected ({n_rows},)"
+            )
+        if not np.isfinite(arr).all():
+            raise ValueError(f"scores for {model_name} contain non-finite values")
+        if np.any((arr < 0.0) | (arr > 1.0)):
+            raise ValueError(f"scores for {model_name} are outside [0, 1]")
+
+    fold_assignments = np.asarray(result["fold_assignments"], dtype=np.int64)
+    if fold_assignments.shape != (n_rows,):
+        raise ValueError(
+            f"fold_assignments have shape {fold_assignments.shape}, expected ({n_rows},)"
+        )
+    if np.any(fold_assignments < 0):
+        raise ValueError("fold_assignments contains negative fold indices")
+    n_folds = int(fold_assignments.max()) + 1
+    for fold_index in range(n_folds):
+        if not np.any(fold_assignments == fold_index):
+            raise ValueError(f"fold {fold_index} has no assigned rows")
+    if len(np.unique(fold_assignments)) != n_folds:
+        raise ValueError("fold_assignments contains unexpected fold indices")
+
+    required_frontier_keys = {
+        "model",
+        "threshold",
+        "cer",
+        "rr",
+        "overall",
+        "accepted_positives",
+        "accepted_negatives",
+    }
+    for index, point in enumerate(result["frontier"]):
+        if not required_frontier_keys.issubset(point):
+            missing = required_frontier_keys - set(point)
+            raise ValueError(f"frontier point {index} is missing keys {missing}")
+        for key in ("cer", "rr", "overall"):
+            value = float(point[key])
+            if not math.isfinite(value):
+                raise ValueError(
+                    f"frontier point {index} has non-finite {key}: {value}"
+                )
+
+    required_selected_keys = {
+        "model",
+        "threshold",
+        "cer",
+        "rr",
+        "overall",
+        "accepted_positives",
+        "accepted_negatives",
+        "diagnostic_only",
+        "deployable",
+    }
+    if not required_selected_keys.issubset(result["selected_point"]):
+        missing = required_selected_keys - set(result["selected_point"])
+        raise ValueError(f"selected_point is missing keys {missing}")
+
+    for key in ("cer", "rr", "overall"):
+        value = float(result["selected_point"][key])
+        if not math.isfinite(value):
+            raise ValueError(f"selected_point has non-finite {key}: {value}")
+
+
+def _build_coverage(rows: Sequence[CandidateRow], result: dict[str, Any]) -> dict[str, Any]:
+    fold_assignments = np.asarray(result["fold_assignments"], dtype=np.int64)
+    n_rows = len(rows)
+    covered = np.zeros(n_rows, dtype=np.int64)
+    for fold in result["fold_metadata"]:
+        for idx in fold["test_indices"]:
+            covered[int(idx)] += 1
+    return {
+        "n_rows_total": n_rows,
+        "n_rows_covered": int(np.count_nonzero(covered > 0)),
+        "once_only": bool(np.all(covered == 1)),
+        "n_folds": int(fold_assignments.max()) + 1,
+        "sample_ids": [row.id for row in rows],
+    }
+
+
+def _build_fold_metadata_evidence(result: dict[str, Any]) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    for fold in result["fold_metadata"]:
+        train_groups = set(fold["train_groups"])
+        test_groups = set(fold["test_groups"])
+        evidence.append(
+            {
+                "fold_index": int(fold["fold_index"]),
+                "n_train": len(fold["train_indices"]),
+                "n_test": len(fold["test_indices"]),
+                "train_groups": sorted(train_groups, key=str),
+                "test_groups": sorted(test_groups, key=str),
+                "group_disjoint": len(train_groups & test_groups) == 0,
+            }
+        )
+    return evidence
 
 
 def write_e0_artifacts(
@@ -325,18 +551,21 @@ def write_e0_artifacts(
     paths: dict[str, Any],
     output_root: Path,
 ) -> dict[str, Path]:
-    """Write the five fixed E0 reproducibility artifacts.
+    """Write the five fixed E0 reproducibility artifacts atomically.
 
-    Returns a mapping of artifact role to written path.
+    The result is fully validated and all artifacts are written to a staging
+    directory before the final output root is published, so a failure never
+    leaves a partial evidence directory.
     """
 
     output_root = Path(output_root)
-    output_root.mkdir(parents=True, exist_ok=True)
+    _validate_result(result, rows, groups)
 
     n_outer = int(paths["n_outer"])
     n_boot = int(paths["n_boot"])
     seed = int(paths["seed"])
     rr_floor = float(paths["rr_floor"])
+    path_values = {k: Path(v) for k, v in paths.items() if k not in {"n_outer", "n_boot", "seed", "rr_floor"}}
 
     config_hash = _config_hash(
         n_outer=n_outer,
@@ -347,14 +576,16 @@ def write_e0_artifacts(
         model_specs=result["model_specs"],
         fixed_gates=_FIXED_DECISION_GATES,
     )
-    source_digest = _source_digest({k: Path(v) for k, v in paths.items() if k not in {"n_outer", "n_boot", "seed", "rr_floor"}})
+    source_digest = _source_digest(path_values)
+    feature_state_digest = _feature_state_digest(rows)
+    source_id_sets = _source_id_sets(path_values, [row.id for row in rows])
+    coverage = _build_coverage(rows, result)
+    fold_metadata_evidence = _build_fold_metadata_evidence(result)
 
     selected = dict(result["selected_point"])
     selected_model = str(selected["model"])
     selected_threshold = float(selected["threshold"])
-    selected_threshold_display = (
-        _REJECT_ALL_THRESHOLD_MARKER if math.isinf(selected_threshold) else selected_threshold
-    )
+    selected_threshold_display = _serialize_threshold(selected_threshold)
 
     bootstrap = result["bootstrap"]
     bootstrap_summary = {
@@ -377,7 +608,11 @@ def write_e0_artifacts(
     manifest = {
         "config_hash": config_hash,
         "source_digest": source_digest,
+        "feature_state_digest": feature_state_digest,
         "resolved_paths": resolved_paths,
+        "source_id_sets": source_id_sets,
+        "coverage": coverage,
+        "fold_metadata": _apply_threshold_markers(fold_metadata_evidence),
         "n_outer": n_outer,
         "n_boot": n_boot,
         "seed": seed,
@@ -387,14 +622,18 @@ def write_e0_artifacts(
         "decision": result["decision"],
         "diagnostic_only": result["diagnostic_only"],
         "global_threshold_deployable": result["global_threshold_deployable"],
-        "selected_point": _jsonify(selected),
-        "worst_fold": _jsonify(result["worst_fold"]),
-        "fold_metrics": _jsonify(result["fold_metrics"]),
+        "selected_point": _jsonify(_apply_threshold_markers(selected)),
+        "worst_fold": _jsonify(_apply_threshold_markers(result["worst_fold"])),
+        "fold_metrics": _jsonify(_apply_threshold_markers(result["fold_metrics"])),
         "bootstrap_summary": bootstrap_summary,
-        "input_validation": {
-            "dataset_manifest_label_parity": True,
-            "exact_source_id_sets": True,
-            "evaluator_parity": True,
+        "official_parity": {
+            "avg_cer": float(result["selected_point"]["cer"]),
+            "avg_rr": float(result["selected_point"]["rr"]),
+            "overall": float(result["selected_point"]["overall"]),
+            "false_accept_rate": float(result["selected_point"]["accepted_negatives"])
+            / max(1, int(sum(row.label is None for row in rows))),
+            "false_reject_rate": float(result["selected_point"]["accepted_positives"])
+            / max(1, int(sum(row.label is not None for row in rows))),
         },
     }
 
@@ -419,59 +658,46 @@ def write_e0_artifacts(
         "bootstrap_ci": bootstrap_summary,
         "config_hash": config_hash,
         "source_digest": source_digest,
+        "feature_state_digest": feature_state_digest["aggregate"],
         "output_files": [],
     }
 
-    manifest_path = output_root / _ARTIFACT_NAMES["manifest"]
-    summary_path = output_root / _ARTIFACT_NAMES["summary"]
-    scores_path = output_root / _ARTIFACT_NAMES["scores"]
-    frontier_path = output_root / _ARTIFACT_NAMES["frontier"]
-    report_path = output_root / _ARTIFACT_NAMES["report"]
+    final_paths = {
+        "manifest": output_root / _ARTIFACT_NAMES["manifest"],
+        "summary": output_root / _ARTIFACT_NAMES["summary"],
+        "scores": output_root / _ARTIFACT_NAMES["scores"],
+        "frontier": output_root / _ARTIFACT_NAMES["frontier"],
+        "report": output_root / _ARTIFACT_NAMES["report"],
+    }
 
-    manifest_path.write_text(
-        _canonical_json(manifest, allow_nan=False),
-        encoding="utf-8",
-    )
-    summary["output_files"] = [
-        str(manifest_path.resolve()),
-        str(summary_path.resolve()),
-        str(scores_path.resolve()),
-        str(frontier_path.resolve()),
-        str(report_path.resolve()),
-    ]
-    summary_path.write_text(
-        _canonical_json(summary, allow_nan=False),
-        encoding="utf-8",
-    )
+    manifest_json = _canonical_json(manifest, allow_nan=False)
+    summary["output_files"] = [str(p.resolve()) for p in final_paths.values()]
+    summary_json = _canonical_json(summary, allow_nan=False)
 
     scores_by_model = result["scores_by_model"]
     model_names = sorted(scores_by_model)
     fold_assignments = np.asarray(result["fold_assignments"], dtype=np.int64)
-    with scores_path.open("w", encoding="utf-8") as handle:
-        for index, row in enumerate(rows):
-            record = {
-                "id": row.id,
-                "group": str(groups[index]),
-                "fold": int(fold_assignments[index]),
-            }
-            for model_name in model_names:
-                score = float(scores_by_model[model_name][index])
-                if not math.isfinite(score) or score < 0.0 or score > 1.0:
-                    raise ValueError(
-                        f"invalid OOF probability for {model_name} at {row.id}: {score}"
-                    )
-                record[model_name] = score
-            handle.write(_canonical_json(record, allow_nan=False) + "\n")
+    score_lines: list[str] = []
+    for index, row in enumerate(rows):
+        record = {
+            "id": row.id,
+            "group": str(groups[index]),
+            "fold": int(fold_assignments[index]),
+        }
+        for model_name in model_names:
+            record[model_name] = float(scores_by_model[model_name][index])
+        score_lines.append(_canonical_json(record, allow_nan=False))
 
-    with frontier_path.open("w", encoding="utf-8") as handle:
-        for point in result["frontier"]:
-            handle.write(_canonical_json(point, allow_nan=False) + "\n")
+    frontier_lines: list[str] = []
+    for point in result["frontier"]:
+        frontier_lines.append(_canonical_json(_apply_threshold_markers(point), allow_nan=False))
 
     report_lines = [
         "# R11 E0 Gate-Oracle OOF Report",
         "",
         f"Config hash: `{config_hash}`",
         f"Source digest: `{source_digest}`",
+        f"Feature state digest: `{feature_state_digest['aggregate']}`",
         f"Outer folds: {n_outer}, bootstrap resamples: {n_boot}, seed: {seed}",
         "",
         "## Selected point",
@@ -504,20 +730,37 @@ def write_e0_artifacts(
         "- No Dataset-B, hidden labels, or leaderboard feedback used.",
         "- Reference label text is absent from score and frontier artifacts.",
         "",
-        f"Artifacts: {manifest_path}, {summary_path}, {scores_path}, {frontier_path}, {report_path}",
+        f"Artifacts: {final_paths['manifest']}, {final_paths['summary']}, {final_paths['scores']}, {final_paths['frontier']}, {final_paths['report']}",
     ])
-    report_path.write_text("\n".join(report_lines), encoding="utf-8")
+    report_text = "\n".join(report_lines)
 
-    return {
-        "manifest": manifest_path,
-        "summary": summary_path,
-        "scores": scores_path,
-        "frontier": frontier_path,
-        "report": report_path,
-    }
+    # Atomic publish: write to a staging directory, then rename it into place.
+    staging = output_root.with_name(output_root.name + ".staging")
+    if staging.exists():
+        shutil.rmtree(staging)
+    staging.mkdir(parents=True)
+    try:
+        (staging / _ARTIFACT_NAMES["manifest"]).write_text(manifest_json, encoding="utf-8")
+        (staging / _ARTIFACT_NAMES["summary"]).write_text(summary_json, encoding="utf-8")
+        with (staging / _ARTIFACT_NAMES["scores"]).open("w", encoding="utf-8") as handle:
+            for line in score_lines:
+                handle.write(line + "\n")
+        with (staging / _ARTIFACT_NAMES["frontier"]).open("w", encoding="utf-8") as handle:
+            for line in frontier_lines:
+                handle.write(line + "\n")
+        (staging / _ARTIFACT_NAMES["report"]).write_text(report_text, encoding="utf-8")
+
+        if output_root.exists():
+            shutil.rmtree(output_root)
+        os.rename(staging, output_root)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+
+    return final_paths
 
 
-def _validate_inputs(args: argparse.Namespace) -> tuple[list[CandidateRow], dict[str, str | None], list[str], dict[str, Any]]:
+def _validate_inputs(args: argparse.Namespace) -> tuple[list[CandidateRow], dict[str, str | None], list[str], dict[str, Any], list[Sample]]:
     """Load and validate all inputs before any output is created."""
 
     required_files = [
@@ -537,7 +780,7 @@ def _validate_inputs(args: argparse.Namespace) -> tuple[list[CandidateRow], dict
         if not split_path.is_file():
             raise FileNotFoundError(f"required split file not found: {split_path}")
 
-    samples = load_dataset(args.dataset_root, splits=("pos", "neg"))
+    samples = _validate_dataset_uniqueness(args.dataset_root)
     dataset_labels = {str(s.id): s.label for s in samples}
     dataset_ids = set(dataset_labels)
 
@@ -577,7 +820,7 @@ def _validate_inputs(args: argparse.Namespace) -> tuple[list[CandidateRow], dict
         ("audio_map", audio_ids),
         ("r3_predictions", r3_ids),
     ]:
-        if ids != expected_ids:
+        if set(ids) != expected_ids:
             raise ValueError(
                 f"{name} IDs do not match manifest IDs exactly: "
                 f"{name}={len(ids)}, manifest={len(expected_ids)}"
@@ -594,6 +837,7 @@ def _validate_inputs(args: argparse.Namespace) -> tuple[list[CandidateRow], dict
     rows = [rows_by_id[sid] for sid in sample_ids]
     groups = [manifest_groups[sid] for sid in sample_ids]
     labels = dataset_labels
+    ordered_samples = [next(s for s in samples if str(s.id) == sid) for sid in sample_ids]
 
     paths = {
         "dataset_root": args.dataset_root,
@@ -608,7 +852,7 @@ def _validate_inputs(args: argparse.Namespace) -> tuple[list[CandidateRow], dict
         "rr_floor": args.rr_floor,
     }
 
-    return rows, labels, groups, paths
+    return rows, labels, groups, paths, ordered_samples
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -621,14 +865,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--audio-map", type=Path, default=REPO_ROOT / "output" / "training_r9" / "datasetA_tse" / "audio_map.jsonl")
     parser.add_argument("--r3-predictions", type=Path, default=REPO_ROOT / "output" / "evaluations" / "r3_temporal_on_datasetA_gated.jsonl")
     parser.add_argument("--group-manifest", type=Path, default=REPO_ROOT / ".superpowers" / "sdd" / "2026-08-07-r9-overall-08-arena" / "datasetA_group_manifest_v1.json")
-    parser.add_argument("--output-root", type=Path, default=REPO_ROOT / "output" / "r11_gate_oracle_e0")
+    parser.add_argument("--output-root", type=Path, default=REPO_ROOT / "output" / "r11_gate_oracle")
     parser.add_argument("--n-outer", type=int, default=5)
     parser.add_argument("--n-boot", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=20260807)
     parser.add_argument("--rr-floor", type=float, default=0.93)
     args = parser.parse_args(argv)
 
-    rows, labels, groups, paths = _validate_inputs(args)
+    rows, labels, groups, paths, ordered_samples = _validate_inputs(args)
 
     result = evaluate_e0(
         rows,
@@ -640,7 +884,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         n_boot=args.n_boot,
     )
 
-    _check_evaluator_parity(rows, labels, result)
+    _check_evaluator_parity(rows, labels, result, samples=ordered_samples)
 
     files = write_e0_artifacts(result, rows, groups, paths, args.output_root)
 

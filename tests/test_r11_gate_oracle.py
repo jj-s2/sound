@@ -30,14 +30,16 @@ from xh202615.r11_gate_oracle import (
 )
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.r11_gate_oracle_oof import (
+    _REJECT_ALL_THRESHOLD_MARKER,
     _SENTINEL_ACCEPTED_NEGATIVE,
+    _next_branch,
     main,
     write_e0_artifacts,
 )
-
-
-REJECT_ALL_THRESHOLD_MARKER = "__reject_all__"
 
 
 def _row(
@@ -636,8 +638,24 @@ class ArtifactWriterTests(unittest.TestCase):
         r3_predictions = tmp_path / "r3_predictions.jsonl"
         group_manifest = tmp_path / "manifest.json"
         for path in (candidate_fusion, tse_asr, audio_map, r3_predictions):
-            path.write_text(json.dumps({"id": "0"}) + "\n", encoding="utf-8")
-        group_manifest.write_text(json.dumps({"rows": []}), encoding="utf-8")
+            path.write_text(
+                "".join(json.dumps({"id": sid}) + "\n" for sid in ("0", "1", "2", "3")),
+                encoding="utf-8",
+            )
+        group_manifest.write_text(
+            json.dumps(
+                {
+                    "rows": [
+                        {"id": "0", "wake_component": "g0"},
+                        {"id": "1", "wake_component": "g0"},
+                        {"id": "2", "wake_component": "g1"},
+                        {"id": "3", "wake_component": "g1"},
+                    ]
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
         return {
             "dataset_root": dataset_root,
             "candidate_fusion": candidate_fusion,
@@ -664,11 +682,11 @@ class ArtifactWriterTests(unittest.TestCase):
 
     def _expected_files(self, out_root: Path):
         return {
-            "manifest": out_root / "r11_e0_manifest.json",
-            "summary": out_root / "r11_e0_summary.json",
-            "scores": out_root / "r11_e0_scores.jsonl",
-            "frontier": out_root / "r11_e0_frontier.jsonl",
-            "report": out_root / "r11_e0_report.md",
+            "manifest": out_root / "e0_manifest.json",
+            "summary": out_root / "e0_summary.json",
+            "scores": out_root / "e0_oof_scores.jsonl",
+            "frontier": out_root / "e0_frontier.jsonl",
+            "report": out_root / "e0_report.md",
         }
 
     def test_writes_exactly_five_artifacts_with_expected_names(self):
@@ -701,17 +719,31 @@ class ArtifactWriterTests(unittest.TestCase):
             for key in (
                 "config_hash",
                 "source_digest",
+                "feature_state_digest",
                 "resolved_paths",
+                "source_id_sets",
+                "coverage",
+                "fold_metadata",
+                "official_parity",
                 "model_specs",
+                "feature_schema",
                 "decision",
                 "selected_point",
                 "worst_fold",
+                "fold_metrics",
                 "bootstrap_summary",
-                "input_validation",
             ):
                 self.assertIn(key, manifest, key)
             self.assertEqual(manifest["selected_point"]["diagnostic_only"], True)
             self.assertEqual(manifest["selected_point"]["deployable"], False)
+            self.assertEqual(manifest["coverage"]["n_rows_total"], len(rows))
+            self.assertTrue(manifest["coverage"]["once_only"])
+            for fold in manifest["fold_metadata"]:
+                self.assertTrue(fold["group_disjoint"])
+                self.assertEqual(
+                    set(fold["train_groups"]) & set(fold["test_groups"]),
+                    set(),
+                )
         finally:
             import shutil
             shutil.rmtree(tmp_path)
@@ -784,10 +816,10 @@ class ArtifactWriterTests(unittest.TestCase):
             out_root = tmp_path / "out"
             files = write_e0_artifacts(result, rows, groups, paths, out_root)
             manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
-            self.assertEqual(manifest["selected_point"]["threshold"], REJECT_ALL_THRESHOLD_MARKER)
+            self.assertEqual(manifest["selected_point"]["threshold"], _REJECT_ALL_THRESHOLD_MARKER)
             lines = files["frontier"].read_text(encoding="utf-8").strip().split("\n")
             thresholds = {json.loads(line)["threshold"] for line in lines}
-            self.assertIn(REJECT_ALL_THRESHOLD_MARKER, thresholds)
+            self.assertIn(_REJECT_ALL_THRESHOLD_MARKER, thresholds)
         finally:
             import shutil
             shutil.rmtree(tmp_path)
@@ -825,7 +857,7 @@ class ArtifactWriterTests(unittest.TestCase):
             files = write_e0_artifacts(result, rows, groups, paths, out_root)
             report = files["report"].read_text(encoding="utf-8")
             self.assertIn(f"Decision: {result['decision']}", report)
-            self.assertIn("Next branch:", report)
+            self.assertIn(_next_branch(result["decision"]), report)
         finally:
             import shutil
             shutil.rmtree(tmp_path)
@@ -862,6 +894,134 @@ class ArtifactWriterTests(unittest.TestCase):
         expected_overall = ((1.0 - official["avg_cer"]) + official["avg_rr"]) / 2.0
         self.assertAlmostEqual(selected["overall"], expected_overall, places=9)
 
+    def test_feature_state_digest_is_sensitive_to_joined_state(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            files = write_e0_artifacts(result, rows, groups, paths, out_root)
+            manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
+            original = manifest["feature_state_digest"]
+
+            mutated = list(rows)
+            mutated[0] = replace(
+                mutated[0],
+                audio_features={**mutated[0].audio_features, "presence_score": 9.9},
+            )
+            out_root2 = tmp_path / "out2"
+            files2 = write_e0_artifacts(result, mutated, groups, paths, out_root2)
+            manifest2 = json.loads(files2["manifest"].read_text(encoding="utf-8"))
+            self.assertNotEqual(original, manifest2["feature_state_digest"])
+            self.assertEqual(
+                manifest["source_digest"], manifest2["source_digest"]
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmp_path)
+
+    def test_source_id_sets_record_exact_counts(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            files = write_e0_artifacts(result, rows, groups, paths, out_root)
+            manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
+            for key in ("candidate_fusion", "tse_asr", "audio_map", "r3_predictions", "group_manifest"):
+                self.assertEqual(manifest["source_id_sets"][key]["count"], len(rows))
+        finally:
+            import shutil
+            shutil.rmtree(tmp_path)
+
+    def test_coverage_matches_independent_recomputation(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            files = write_e0_artifacts(result, rows, groups, paths, out_root)
+            manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
+            coverage = manifest["coverage"]
+            assignments = np.asarray(result["fold_assignments"], dtype=np.int64)
+            self.assertEqual(coverage["n_rows_total"], len(rows))
+            self.assertEqual(coverage["n_rows_covered"], len(rows))
+            self.assertTrue(coverage["once_only"])
+            self.assertEqual(coverage["n_folds"], int(assignments.max()) + 1)
+            ids = [row.id for row in rows]
+            self.assertEqual(coverage["sample_ids"], ids)
+        finally:
+            import shutil
+            shutil.rmtree(tmp_path)
+
+    def test_non_finite_score_leaves_no_output(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        model_name = next(iter(result["scores_by_model"]))
+        result["scores_by_model"][model_name][0] = float("nan")
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            with self.assertRaises(ValueError):
+                write_e0_artifacts(result, rows, groups, paths, out_root)
+            self.assertFalse(out_root.exists())
+        finally:
+            import shutil
+            shutil.rmtree(tmp_path)
+
+    def test_malformed_frontier_leaves_no_output(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        result["frontier"].append({"model": "bad", "threshold": 0.5})
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            with self.assertRaises(ValueError):
+                write_e0_artifacts(result, rows, groups, paths, out_root)
+            self.assertFalse(out_root.exists())
+        finally:
+            import shutil
+            shutil.rmtree(tmp_path)
+
+    def test_infinite_non_threshold_metric_raises(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        result["frontier"].append(
+            {
+                "model": "bad",
+                "threshold": 0.5,
+                "cer": float("inf"),
+                "rr": 1.0,
+                "overall": 1.0,
+                "accepted_positives": 1.0,
+                "accepted_negatives": 0.0,
+            }
+        )
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            with self.assertRaises(ValueError):
+                write_e0_artifacts(result, rows, groups, paths, out_root)
+            self.assertFalse(out_root.exists())
+        finally:
+            import shutil
+            shutil.rmtree(tmp_path)
+
+    def test_next_branch_text_is_exact_for_all_decisions(self):
+        expected = {
+            "continue_cached": "E1 — complete cached negative control: compare positive-only expected-CER regression and LambdaMART; do not tune cached-gate hyperparameters further.",
+            "falsified_cached": "Stop cached-gate tuning; go directly to E2 — FireRedChat-pVAD zero-shot and fused gate-oracle.",
+            "proceed_pvad": "Begin E2 — FireRedChat-pVAD zero-shot and fused gate-oracle.",
+        }
+        for decision, text in expected.items():
+            self.assertEqual(_next_branch(decision), text)
+
 
 class GateOracleCLITests(unittest.TestCase):
     def test_help_exits_cleanly(self):
@@ -888,71 +1048,82 @@ class GateOracleCLITests(unittest.TestCase):
             self.assertFalse(out_root.exists())
         finally:
             import shutil
-            shutil.rmtree(tmp_path, ignore_errors=True)
+            shutil.rmtree(tmp_path)
+
+    def _write_synthetic_bundle(self, tmp_path: Path, pos: list[dict], neg: list[dict]):
+        dataset_root = tmp_path / "datasetA"
+        dataset_root.mkdir()
+        (dataset_root / "pos.jsonl").write_text(
+            "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in pos), encoding="utf-8"
+        )
+        (dataset_root / "neg.jsonl").write_text(
+            "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in neg), encoding="utf-8"
+        )
+
+        def write_jsonl(path: Path, records: list[dict]):
+            path.write_text(
+                "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records),
+                encoding="utf-8",
+            )
+
+        all_ids = sorted({str(r["id"]) for r in pos + neg}, key=lambda x: int(x) if x.isdigit() else x)
+        labels = {"0": "甲", "1": None, "2": "乙", "3": None}
+        fusion = [
+            {"id": sid, "recognition_text": labels[sid] or "", "candidate_texts": {"primary": labels[sid] or "", "energy": ""}}
+            for sid in all_ids
+        ]
+        tse = [{"id": rec["id"], "text": rec["recognition_text"]} for rec in fusion]
+        audio = [
+            {"id": sid, "presence_score": 0.9 if labels[sid] else 0.1, "enhanced_cosine": 0.8,
+             "mixture_cosine": 0.7, "max_cosine": 0.8, "latency_ms": 100.0}
+            for sid in all_ids
+        ]
+        r3 = [{"id": rec["id"], "recognition_text": rec["recognition_text"]} for rec in fusion]
+        manifest = {
+            "rows": [
+                {"id": "0", "split": "pos", "label": "甲", "wake_component": "g0"},
+                {"id": "1", "split": "neg", "label": None, "wake_component": "g0"},
+                {"id": "2", "split": "pos", "label": "乙", "wake_component": "g1"},
+                {"id": "3", "split": "neg", "label": None, "wake_component": "g1"},
+            ]
+        }
+        candidate_fusion = tmp_path / "fusion.jsonl"
+        tse_asr = tmp_path / "tse.jsonl"
+        audio_map = tmp_path / "audio.jsonl"
+        r3_predictions = tmp_path / "r3.jsonl"
+        group_manifest = tmp_path / "manifest.json"
+        write_jsonl(candidate_fusion, fusion)
+        write_jsonl(tse_asr, tse)
+        write_jsonl(audio_map, audio)
+        write_jsonl(r3_predictions, r3)
+        group_manifest.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+        return {
+            "dataset_root": dataset_root,
+            "candidate_fusion": candidate_fusion,
+            "tse_asr": tse_asr,
+            "audio_map": audio_map,
+            "r3_predictions": r3_predictions,
+            "group_manifest": group_manifest,
+        }
 
     def test_end_to_end_runs_on_synthetic_inputs(self):
         tmp_path = Path(tempfile.mkdtemp())
         try:
-            dataset_root = tmp_path / "datasetA"
-            dataset_root.mkdir()
-            pos = [{"id": "0", "wakeup_audio": "a.wav", "command_audio": "b.wav", "label": "甲"},
-                   {"id": "2", "wakeup_audio": "a.wav", "command_audio": "b.wav", "label": "乙"}]
-            neg = [{"id": "1", "wakeup_audio": "a.wav", "command_audio": "b.wav"},
-                   {"id": "3", "wakeup_audio": "a.wav", "command_audio": "b.wav"}]
-            (dataset_root / "pos.jsonl").write_text(
-                "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in pos), encoding="utf-8"
+            paths = self._write_synthetic_bundle(
+                tmp_path,
+                pos=[{"id": "0", "wakeup_audio": "a.wav", "command_audio": "b.wav", "label": "甲"},
+                     {"id": "2", "wakeup_audio": "a.wav", "command_audio": "b.wav", "label": "乙"}],
+                neg=[{"id": "1", "wakeup_audio": "a.wav", "command_audio": "b.wav"},
+                     {"id": "3", "wakeup_audio": "a.wav", "command_audio": "b.wav"}],
             )
-            (dataset_root / "neg.jsonl").write_text(
-                "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in neg), encoding="utf-8"
-            )
-
-            def write_jsonl(path: Path, records: list[dict]):
-                path.write_text(
-                    "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records),
-                    encoding="utf-8",
-                )
-
-            fusion = [
-                {"id": "0", "recognition_text": "甲", "candidate_texts": {"primary": "甲", "energy": ""}},
-                {"id": "1", "recognition_text": "", "candidate_texts": {"primary": "", "energy": ""}},
-                {"id": "2", "recognition_text": "乙", "candidate_texts": {"primary": "", "energy": ""}},
-                {"id": "3", "recognition_text": "", "candidate_texts": {"primary": "", "energy": ""}},
-            ]
-            tse = [{"id": sid, "text": rec["recognition_text"]} for sid, rec in [("0", fusion[0]), ("1", fusion[1]), ("2", fusion[2]), ("3", fusion[3])]]
-            audio = [
-                {"id": "0", "presence_score": 0.9, "enhanced_cosine": 0.8, "mixture_cosine": 0.7, "max_cosine": 0.8, "latency_ms": 100.0},
-                {"id": "1", "presence_score": 0.1, "enhanced_cosine": 0.2, "mixture_cosine": 0.1, "max_cosine": 0.2, "latency_ms": 100.0},
-                {"id": "2", "presence_score": 0.9, "enhanced_cosine": 0.8, "mixture_cosine": 0.7, "max_cosine": 0.8, "latency_ms": 100.0},
-                {"id": "3", "presence_score": 0.1, "enhanced_cosine": 0.2, "mixture_cosine": 0.1, "max_cosine": 0.2, "latency_ms": 100.0},
-            ]
-            r3 = [{"id": rec["id"], "recognition_text": rec["recognition_text"]} for rec in fusion]
-            manifest = {
-                "rows": [
-                    {"id": "0", "split": "pos", "label": "甲", "wake_component": "g0"},
-                    {"id": "1", "split": "neg", "label": None, "wake_component": "g0"},
-                    {"id": "2", "split": "pos", "label": "乙", "wake_component": "g1"},
-                    {"id": "3", "split": "neg", "label": None, "wake_component": "g1"},
-                ]
-            }
-            candidate_fusion = tmp_path / "fusion.jsonl"
-            tse_asr = tmp_path / "tse.jsonl"
-            audio_map = tmp_path / "audio.jsonl"
-            r3_predictions = tmp_path / "r3.jsonl"
-            group_manifest = tmp_path / "manifest.json"
-            write_jsonl(candidate_fusion, fusion)
-            write_jsonl(tse_asr, tse)
-            write_jsonl(audio_map, audio)
-            write_jsonl(r3_predictions, r3)
-            group_manifest.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
-
             out_root = tmp_path / "out"
             rc = main([
-                "--dataset-root", str(dataset_root),
-                "--candidate-fusion", str(candidate_fusion),
-                "--tse-asr", str(tse_asr),
-                "--audio-map", str(audio_map),
-                "--r3-predictions", str(r3_predictions),
-                "--group-manifest", str(group_manifest),
+                "--dataset-root", str(paths["dataset_root"]),
+                "--candidate-fusion", str(paths["candidate_fusion"]),
+                "--tse-asr", str(paths["tse_asr"]),
+                "--audio-map", str(paths["audio_map"]),
+                "--r3-predictions", str(paths["r3_predictions"]),
+                "--group-manifest", str(paths["group_manifest"]),
                 "--output-root", str(out_root),
                 "--n-outer", "2",
                 "--n-boot", "4",
@@ -963,9 +1134,63 @@ class GateOracleCLITests(unittest.TestCase):
             self.assertTrue(out_root.is_dir())
             self.assertEqual(
                 {p.name for p in out_root.iterdir()},
-                {"r11_e0_manifest.json", "r11_e0_summary.json", "r11_e0_scores.jsonl",
-                 "r11_e0_frontier.jsonl", "r11_e0_report.md"},
+                {"e0_manifest.json", "e0_summary.json", "e0_oof_scores.jsonl",
+                 "e0_frontier.jsonl", "e0_report.md"},
             )
+        finally:
+            import shutil
+            shutil.rmtree(tmp_path, ignore_errors=True)
+
+    def test_duplicate_within_split_rejects_and_leaves_no_output(self):
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._write_synthetic_bundle(
+                tmp_path,
+                pos=[{"id": "0", "wakeup_audio": "a.wav", "command_audio": "b.wav", "label": "甲"},
+                     {"id": "0", "wakeup_audio": "a.wav", "command_audio": "b.wav", "label": "甲"}],
+                neg=[{"id": "1", "wakeup_audio": "a.wav", "command_audio": "b.wav"}],
+            )
+            out_root = tmp_path / "out"
+            with self.assertRaises(ValueError):
+                main([
+                    "--dataset-root", str(paths["dataset_root"]),
+                    "--candidate-fusion", str(paths["candidate_fusion"]),
+                    "--tse-asr", str(paths["tse_asr"]),
+                    "--audio-map", str(paths["audio_map"]),
+                    "--r3-predictions", str(paths["r3_predictions"]),
+                    "--group-manifest", str(paths["group_manifest"]),
+                    "--output-root", str(out_root),
+                    "--n-outer", "2",
+                    "--n-boot", "4",
+                ])
+            self.assertFalse(out_root.exists())
+        finally:
+            import shutil
+            shutil.rmtree(tmp_path, ignore_errors=True)
+
+    def test_duplicate_across_splits_rejects_and_leaves_no_output(self):
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._write_synthetic_bundle(
+                tmp_path,
+                pos=[{"id": "0", "wakeup_audio": "a.wav", "command_audio": "b.wav", "label": "甲"},
+                     {"id": "1", "wakeup_audio": "a.wav", "command_audio": "b.wav", "label": "甲"}],
+                neg=[{"id": "1", "wakeup_audio": "a.wav", "command_audio": "b.wav"}],
+            )
+            out_root = tmp_path / "out"
+            with self.assertRaises(ValueError):
+                main([
+                    "--dataset-root", str(paths["dataset_root"]),
+                    "--candidate-fusion", str(paths["candidate_fusion"]),
+                    "--tse-asr", str(paths["tse_asr"]),
+                    "--audio-map", str(paths["audio_map"]),
+                    "--r3-predictions", str(paths["r3_predictions"]),
+                    "--group-manifest", str(paths["group_manifest"]),
+                    "--output-root", str(out_root),
+                    "--n-outer", "2",
+                    "--n-boot", "4",
+                ])
+            self.assertFalse(out_root.exists())
         finally:
             import shutil
             shutil.rmtree(tmp_path, ignore_errors=True)
@@ -973,4 +1198,5 @@ class GateOracleCLITests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
 
