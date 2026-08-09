@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+import json
 import math
+import sys
+import tempfile
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 
+from xh202615.data import Sample
+from xh202615.evaluation import evaluate_rows
 from xh202615.r10_selector import CandidateRow
 from xh202615.r11_gate_oracle import (
     GATE_FEATURE_SCHEMA,
@@ -22,6 +28,16 @@ from xh202615.r11_gate_oracle import (
     group_bootstrap_best_frontier,
     select_frontier_point,
 )
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from scripts.r11_gate_oracle_oof import (
+    _SENTINEL_ACCEPTED_NEGATIVE,
+    main,
+    write_e0_artifacts,
+)
+
+
+REJECT_ALL_THRESHOLD_MARKER = "__reject_all__"
 
 
 def _row(
@@ -597,5 +613,364 @@ class OracleMetricTests(unittest.TestCase):
         self.assertIsNone(select_frontier_point(points, 0.99))
 
 
+class ArtifactWriterTests(unittest.TestCase):
+    def _synthetic_rows(self):
+        labels = {"0": "甲", "1": None, "2": "乙", "3": None}
+        groups = ["g0", "g0", "g1", "g1"]
+        rows = [
+            _row("0", "甲", r3="甲", primary="乙", energy="", tse="甲"),
+            _row("1", None, r3="", primary="", energy="", tse=""),
+            _row("2", "乙", r3="乙", primary="丙", energy="", tse="乙"),
+            _row("3", None, r3="", primary="", energy="", tse=""),
+        ]
+        return rows, labels, groups
+
+    def _make_paths(self, tmp_path: Path):
+        dataset_root = tmp_path / "datasetA"
+        dataset_root.mkdir()
+        for split in ("pos", "neg"):
+            (dataset_root / f"{split}.jsonl").write_text("", encoding="utf-8")
+        candidate_fusion = tmp_path / "candidate_fusion.jsonl"
+        tse_asr = tmp_path / "tse_asr.jsonl"
+        audio_map = tmp_path / "audio_map.jsonl"
+        r3_predictions = tmp_path / "r3_predictions.jsonl"
+        group_manifest = tmp_path / "manifest.json"
+        for path in (candidate_fusion, tse_asr, audio_map, r3_predictions):
+            path.write_text(json.dumps({"id": "0"}) + "\n", encoding="utf-8")
+        group_manifest.write_text(json.dumps({"rows": []}), encoding="utf-8")
+        return {
+            "dataset_root": dataset_root,
+            "candidate_fusion": candidate_fusion,
+            "tse_asr": tse_asr,
+            "audio_map": audio_map,
+            "r3_predictions": r3_predictions,
+            "group_manifest": group_manifest,
+            "n_outer": 2,
+            "n_boot": 4,
+            "seed": 1,
+            "rr_floor": 1.0,
+        }
+
+    def _evaluate(self, rows, labels, groups):
+        return evaluate_e0(
+            rows,
+            labels,
+            groups,
+            n_splits=2,
+            seed=1,
+            rr_floor=1.0,
+            n_boot=4,
+        )
+
+    def _expected_files(self, out_root: Path):
+        return {
+            "manifest": out_root / "r11_e0_manifest.json",
+            "summary": out_root / "r11_e0_summary.json",
+            "scores": out_root / "r11_e0_scores.jsonl",
+            "frontier": out_root / "r11_e0_frontier.jsonl",
+            "report": out_root / "r11_e0_report.md",
+        }
+
+    def test_writes_exactly_five_artifacts_with_expected_names(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            files = write_e0_artifacts(result, rows, groups, paths, out_root)
+            expected = self._expected_files(out_root)
+            self.assertEqual(files, expected)
+            self.assertEqual(
+                {p.name for p in out_root.iterdir()},
+                {p.name for p in expected.values()},
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmp_path)
+
+    def test_manifest_has_required_provenance_and_summary_keys(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            files = write_e0_artifacts(result, rows, groups, paths, out_root)
+            manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
+            for key in (
+                "config_hash",
+                "source_digest",
+                "resolved_paths",
+                "model_specs",
+                "decision",
+                "selected_point",
+                "worst_fold",
+                "bootstrap_summary",
+                "input_validation",
+            ):
+                self.assertIn(key, manifest, key)
+            self.assertEqual(manifest["selected_point"]["diagnostic_only"], True)
+            self.assertEqual(manifest["selected_point"]["deployable"], False)
+        finally:
+            import shutil
+            shutil.rmtree(tmp_path)
+
+    def test_scores_roundtrip_without_label_or_reference_text(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            files = write_e0_artifacts(result, rows, groups, paths, out_root)
+            lines = files["scores"].read_text(encoding="utf-8").strip().split("\n")
+            self.assertEqual(len(lines), len(rows))
+            for line in lines:
+                row = json.loads(line)
+                self.assertEqual(set(row), {"id", "group", "fold", *result["scores_by_model"]})
+                for model_name in result["scores_by_model"]:
+                    score = row[model_name]
+                    self.assertIsInstance(score, float)
+                    self.assertTrue(0.0 <= score <= 1.0)
+                    self.assertTrue(math.isfinite(score))
+                self.assertNotIn("label", row)
+                self.assertNotIn("recognition_text", row)
+                self.assertNotIn("target_present", row)
+        finally:
+            import shutil
+            shutil.rmtree(tmp_path)
+
+    def test_frontier_rows_contain_metrics_model_and_threshold_only(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            files = write_e0_artifacts(result, rows, groups, paths, out_root)
+            lines = files["frontier"].read_text(encoding="utf-8").strip().split("\n")
+            self.assertGreater(len(lines), 0)
+            for line in lines:
+                row = json.loads(line)
+                self.assertIn("model", row)
+                self.assertIn("threshold", row)
+                for key in ("cer", "rr", "overall", "accepted_positives", "accepted_negatives"):
+                    self.assertIn(key, row)
+                for forbidden in ("label", "reference", "text", "chosen_action"):
+                    self.assertNotIn(forbidden, row)
+        finally:
+            import shutil
+            shutil.rmtree(tmp_path)
+
+    def test_reject_all_threshold_uses_json_safe_marker(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        result["selected_point"]["threshold"] = math.inf
+        result["frontier"].append(
+            {
+                "model": result["selected_point"]["model"],
+                "threshold": math.inf,
+                "cer": 1.0,
+                "rr": 1.0,
+                "overall": 0.5,
+                "accepted_positives": 0.0,
+                "accepted_negatives": 0.0,
+            }
+        )
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            files = write_e0_artifacts(result, rows, groups, paths, out_root)
+            manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
+            self.assertEqual(manifest["selected_point"]["threshold"], REJECT_ALL_THRESHOLD_MARKER)
+            lines = files["frontier"].read_text(encoding="utf-8").strip().split("\n")
+            thresholds = {json.loads(line)["threshold"] for line in lines}
+            self.assertIn(REJECT_ALL_THRESHOLD_MARKER, thresholds)
+        finally:
+            import shutil
+            shutil.rmtree(tmp_path)
+
+    def test_digest_and_config_hash_are_deterministic(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+
+        def run(tmp: Path):
+            paths = self._make_paths(tmp)
+            out_root = tmp / "out"
+            files = write_e0_artifacts(result, rows, groups, paths, out_root)
+            manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
+            return manifest["config_hash"], manifest["source_digest"]
+
+        tmp_a = Path(tempfile.mkdtemp())
+        tmp_b = Path(tempfile.mkdtemp())
+        try:
+            hash_a, digest_a = run(tmp_a)
+            hash_b, digest_b = run(tmp_b)
+            self.assertEqual(hash_a, hash_b)
+            self.assertEqual(digest_a, digest_b)
+        finally:
+            import shutil
+            shutil.rmtree(tmp_a)
+            shutil.rmtree(tmp_b)
+
+    def test_report_contains_decision_and_next_branch(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            files = write_e0_artifacts(result, rows, groups, paths, out_root)
+            report = files["report"].read_text(encoding="utf-8")
+            self.assertIn(f"Decision: {result['decision']}", report)
+            self.assertIn("Next branch:", report)
+        finally:
+            import shutil
+            shutil.rmtree(tmp_path)
+
+    def test_official_parity_for_selected_point(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        selected = result["selected_point"]
+        threshold = float(selected["threshold"])
+        model_scores = result["scores_by_model"][selected["model"]]
+        contributions = build_oracle_contributions(rows, labels)
+        accepted = model_scores >= threshold
+        predictions = []
+        for row, accept, action in zip(rows, accepted, contributions.chosen_actions):
+            if labels[row.id] is None:
+                text = _SENTINEL_ACCEPTED_NEGATIVE if accept else ""
+            else:
+                text = row.texts.get(action, "") if accept else ""
+            predictions.append({"id": row.id, "recognition_text": text})
+        samples = [
+            Sample(
+                id=row.id,
+                split=row.split,
+                wakeup_audio=Path("."),
+                wakeup_text="",
+                command_audio=row.original_command_audio or Path("."),
+                label=labels[row.id],
+            )
+            for row in rows
+        ]
+        official = evaluate_rows(samples, predictions, missing_policy="empty").metrics
+        self.assertAlmostEqual(selected["cer"], official["avg_cer"], places=9)
+        self.assertAlmostEqual(selected["rr"], official["avg_rr"], places=9)
+        expected_overall = ((1.0 - official["avg_cer"]) + official["avg_rr"]) / 2.0
+        self.assertAlmostEqual(selected["overall"], expected_overall, places=9)
+
+
+class GateOracleCLITests(unittest.TestCase):
+    def test_help_exits_cleanly(self):
+        with self.assertRaises(SystemExit) as ctx:
+            main(["--help"])
+        self.assertEqual(ctx.exception.code, 0)
+
+    def test_missing_input_file_fails_before_writing_output(self):
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            out_root = tmp_path / "out"
+            with self.assertRaises((FileNotFoundError, ValueError)):
+                main([
+                    "--dataset-root", str(tmp_path / "missing"),
+                    "--candidate-fusion", str(tmp_path / "missing.jsonl"),
+                    "--tse-asr", str(tmp_path / "missing.jsonl"),
+                    "--audio-map", str(tmp_path / "missing.jsonl"),
+                    "--r3-predictions", str(tmp_path / "missing.jsonl"),
+                    "--group-manifest", str(tmp_path / "missing.jsonl"),
+                    "--output-root", str(out_root),
+                    "--n-outer", "2",
+                    "--n-boot", "4",
+                ])
+            self.assertFalse(out_root.exists())
+        finally:
+            import shutil
+            shutil.rmtree(tmp_path, ignore_errors=True)
+
+    def test_end_to_end_runs_on_synthetic_inputs(self):
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            dataset_root = tmp_path / "datasetA"
+            dataset_root.mkdir()
+            pos = [{"id": "0", "wakeup_audio": "a.wav", "command_audio": "b.wav", "label": "甲"},
+                   {"id": "2", "wakeup_audio": "a.wav", "command_audio": "b.wav", "label": "乙"}]
+            neg = [{"id": "1", "wakeup_audio": "a.wav", "command_audio": "b.wav"},
+                   {"id": "3", "wakeup_audio": "a.wav", "command_audio": "b.wav"}]
+            (dataset_root / "pos.jsonl").write_text(
+                "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in pos), encoding="utf-8"
+            )
+            (dataset_root / "neg.jsonl").write_text(
+                "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in neg), encoding="utf-8"
+            )
+
+            def write_jsonl(path: Path, records: list[dict]):
+                path.write_text(
+                    "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records),
+                    encoding="utf-8",
+                )
+
+            fusion = [
+                {"id": "0", "recognition_text": "甲", "candidate_texts": {"primary": "甲", "energy": ""}},
+                {"id": "1", "recognition_text": "", "candidate_texts": {"primary": "", "energy": ""}},
+                {"id": "2", "recognition_text": "乙", "candidate_texts": {"primary": "", "energy": ""}},
+                {"id": "3", "recognition_text": "", "candidate_texts": {"primary": "", "energy": ""}},
+            ]
+            tse = [{"id": sid, "text": rec["recognition_text"]} for sid, rec in [("0", fusion[0]), ("1", fusion[1]), ("2", fusion[2]), ("3", fusion[3])]]
+            audio = [
+                {"id": "0", "presence_score": 0.9, "enhanced_cosine": 0.8, "mixture_cosine": 0.7, "max_cosine": 0.8, "latency_ms": 100.0},
+                {"id": "1", "presence_score": 0.1, "enhanced_cosine": 0.2, "mixture_cosine": 0.1, "max_cosine": 0.2, "latency_ms": 100.0},
+                {"id": "2", "presence_score": 0.9, "enhanced_cosine": 0.8, "mixture_cosine": 0.7, "max_cosine": 0.8, "latency_ms": 100.0},
+                {"id": "3", "presence_score": 0.1, "enhanced_cosine": 0.2, "mixture_cosine": 0.1, "max_cosine": 0.2, "latency_ms": 100.0},
+            ]
+            r3 = [{"id": rec["id"], "recognition_text": rec["recognition_text"]} for rec in fusion]
+            manifest = {
+                "rows": [
+                    {"id": "0", "split": "pos", "label": "甲", "wake_component": "g0"},
+                    {"id": "1", "split": "neg", "label": None, "wake_component": "g0"},
+                    {"id": "2", "split": "pos", "label": "乙", "wake_component": "g1"},
+                    {"id": "3", "split": "neg", "label": None, "wake_component": "g1"},
+                ]
+            }
+            candidate_fusion = tmp_path / "fusion.jsonl"
+            tse_asr = tmp_path / "tse.jsonl"
+            audio_map = tmp_path / "audio.jsonl"
+            r3_predictions = tmp_path / "r3.jsonl"
+            group_manifest = tmp_path / "manifest.json"
+            write_jsonl(candidate_fusion, fusion)
+            write_jsonl(tse_asr, tse)
+            write_jsonl(audio_map, audio)
+            write_jsonl(r3_predictions, r3)
+            group_manifest.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+
+            out_root = tmp_path / "out"
+            rc = main([
+                "--dataset-root", str(dataset_root),
+                "--candidate-fusion", str(candidate_fusion),
+                "--tse-asr", str(tse_asr),
+                "--audio-map", str(audio_map),
+                "--r3-predictions", str(r3_predictions),
+                "--group-manifest", str(group_manifest),
+                "--output-root", str(out_root),
+                "--n-outer", "2",
+                "--n-boot", "4",
+                "--seed", "1",
+                "--rr-floor", "0.5",
+            ])
+            self.assertEqual(rc, 0)
+            self.assertTrue(out_root.is_dir())
+            self.assertEqual(
+                {p.name for p in out_root.iterdir()},
+                {"r11_e0_manifest.json", "r11_e0_summary.json", "r11_e0_scores.jsonl",
+                 "r11_e0_frontier.jsonl", "r11_e0_report.md"},
+            )
+        finally:
+            import shutil
+            shutil.rmtree(tmp_path, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -91,6 +91,14 @@ scores across sources, or persist full time-by-vocabulary tensors.
 Cross-fit a small predeclared cached-feature gate grid. For accepted positives,
 assign the true best current candidate only for this diagnostic upper bound.
 
+Run the reproducible E0 CLI from the repository root. E0 runs on CPU and does
+not start neural training.
+
+```powershell
+Set-Location 'F:\XH-202615\XH-202615'
+.\.venv\Scripts\python.exe .\scripts\r11_gate_oracle_oof.py
+```
+
 - Continue cached cascade only if gate-oracle `Overall >= 0.81`, `RR >= 0.93`
   and worst-fold `Overall >= 0.77`.
 - If the upper 95% grouped-bootstrap bound of best gate-oracle Overall is below
