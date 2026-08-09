@@ -1236,6 +1236,28 @@ class ArtifactWriterTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_path)
 
+    def test_invalid_official_rate_fails_closed_before_output(self):
+        rows, labels, groups = self._synthetic_rows()
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            for key, value in (
+                ("avg_cer", -0.01),
+                ("avg_rr", 1.01),
+                ("false_reject_rate", -0.01),
+                ("false_accept_rate", 1.01),
+            ):
+                with self.subTest(key=key, value=value):
+                    result = self._evaluate(rows, labels, groups)
+                    result["official_metrics"][key] = value
+                    out_root = tmp_path / f"out-{key}"
+                    with self.assertRaises(ValueError):
+                        write_e0_artifacts(result, rows, groups, paths, out_root)
+                    self.assertFalse(out_root.exists())
+                    self.assertFalse((tmp_path / f"out-{key}.publish.lock").exists())
+        finally:
+            shutil.rmtree(tmp_path)
+
     def test_all_parity_flags_true_in_published_package(self):
         rows, labels, groups = self._synthetic_rows()
         result = self._evaluate(rows, labels, groups)
@@ -1525,6 +1547,66 @@ class ArtifactWriterTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp_path)
 
+    def test_existing_publication_lock_fails_closed_without_cleanup(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            lock = tmp_path / "out.publish.lock"
+            lock.mkdir()
+            owner = lock / "owner.json"
+            owner.write_text('{"writer":"other"}', encoding="utf-8")
+
+            with self.assertRaises(RuntimeError) as ctx:
+                write_e0_artifacts(result, rows, groups, paths, out_root)
+
+            self.assertIn("publication lock", str(ctx.exception).lower())
+            self.assertEqual(owner.read_text(encoding="utf-8"), '{"writer":"other"}')
+            self.assertFalse(out_root.exists())
+            self.assertFalse(any(p.name.startswith("out.staging") for p in tmp_path.iterdir()))
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def test_competing_output_after_publish_failure_is_preserved_with_backup(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            write_e0_artifacts(result, rows, groups, paths, out_root)
+            old_manifest_bytes = (out_root / "e0_manifest.json").read_bytes()
+
+            mutated = list(rows)
+            mutated[0] = replace(mutated[0], audio_features={**mutated[0].audio_features, "presence_score": 9.9})
+            result2 = self._evaluate(mutated, labels, groups)
+
+            from scripts import r11_gate_oracle_oof as oof_module
+            original_rename = oof_module.os.rename
+            calls = {"count": 0}
+
+            def competing_writer_rename(src, dst):
+                calls["count"] += 1
+                if calls["count"] == 2:
+                    backup = next(p for p in tmp_path.iterdir() if p.name.startswith("out.backup"))
+                    shutil.copytree(backup, out_root)
+                    raise OSError("simulated competing publication")
+                return original_rename(src, dst)
+
+            with patch.object(oof_module.os, "rename", side_effect=competing_writer_rename):
+                with self.assertRaises(RuntimeError) as ctx:
+                    write_e0_artifacts(result2, mutated, groups, paths, out_root)
+
+            self.assertIn(str(out_root), str(ctx.exception))
+            backups = [p for p in tmp_path.iterdir() if p.name.startswith("out.backup")]
+            self.assertEqual(len(backups), 1)
+            self.assertEqual((out_root / "e0_manifest.json").read_bytes(), old_manifest_bytes)
+            self.assertEqual((backups[0] / "e0_manifest.json").read_bytes(), old_manifest_bytes)
+        finally:
+            shutil.rmtree(tmp_path)
+
     def test_existing_output_with_directory_named_artifacts_is_preserved(self):
         rows, labels, groups = self._synthetic_rows()
         result = self._evaluate(rows, labels, groups)
@@ -1755,5 +1837,4 @@ class GateOracleCLITests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
 

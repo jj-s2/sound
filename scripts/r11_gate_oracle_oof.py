@@ -457,6 +457,12 @@ def _validate_result(
             raise ValueError(f"official_metrics is missing {key!r}")
         if not math.isfinite(float(official[key])):
             raise ValueError(f"official metric {key} is not finite: {official[key]!r}")
+    if float(official["avg_cer"]) < 0.0:
+        raise ValueError(f"official metric avg_cer is negative: {official['avg_cer']!r}")
+    for key in ("avg_rr", "false_reject_rate", "false_accept_rate"):
+        value = float(official[key])
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"official metric {key} is outside [0, 1]: {official[key]!r}")
 
     selected = result["selected_point"]
     for key, custom_key in (("avg_cer", "cer"), ("avg_rr", "rr"), ("overall", "overall")):
@@ -879,15 +885,25 @@ def write_e0_artifacts(
     ])
     report_text = "\n".join(report_lines)
 
-    # Atomic publish with unique staging and backup paths.
+    # Serialize all staging, replacement, rollback, and cleanup for this root.
     parent = output_root.parent
     parent.mkdir(parents=True, exist_ok=True)
+    lock = output_root.with_name(output_root.name + ".publish.lock")
+    owner_metadata = _canonical_json({"pid": os.getpid(), "token": secrets.token_hex(16)})
+    try:
+        lock.mkdir()
+    except FileExistsError as exc:
+        raise RuntimeError(
+            f"publication lock already exists for {output_root}: {lock}; refusing to modify it"
+        ) from exc
+    (lock / "owner.json").write_text(owner_metadata, encoding="utf-8")
+
     staging = _unique_sibling(parent, output_root.name + ".staging")
-    staging.mkdir()
     backup: Path | None = None
     publish_succeeded = False
     restore_succeeded = False
     try:
+        staging.mkdir()
         (staging / _ARTIFACT_NAMES["manifest"]).write_text(manifest_json, encoding="utf-8")
         (staging / _ARTIFACT_NAMES["summary"]).write_text(summary_json, encoding="utf-8")
         with (staging / _ARTIFACT_NAMES["scores"]).open("w", encoding="utf-8") as handle:
@@ -910,9 +926,12 @@ def write_e0_artifacts(
         publish_succeeded = True
     except Exception as publish_exc:
         if backup is not None and backup.exists():
+            if output_root.exists():
+                raise RuntimeError(
+                    f"publish failed and unexpected output root was preserved at {output_root}; "
+                    f"recovery backup preserved at {backup}"
+                ) from publish_exc
             try:
-                if output_root.exists():
-                    shutil.rmtree(output_root)
                 os.rename(backup, output_root)
                 restore_succeeded = True
             except Exception as restore_exc:
@@ -925,6 +944,10 @@ def write_e0_artifacts(
             shutil.rmtree(staging)
         if backup is not None and backup.exists() and (publish_succeeded or restore_succeeded):
             shutil.rmtree(backup)
+        owner = lock / "owner.json"
+        if owner.is_file() and owner.read_text(encoding="utf-8") == owner_metadata:
+            owner.unlink()
+            lock.rmdir()
 
     return final_paths
 
