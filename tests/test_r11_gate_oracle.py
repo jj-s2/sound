@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 import sys
 import tempfile
 import unittest
@@ -36,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scripts.r11_gate_oracle_oof import (
     _REJECT_ALL_THRESHOLD_MARKER,
     _SENTINEL_ACCEPTED_NEGATIVE,
+    _check_evaluator_parity,
     _next_branch,
     main,
     write_e0_artifacts,
@@ -670,7 +672,7 @@ class ArtifactWriterTests(unittest.TestCase):
         }
 
     def _evaluate(self, rows, labels, groups):
-        return evaluate_e0(
+        result = evaluate_e0(
             rows,
             labels,
             groups,
@@ -679,6 +681,8 @@ class ArtifactWriterTests(unittest.TestCase):
             rr_floor=1.0,
             n_boot=4,
         )
+        result["official_metrics"] = _check_evaluator_parity(rows, labels, result)
+        return result
 
     def _expected_files(self, out_root: Path):
         return {
@@ -744,6 +748,11 @@ class ArtifactWriterTests(unittest.TestCase):
                     set(fold["train_groups"]) & set(fold["test_groups"]),
                     set(),
                 )
+            parity = manifest["official_parity"]
+            for key in ("custom", "official", "deltas", "parity"):
+                self.assertIn(key, parity)
+            self.assertIn("false_reject_rate", parity["official"])
+            self.assertIn("false_accept_rate", parity["official"])
         finally:
             import shutil
             shutil.rmtree(tmp_path)
@@ -841,11 +850,109 @@ class ArtifactWriterTests(unittest.TestCase):
             hash_a, digest_a = run(tmp_a)
             hash_b, digest_b = run(tmp_b)
             self.assertEqual(hash_a, hash_b)
-            self.assertEqual(digest_a, digest_b)
+            self.assertEqual(digest_a["aggregate"], digest_b["aggregate"])
+            self.assertEqual(digest_a["per_source"], digest_b["per_source"])
         finally:
             import shutil
             shutil.rmtree(tmp_a)
             shutil.rmtree(tmp_b)
+
+    def test_source_content_digest_per_source_and_aggregate(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            files = write_e0_artifacts(result, rows, groups, paths, out_root)
+            manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
+            digest = manifest["source_digest"]
+            self.assertIn("aggregate", digest)
+            self.assertIn("per_source", digest)
+            for name in (
+                "candidate_fusion",
+                "tse_asr",
+                "audio_map",
+                "r3_predictions",
+                "group_manifest",
+                "dataset_pos",
+                "dataset_neg",
+            ):
+                self.assertIn(name, digest["per_source"])
+                self.assertEqual(len(digest["per_source"][name]), 64)
+        finally:
+            import shutil
+            shutil.rmtree(tmp_path)
+
+    def test_source_content_digest_is_sensitive_to_each_raw_input(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+
+        def base_digest():
+            tmp_path = Path(tempfile.mkdtemp())
+            try:
+                paths = self._make_paths(tmp_path)
+                out_root = tmp_path / "out"
+                files = write_e0_artifacts(result, rows, groups, paths, out_root)
+                manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
+                return manifest["source_digest"], paths, tmp_path
+            except Exception:
+                shutil.rmtree(tmp_path)
+                raise
+
+        original, _, _ = base_digest()
+        for name in (
+            "candidate_fusion",
+            "tse_asr",
+            "audio_map",
+            "r3_predictions",
+            "group_manifest",
+        ):
+            tmp_path = Path(tempfile.mkdtemp())
+            try:
+                paths = self._make_paths(tmp_path)
+                out_root = tmp_path / "out"
+                path = paths[name]
+                original_bytes = path.read_bytes()
+                path.write_bytes(original_bytes + b"\n")
+                files = write_e0_artifacts(result, rows, groups, paths, out_root)
+                manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
+                mutated = manifest["source_digest"]
+                self.assertNotEqual(
+                    mutated["per_source"][name],
+                    original["per_source"][name],
+                    f"{name} digest did not change after mutation",
+                )
+                self.assertNotEqual(
+                    mutated["aggregate"], original["aggregate"], f"{name} mutation did not change aggregate"
+                )
+                for other in original["per_source"]:
+                    if other != name:
+                        self.assertEqual(
+                            mutated["per_source"][other],
+                            original["per_source"][other],
+                            f"{name} mutation changed {other} digest",
+                        )
+            finally:
+                import shutil
+                shutil.rmtree(tmp_path)
+
+        for split in ("pos", "neg"):
+            tmp_path = Path(tempfile.mkdtemp())
+            try:
+                paths = self._make_paths(tmp_path)
+                out_root = tmp_path / "out"
+                split_path = paths["dataset_root"] / f"{split}.jsonl"
+                split_path.write_bytes(split_path.read_bytes() + b"\n")
+                files = write_e0_artifacts(result, rows, groups, paths, out_root)
+                manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
+                mutated = manifest["source_digest"]
+                key = f"dataset_{split}"
+                self.assertNotEqual(mutated["per_source"][key], original["per_source"][key])
+                self.assertNotEqual(mutated["aggregate"], original["aggregate"])
+            finally:
+                import shutil
+                shutil.rmtree(tmp_path)
 
     def test_report_contains_decision_and_next_branch(self):
         rows, labels, groups = self._synthetic_rows()
@@ -1021,6 +1128,333 @@ class ArtifactWriterTests(unittest.TestCase):
         }
         for decision, text in expected.items():
             self.assertEqual(_next_branch(decision), text)
+
+    def test_missing_official_metrics_raises_before_output(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        del result["official_metrics"]
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            with self.assertRaises(ValueError):
+                write_e0_artifacts(result, rows, groups, paths, out_root)
+            self.assertFalse(out_root.exists())
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def test_official_parity_in_manifest_separates_values(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            files = write_e0_artifacts(result, rows, groups, paths, out_root)
+            manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
+            parity = manifest["official_parity"]
+            for key in ("custom", "official", "deltas", "parity"):
+                self.assertIn(key, parity)
+            for key in ("avg_cer", "avg_rr", "overall"):
+                self.assertAlmostEqual(parity["deltas"][key], 0.0, places=9)
+                self.assertTrue(parity["parity"][key])
+            self.assertIn("false_reject_rate", parity["official"])
+            self.assertIn("false_accept_rate", parity["official"])
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def test_check_evaluator_parity_records_false_reject_for_empty_accepted_positive(self):
+        rows = [
+            _row("p", "甲", r3="", primary="", energy="", tse=""),
+            _row("n", None, r3="", primary="", energy="", tse=""),
+        ]
+        labels = {"p": "甲", "n": None}
+        groups = ["g0", "g1"]
+        result = {
+            "selected_point": {
+                "model": "m",
+                "threshold": 0.5,
+                "cer": 1.0,
+                "rr": 1.0,
+                "overall": 0.5,
+                "accepted_positives": 1.0,
+                "accepted_negatives": 0.0,
+                "diagnostic_only": True,
+                "deployable": False,
+            },
+            "scores_by_model": {"m": np.array([0.9, 0.1])},
+        }
+        official = _check_evaluator_parity(rows, labels, result)
+        self.assertEqual(official["false_reject_rate"], 1.0)
+        self.assertEqual(official["false_accept_rate"], 0.0)
+
+    def test_official_parity_false_when_custom_official_disagree(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        result["selected_point"]["cer"] = 0.999
+        result["selected_point"]["overall"] = (
+            (1.0 - result["selected_point"]["cer"]) + result["selected_point"]["rr"]
+        ) / 2.0
+        result["official_metrics"] = {
+            "avg_cer": 0.0,
+            "avg_rr": 1.0,
+            "overall": 1.0,
+            "false_reject_rate": 1.0,
+            "false_accept_rate": 0.0,
+        }
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            files = write_e0_artifacts(result, rows, groups, paths, out_root)
+            manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
+            parity = manifest["official_parity"]
+            self.assertFalse(parity["parity"]["avg_cer"])
+            self.assertFalse(parity["parity"]["overall"])
+            self.assertNotEqual(parity["deltas"]["avg_cer"], 0.0)
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def _valid_result_with_folds(self, rows, labels, groups):
+        result = self._evaluate(rows, labels, groups)
+        result["fold_metadata"] = (
+            {
+                "fold_index": 0,
+                "train_indices": np.array([2, 3], dtype=np.int64),
+                "test_indices": np.array([0, 1], dtype=np.int64),
+                "train_groups": ["g1"],
+                "test_groups": ["g0"],
+            },
+            {
+                "fold_index": 1,
+                "train_indices": np.array([0, 1], dtype=np.int64),
+                "test_indices": np.array([2, 3], dtype=np.int64),
+                "train_groups": ["g0"],
+                "test_groups": ["g1"],
+            },
+        )
+        result["fold_assignments"] = np.array([0, 0, 1, 1], dtype=np.int64)
+        return result
+
+    def test_fold_validation_rejects_duplicate_test_index(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._valid_result_with_folds(rows, labels, groups)
+        result["fold_metadata"] = (
+            {
+                "fold_index": 0,
+                "train_indices": np.array([2, 3], dtype=np.int64),
+                "test_indices": np.array([0, 1], dtype=np.int64),
+                "train_groups": ["g1"],
+                "test_groups": ["g0"],
+            },
+            {
+                "fold_index": 1,
+                "train_indices": np.array([0], dtype=np.int64),
+                "test_indices": np.array([1, 2, 3], dtype=np.int64),
+                "train_groups": ["g0"],
+                "test_groups": ["g0", "g1"],
+            },
+        )
+        result["fold_assignments"] = np.array([0, 0, 1, 1], dtype=np.int64)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            with self.assertRaises(ValueError):
+                write_e0_artifacts(result, rows, groups, paths, out_root)
+            self.assertFalse(out_root.exists())
+            self.assertFalse(any(p.name.startswith("out.staging") for p in tmp_path.iterdir()))
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def test_fold_validation_rejects_missing_test_index(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._valid_result_with_folds(rows, labels, groups)
+        result["fold_metadata"] = (
+            {
+                "fold_index": 0,
+                "train_indices": np.array([1, 2, 3], dtype=np.int64),
+                "test_indices": np.array([0], dtype=np.int64),
+                "train_groups": ["g0", "g1"],
+                "test_groups": ["g0"],
+            },
+            {
+                "fold_index": 1,
+                "train_indices": np.array([0], dtype=np.int64),
+                "test_indices": np.array([1], dtype=np.int64),
+                "train_groups": ["g0"],
+                "test_groups": ["g0"],
+            },
+        )
+        result["fold_assignments"] = np.array([0, 1, -1, -1], dtype=np.int64)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            with self.assertRaises(ValueError):
+                write_e0_artifacts(result, rows, groups, paths, out_root)
+            self.assertFalse(out_root.exists())
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def test_fold_validation_rejects_assignment_disagreement(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._valid_result_with_folds(rows, labels, groups)
+        result["fold_assignments"] = np.array([1, 1, 0, 0], dtype=np.int64)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            with self.assertRaises(ValueError):
+                write_e0_artifacts(result, rows, groups, paths, out_root)
+            self.assertFalse(out_root.exists())
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def test_fold_validation_rejects_train_test_group_intersection(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._valid_result_with_folds(rows, labels, groups)
+        meta = list(result["fold_metadata"])
+        meta[0] = {
+            "fold_index": 0,
+            "train_indices": np.array([2, 3], dtype=np.int64),
+            "test_indices": np.array([0, 1], dtype=np.int64),
+            "train_groups": ["g0", "g1"],
+            "test_groups": ["g0"],
+        }
+        result["fold_metadata"] = tuple(meta)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            with self.assertRaises(ValueError):
+                write_e0_artifacts(result, rows, groups, paths, out_root)
+            self.assertFalse(out_root.exists())
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def test_fold_validation_rejects_metadata_groups_not_derived_from_rows(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._valid_result_with_folds(rows, labels, groups)
+        meta = list(result["fold_metadata"])
+        meta[0] = {
+            "fold_index": 0,
+            "train_indices": np.array([2, 3], dtype=np.int64),
+            "test_indices": np.array([0, 1], dtype=np.int64),
+            "train_groups": ["g1"],
+            "test_groups": ["wrong_group"],
+        }
+        result["fold_metadata"] = tuple(meta)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            with self.assertRaises(ValueError):
+                write_e0_artifacts(result, rows, groups, paths, out_root)
+            self.assertFalse(out_root.exists())
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def test_unique_staging_path_is_not_fixed_sibling(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            stale = out_root.with_name(out_root.name + ".staging")
+            stale.mkdir()
+            captured = {}
+
+            def fake_rename(src, dst):
+                captured["src"] = str(src)
+                captured["dst"] = str(dst)
+                os_rename(src, dst)
+
+            from scripts import r11_gate_oracle_oof as oof_module
+            os_rename = oof_module.os.rename
+            with patch.object(oof_module.os, "rename", side_effect=fake_rename):
+                write_e0_artifacts(result, rows, groups, paths, out_root)
+            self.assertTrue(out_root.is_dir())
+            self.assertIn("staging", captured["src"])
+            self.assertNotEqual(Path(captured["src"]), stale)
+            self.assertTrue(stale.exists())
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def test_existing_unrecognized_output_root_fails_closed(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            out_root.mkdir()
+            (out_root / "stray_file.txt").write_text("not evidence", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                write_e0_artifacts(result, rows, groups, paths, out_root)
+            self.assertTrue((out_root / "stray_file.txt").exists())
+            self.assertFalse(any(p.name.startswith("out.staging") for p in tmp_path.iterdir()))
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def test_existing_recognized_output_root_is_replaced(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            write_e0_artifacts(result, rows, groups, paths, out_root)
+            old_manifest = json.loads((out_root / "e0_manifest.json").read_text(encoding="utf-8"))
+
+            mutated = list(rows)
+            mutated[0] = replace(mutated[0], audio_features={**mutated[0].audio_features, "presence_score": 9.9})
+            result2 = self._evaluate(mutated, labels, groups)
+            write_e0_artifacts(result2, mutated, groups, paths, out_root)
+            new_manifest = json.loads((out_root / "e0_manifest.json").read_text(encoding="utf-8"))
+            self.assertNotEqual(
+                old_manifest["feature_state_digest"]["aggregate"],
+                new_manifest["feature_state_digest"]["aggregate"],
+            )
+            self.assertFalse(any(p.name.startswith("out.backup") for p in tmp_path.iterdir()))
+        finally:
+            shutil.rmtree(tmp_path)
+
+    def test_forced_rename_failure_restores_backup(self):
+        rows, labels, groups = self._synthetic_rows()
+        result = self._evaluate(rows, labels, groups)
+        tmp_path = Path(tempfile.mkdtemp())
+        try:
+            paths = self._make_paths(tmp_path)
+            out_root = tmp_path / "out"
+            write_e0_artifacts(result, rows, groups, paths, out_root)
+            old_manifest_bytes = (out_root / "e0_manifest.json").read_bytes()
+
+            mutated = list(rows)
+            mutated[0] = replace(mutated[0], audio_features={**mutated[0].audio_features, "presence_score": 9.9})
+            result2 = self._evaluate(mutated, labels, groups)
+
+            from scripts import r11_gate_oracle_oof as oof_module
+            original_rename = oof_module.os.rename
+            calls = {"count": 0}
+
+            def failing_rename(src, dst):
+                calls["count"] += 1
+                if calls["count"] == 2:
+                    raise OSError("forced rename failure")
+                return original_rename(src, dst)
+
+            with patch.object(oof_module.os, "rename", side_effect=failing_rename):
+                with self.assertRaises(OSError):
+                    write_e0_artifacts(result2, mutated, groups, paths, out_root)
+
+            self.assertTrue(out_root.is_dir())
+            restored_bytes = (out_root / "e0_manifest.json").read_bytes()
+            self.assertEqual(restored_bytes, old_manifest_bytes)
+            self.assertFalse(any(p.name.startswith("out.staging") for p in tmp_path.iterdir()))
+        finally:
+            shutil.rmtree(tmp_path)
 
 
 class GateOracleCLITests(unittest.TestCase):

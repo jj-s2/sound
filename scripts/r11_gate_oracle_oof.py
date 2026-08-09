@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import secrets
 import shutil
 import sys
 from dataclasses import asdict, is_dataclass
@@ -103,25 +104,25 @@ def _jsonify(obj: Any) -> Any:
     return obj
 
 
-def _serialize_threshold(value: Any) -> Any:
-    """Encode the reject-all threshold as a JSON-safe boundary marker."""
-    if isinstance(value, float) and math.isinf(value) and value > 0:
-        return _REJECT_ALL_THRESHOLD_MARKER
-    return value
-
-
 def _apply_threshold_markers(obj: Any) -> Any:
     """Replace every ``threshold`` field with the safe marker when it is +inf."""
     if isinstance(obj, dict):
         return {
-            k: _REJECT_ALL_THRESHOLD_MARKER
-            if k == "threshold" and isinstance(v, float) and math.isinf(v) and v > 0
+            k: _serialize_threshold(v)
+            if k == "threshold"
             else _apply_threshold_markers(v)
             for k, v in obj.items()
         }
     if isinstance(obj, list):
         return [_apply_threshold_markers(item) for item in obj]
     return obj
+
+
+def _serialize_threshold(value: Any) -> Any:
+    """Encode a standalone reject-all threshold as a JSON-safe boundary marker."""
+    if isinstance(value, float) and math.isinf(value) and value > 0:
+        return _REJECT_ALL_THRESHOLD_MARKER
+    return value
 
 
 def _canonical_json(obj: Any, *, allow_nan: bool = False) -> str:
@@ -159,8 +160,8 @@ def _config_hash(
     return _sha256_hex(canonical.encode("utf-8"))
 
 
-def _source_digest(paths: dict[str, Path]) -> str:
-    """Hash all consumed source bytes (candidate sources, manifest, and dataset)."""
+def _source_digest(paths: dict[str, Path]) -> dict[str, Any]:
+    """Return per-source and aggregate SHA-256 of all consumed raw bytes."""
 
     digest_parts: dict[str, str] = {}
     source_files = [
@@ -178,8 +179,10 @@ def _source_digest(paths: dict[str, Path]) -> str:
         data = Path(path).read_bytes()
         digest_parts[key] = _sha256_hex(data)
 
-    canonical = json.dumps(digest_parts, sort_keys=True, ensure_ascii=False)
-    return _sha256_hex(canonical.encode("utf-8"))
+    aggregate = _sha256_hex(
+        json.dumps(digest_parts, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    )
+    return {"per_source": digest_parts, "aggregate": aggregate}
 
 
 def _feature_state_digest(rows: Sequence[CandidateRow]) -> dict[str, Any]:
@@ -237,7 +240,10 @@ def _source_id_sets(
     """Return counts and sorted-ID digests for every consumed source."""
 
     def _id_digest(ids: Sequence[str]) -> str:
-        canonical = json.dumps(sorted(ids, key=lambda x: int(x) if x.isdigit() else x), ensure_ascii=False)
+        canonical = json.dumps(
+            sorted(ids, key=lambda x: int(x) if x.isdigit() else x),
+            ensure_ascii=False,
+        )
         return _sha256_hex(canonical.encode("utf-8"))
 
     def _ids_for_jsonl(path: Path) -> tuple[int, str]:
@@ -257,7 +263,7 @@ def _source_id_sets(
     r3_count, r3_digest = _ids_for_jsonl(paths["r3_predictions"])
     manifest_count, manifest_digest = _ids_for_manifest(paths["group_manifest"])
 
-    sets: dict[str, dict[str, Any]] = {
+    return {
         "candidate_fusion": {"count": cf_count, "id_digest": cf_digest},
         "tse_asr": {"count": tse_count, "id_digest": tse_digest},
         "audio_map": {"count": audio_count, "id_digest": audio_digest},
@@ -265,7 +271,6 @@ def _source_id_sets(
         "group_manifest": {"count": manifest_count, "id_digest": manifest_digest},
         "dataset": {"count": len(dataset_ids), "id_digest": _id_digest(dataset_ids)},
     }
-    return sets
 
 
 def _load_manifest_labels_and_groups(path: Path) -> tuple[dict[str, str | None], dict[str, str], list[str]]:
@@ -365,7 +370,8 @@ def _check_evaluator_parity(
     contributions = build_oracle_contributions(rows, labels)
     predictions = _build_official_predictions(rows, labels, scores, threshold, contributions)
     official_samples = _build_samples(rows, labels) if samples is None else list(samples)
-    official = evaluate_rows(official_samples, predictions, missing_policy="empty").metrics
+    official = dict(evaluate_rows(official_samples, predictions, missing_policy="empty").metrics)
+    official["overall"] = ((1.0 - official["avg_cer"]) + official["avg_rr"]) / 2.0
 
     tolerance = 1e-9
     if abs(float(selected["cer"]) - official["avg_cer"]) > tolerance:
@@ -436,10 +442,16 @@ def _validate_result(
         "scores_by_model",
         "fold_assignments",
         "fold_metadata",
+        "official_metrics",
     )
     for key in required_keys:
         if key not in result:
             raise ValueError(f"result is missing required key {key!r}")
+
+    official = result["official_metrics"]
+    for key in ("avg_cer", "avg_rr", "overall", "false_reject_rate", "false_accept_rate"):
+        if key not in official:
+            raise ValueError(f"official_metrics is missing {key!r}")
 
     scores_by_model = result["scores_by_model"]
     if not scores_by_model:
@@ -509,18 +521,80 @@ def _validate_result(
         if not math.isfinite(value):
             raise ValueError(f"selected_point has non-finite {key}: {value}")
 
+    # Fold-metadata validation: exact once-only coverage, bounds, assignment
+    # agreement, train/test complement, row-derived group sets, zero intersections.
+    fold_metadata = result["fold_metadata"]
+    required_meta_keys = {
+        "fold_index",
+        "train_indices",
+        "test_indices",
+        "train_groups",
+        "test_groups",
+    }
+    seen_fold_indices: set[int] = set()
+    all_test_indices: list[int] = []
+    all_row_indices = set(range(n_rows))
+
+    for fold in fold_metadata:
+        if not required_meta_keys.issubset(fold):
+            missing = required_meta_keys - set(fold)
+            raise ValueError(f"fold metadata missing keys {missing}")
+
+        fold_index = int(fold["fold_index"])
+        if fold_index < 0 or fold_index >= n_folds:
+            raise ValueError(f"fold_index {fold_index} out of range")
+        if fold_index in seen_fold_indices:
+            raise ValueError(f"duplicate fold_index {fold_index}")
+        seen_fold_indices.add(fold_index)
+
+        train = np.asarray(fold["train_indices"], dtype=np.int64)
+        test = np.asarray(fold["test_indices"], dtype=np.int64)
+        if train.ndim != 1 or test.ndim != 1:
+            raise ValueError("fold train/test indices must be one-dimensional")
+        if not np.all((train >= 0) & (train < n_rows)):
+            raise ValueError(f"fold {fold_index} train indices out of bounds")
+        if not np.all((test >= 0) & (test < n_rows)):
+            raise ValueError(f"fold {fold_index} test indices out of bounds")
+
+        train_set = set(train.tolist())
+        test_set = set(test.tolist())
+        if len(train_set) != len(train):
+            raise ValueError(f"fold {fold_index} has duplicate train indices")
+        if len(test_set) != len(test):
+            raise ValueError(f"fold {fold_index} has duplicate test indices")
+        if train_set & test_set:
+            raise ValueError(f"fold {fold_index} train/test indices overlap")
+        if train_set | test_set != all_row_indices:
+            raise ValueError(f"fold {fold_index} train/test indices do not cover all rows")
+
+        if not np.all(fold_assignments[test] == fold_index):
+            raise ValueError(
+                f"fold {fold_index} test_indices disagree with fold_assignments"
+            )
+
+        expected_train_groups = {groups[i] for i in train_set}
+        expected_test_groups = {groups[i] for i in test_set}
+        if set(fold["train_groups"]) != expected_train_groups:
+            raise ValueError(f"fold {fold_index} train_groups do not match row-derived groups")
+        if set(fold["test_groups"]) != expected_test_groups:
+            raise ValueError(f"fold {fold_index} test_groups do not match row-derived groups")
+        if expected_train_groups & expected_test_groups:
+            raise ValueError(f"fold {fold_index} train/test groups intersect")
+
+        all_test_indices.extend(test.tolist())
+
+    if set(seen_fold_indices) != set(range(n_folds)):
+        raise ValueError("fold_metadata fold indices do not match fold_assignments")
+    if len(all_test_indices) != n_rows or len(set(all_test_indices)) != n_rows:
+        raise ValueError("test indices do not cover each row exactly once")
+
 
 def _build_coverage(rows: Sequence[CandidateRow], result: dict[str, Any]) -> dict[str, Any]:
     fold_assignments = np.asarray(result["fold_assignments"], dtype=np.int64)
-    n_rows = len(rows)
-    covered = np.zeros(n_rows, dtype=np.int64)
-    for fold in result["fold_metadata"]:
-        for idx in fold["test_indices"]:
-            covered[int(idx)] += 1
     return {
-        "n_rows_total": n_rows,
-        "n_rows_covered": int(np.count_nonzero(covered > 0)),
-        "once_only": bool(np.all(covered == 1)),
+        "n_rows_total": len(rows),
+        "n_rows_covered": len(rows),
+        "once_only": True,
         "n_folds": int(fold_assignments.max()) + 1,
         "sample_ids": [row.id for row in rows],
     }
@@ -544,6 +618,21 @@ def _build_fold_metadata_evidence(result: dict[str, Any]) -> list[dict[str, Any]
     return evidence
 
 
+def _is_recognized_output(path: Path) -> bool:
+    """True only if the directory contains exactly this CLI's five artifacts."""
+    if not path.is_dir():
+        return False
+    return {p.name for p in path.iterdir()} == set(_ARTIFACT_NAMES.values())
+
+
+def _unique_sibling(parent: Path, prefix: str) -> Path:
+    """Return a non-existent path under ``parent`` with the given prefix."""
+    while True:
+        candidate = parent / f"{prefix}.{secrets.token_hex(8)}"
+        if not candidate.exists():
+            return candidate
+
+
 def write_e0_artifacts(
     result: dict[str, Any],
     rows: Sequence[CandidateRow],
@@ -553,9 +642,9 @@ def write_e0_artifacts(
 ) -> dict[str, Path]:
     """Write the five fixed E0 reproducibility artifacts atomically.
 
-    The result is fully validated and all artifacts are written to a staging
-    directory before the final output root is published, so a failure never
-    leaves a partial evidence directory.
+    The result is fully validated before any file is written. All artifacts are
+    staged in a uniquely named sibling directory. If a recognizable prior output
+    root exists, it is moved to a unique backup and restored if publication fails.
     """
 
     output_root = Path(output_root)
@@ -567,6 +656,7 @@ def write_e0_artifacts(
     rr_floor = float(paths["rr_floor"])
     path_values = {k: Path(v) for k, v in paths.items() if k not in {"n_outer", "n_boot", "seed", "rr_floor"}}
 
+    official = result["official_metrics"]
     config_hash = _config_hash(
         n_outer=n_outer,
         n_boot=n_boot,
@@ -605,6 +695,20 @@ def write_e0_artifacts(
         if key not in {"n_outer", "n_boot", "seed", "rr_floor"}
     }
 
+    custom = {
+        "avg_cer": float(selected["cer"]),
+        "avg_rr": float(selected["rr"]),
+        "overall": float(selected["overall"]),
+        "accepted_positives": float(selected["accepted_positives"]),
+        "accepted_negatives": float(selected["accepted_negatives"]),
+    }
+    deltas = {
+        "avg_cer": abs(custom["avg_cer"] - float(official["avg_cer"])),
+        "avg_rr": abs(custom["avg_rr"] - float(official["avg_rr"])),
+        "overall": abs(custom["overall"] - float(official["overall"])),
+    }
+    parity = {key: value <= 1e-9 for key, value in deltas.items()}
+
     manifest = {
         "config_hash": config_hash,
         "source_digest": source_digest,
@@ -627,13 +731,16 @@ def write_e0_artifacts(
         "fold_metrics": _jsonify(_apply_threshold_markers(result["fold_metrics"])),
         "bootstrap_summary": bootstrap_summary,
         "official_parity": {
-            "avg_cer": float(result["selected_point"]["cer"]),
-            "avg_rr": float(result["selected_point"]["rr"]),
-            "overall": float(result["selected_point"]["overall"]),
-            "false_accept_rate": float(result["selected_point"]["accepted_negatives"])
-            / max(1, int(sum(row.label is None for row in rows))),
-            "false_reject_rate": float(result["selected_point"]["accepted_positives"])
-            / max(1, int(sum(row.label is not None for row in rows))),
+            "custom": custom,
+            "official": {
+                "avg_cer": float(official["avg_cer"]),
+                "avg_rr": float(official["avg_rr"]),
+                "overall": float(official["overall"]),
+                "false_reject_rate": float(official["false_reject_rate"]),
+                "false_accept_rate": float(official["false_accept_rate"]),
+            },
+            "deltas": deltas,
+            "parity": parity,
         },
     }
 
@@ -657,7 +764,7 @@ def write_e0_artifacts(
         },
         "bootstrap_ci": bootstrap_summary,
         "config_hash": config_hash,
-        "source_digest": source_digest,
+        "source_digest": source_digest["aggregate"],
         "feature_state_digest": feature_state_digest["aggregate"],
         "output_files": [],
     }
@@ -696,7 +803,7 @@ def write_e0_artifacts(
         "# R11 E0 Gate-Oracle OOF Report",
         "",
         f"Config hash: `{config_hash}`",
-        f"Source digest: `{source_digest}`",
+        f"Source digest: `{source_digest['aggregate']}`",
         f"Feature state digest: `{feature_state_digest['aggregate']}`",
         f"Outer folds: {n_outer}, bootstrap resamples: {n_boot}, seed: {seed}",
         "",
@@ -734,11 +841,12 @@ def write_e0_artifacts(
     ])
     report_text = "\n".join(report_lines)
 
-    # Atomic publish: write to a staging directory, then rename it into place.
-    staging = output_root.with_name(output_root.name + ".staging")
-    if staging.exists():
-        shutil.rmtree(staging)
-    staging.mkdir(parents=True)
+    # Atomic publish with unique staging and backup paths.
+    parent = output_root.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    staging = _unique_sibling(parent, output_root.name + ".staging")
+    staging.mkdir()
+    backup: Path | None = None
     try:
         (staging / _ARTIFACT_NAMES["manifest"]).write_text(manifest_json, encoding="utf-8")
         (staging / _ARTIFACT_NAMES["summary"]).write_text(summary_json, encoding="utf-8")
@@ -751,11 +859,25 @@ def write_e0_artifacts(
         (staging / _ARTIFACT_NAMES["report"]).write_text(report_text, encoding="utf-8")
 
         if output_root.exists():
-            shutil.rmtree(output_root)
+            if not _is_recognized_output(output_root):
+                raise ValueError(
+                    f"existing output root {output_root} is not a recognizable E0 artifact directory"
+                )
+            backup = _unique_sibling(parent, output_root.name + ".backup")
+            os.rename(output_root, backup)
+
         os.rename(staging, output_root)
     except Exception:
-        shutil.rmtree(staging, ignore_errors=True)
+        if backup is not None and backup.exists():
+            if output_root.exists():
+                shutil.rmtree(output_root)
+            os.rename(backup, output_root)
         raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+        if backup is not None and backup.exists():
+            shutil.rmtree(backup)
 
     return final_paths
 
@@ -884,7 +1006,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         n_boot=args.n_boot,
     )
 
-    _check_evaluator_parity(rows, labels, result, samples=ordered_samples)
+    official = _check_evaluator_parity(rows, labels, result, samples=ordered_samples)
+    result = {**result, "official_metrics": official}
 
     files = write_e0_artifacts(result, rows, groups, paths, args.output_root)
 
