@@ -31,7 +31,21 @@ FIRERED_ALLOW_PATTERNS = (
 
 _MODEL_MANIFEST_NAME = "model_manifest.json"
 _ECAPA_DIRECTORY = "spkrec-ecapa-voxceleb"
-_REQUIRED_TOP_LEVEL_FILES = ("NOTICE", "README.md", "pvad.onnx")
+_RAW_SNAPSHOT_FILES = frozenset(
+    {
+        "NOTICE",
+        "README.md",
+        "pvad.onnx",
+        "spkrec-ecapa-voxceleb/README.md",
+        "spkrec-ecapa-voxceleb/classifier.ckpt",
+        "spkrec-ecapa-voxceleb/config.json",
+        "spkrec-ecapa-voxceleb/embedding_model.ckpt",
+        "spkrec-ecapa-voxceleb/hyperparams.yaml",
+        "spkrec-ecapa-voxceleb/label_encoder.ckpt",
+        "spkrec-ecapa-voxceleb/label_encoder.txt",
+        "spkrec-ecapa-voxceleb/mean_var_norm_emb.ckpt",
+    }
+)
 _AGGREGATE_DIGEST_ALGORITHM = "sha256(sorted(path_utf8 + NUL + sha256_bytes))"
 _ARTIFACT_KIND = "firered_model_assets"
 _SCHEMA_VERSION = "v1"
@@ -51,9 +65,9 @@ _UPSTREAM_IDENTITY = {
     "speaker_encoder_url": "https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb",
 }
 
-# These are frozen requirement values, not versions discovered from the active
-# environment. A recognized root therefore has stable identity across machines.
-_DEPENDENCY_VERSIONS = {
+# These frozen requirements describe the runtime needed for this model. They are
+# not observations from the active environment.
+_REQUIRED_DEPENDENCY_VERSIONS = {
     "huggingface-hub": "0.36.2",
     "hyperpyyaml": "1.2.3",
     "joblib": "1.5.3",
@@ -80,6 +94,7 @@ _PROBABILITY_OUTPUT_INDEX = 1
 _MEL_STATE_OUTPUT_INDEX = 2
 _GRU_STATE_OUTPUT_INDEX = 3
 _EXPECTED_POSITIONAL_OUTPUTS = {
+    _PROBABILITY_OUTPUT_INDEX: ("probability output", "tensor(float)", (1, 1)),
     _MEL_STATE_OUTPUT_INDEX: ("mel state output", "tensor(float)", (1, 80, 15)),
     _GRU_STATE_OUTPUT_INDEX: ("GRU state output", "tensor(float)", (2, 1, 256)),
 }
@@ -287,15 +302,12 @@ def _scan_model_tree(root: Path, *, require_manifest: bool) -> dict[str, Path]:
                 raise ValueError(
                     f"model asset must be a regular non-symlink file: {relative}"
                 )
-            if relative in _REQUIRED_TOP_LEVEL_FILES:
+            if relative in _RAW_SNAPSHOT_FILES:
                 files[relative] = path
                 continue
             if relative == _MODEL_MANIFEST_NAME:
                 if not require_manifest:
                     raise ValueError(f"unexpected model asset file: {relative}")
-                files[relative] = path
-                continue
-            if relative.startswith(_ECAPA_DIRECTORY + "/"):
                 files[relative] = path
                 continue
             raise ValueError(f"unexpected model asset file: {relative}")
@@ -304,16 +316,13 @@ def _scan_model_tree(root: Path, *, require_manifest: bool) -> dict[str, Path]:
         raise ValueError(
             f"unexpected empty model asset directories: {sorted(empty_directories)}"
         )
-    missing = sorted(set(_REQUIRED_TOP_LEVEL_FILES) - set(files))
+    raw_files = set(files) - {_MODEL_MANIFEST_NAME}
+    missing = sorted(_RAW_SNAPSHOT_FILES - raw_files)
     if missing:
         raise ValueError(f"missing required model asset files: {missing}")
-    ecapa_files = [
-        name for name in files if name.startswith(_ECAPA_DIRECTORY + "/")
-    ]
-    if not ecapa_files:
-        raise ValueError(
-            f"missing required model asset files below {_ECAPA_DIRECTORY}/"
-        )
+    extras = sorted(raw_files - _RAW_SNAPSHOT_FILES)
+    if extras:
+        raise ValueError(f"unexpected model asset files: {extras}")
     if require_manifest and _MODEL_MANIFEST_NAME not in files:
         raise ValueError(f"missing required model asset file: {_MODEL_MANIFEST_NAME}")
     return files
@@ -334,7 +343,7 @@ def _manifest_payload(
         "aggregate_sha256": _aggregate_digest(raw_sha256),
         "aggregate_sha256_algorithm": _AGGREGATE_DIGEST_ALGORITHM,
         "artifact_kind": _ARTIFACT_KIND,
-        "dependency_versions": dict(_DEPENDENCY_VERSIONS),
+        "required_dependency_versions": dict(_REQUIRED_DEPENDENCY_VERSIONS),
         "onnx": dict(onnx_contract),
         "raw_sha256": dict(raw_sha256),
         "schema_version": _SCHEMA_VERSION,

@@ -12,7 +12,11 @@ from xh202615.firered_model_assets import FIRERED_REVISION, download_and_verify_
 
 
 DEFAULT_MODEL_ROOT = (
-    Path("output") / "models" / "FireRedChat-pvad" / FIRERED_REVISION
+    Path(__file__).resolve().parents[1]
+    / "output"
+    / "models"
+    / "FireRedChat-pvad"
+    / FIRERED_REVISION
 )
 
 

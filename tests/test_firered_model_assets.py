@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -34,9 +35,25 @@ RAW_FILES = {
     "NOTICE": b"Apache notice\n",
     "README.md": b"FireRed model card\n",
     "pvad.onnx": b"fake onnx bytes\x00\x01",
+    "spkrec-ecapa-voxceleb/README.md": b"ECAPA model card\n",
+    "spkrec-ecapa-voxceleb/classifier.ckpt": b"fake classifier weights\x02",
+    "spkrec-ecapa-voxceleb/config.json": b'{"sample_rate": 16000}\n',
     "spkrec-ecapa-voxceleb/hyperparams.yaml": b"sample_rate: 16000\n",
-    "spkrec-ecapa-voxceleb/embedding_model.ckpt": b"fake ecapa weights\x02",
+    "spkrec-ecapa-voxceleb/embedding_model.ckpt": b"fake ecapa weights\x03",
+    "spkrec-ecapa-voxceleb/label_encoder.ckpt": b"fake label encoder\x04",
+    "spkrec-ecapa-voxceleb/label_encoder.txt": b"speaker\n",
+    "spkrec-ecapa-voxceleb/mean_var_norm_emb.ckpt": b"fake normalization\x05",
 }
+
+
+def load_download_script():
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "download_firered_pvad.py"
+    spec = importlib.util.spec_from_file_location("download_firered_pvad", script_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 class FakeMetadata:
@@ -169,7 +186,7 @@ def test_manifest_records_raw_file_and_aggregate_digests(tmp_path: Path) -> None
     assert data["onnx"] == verify_onnx_contract(FakeSession())
 
 
-def test_manifest_records_frozen_dependency_versions(tmp_path: Path) -> None:
+def test_manifest_records_required_dependency_versions(tmp_path: Path) -> None:
     root = tmp_path / "model"
     download_and_verify_model(
         root,
@@ -177,7 +194,9 @@ def test_manifest_records_frozen_dependency_versions(tmp_path: Path) -> None:
         session_factory=fake_session_factory,
     )
 
-    assert manifest(root)["dependency_versions"] == {
+    data = manifest(root)
+    assert "dependency_versions" not in data
+    assert data["required_dependency_versions"] == {
         "huggingface-hub": "0.36.2",
         "hyperpyyaml": "1.2.3",
         "joblib": "1.5.3",
@@ -263,10 +282,26 @@ def test_onnx_contract_rejects_output_disagreement(
         verify_onnx_contract(FakeSession(outputs=outputs))
 
 
+@pytest.mark.parametrize(
+    "probability,match",
+    [
+        (("prob", "tensor(string)", (1, 1)), "probability output.*type"),
+        (("prob", "tensor(float)", (9,)), "probability output.*shape"),
+    ],
+)
+def test_onnx_contract_rejects_invalid_probability_metadata(
+    probability: tuple[str, str, tuple[int, ...]], match: str
+) -> None:
+    outputs = (OUTPUTS[0], probability, OUTPUTS[2], OUTPUTS[3])
+
+    with pytest.raises(ValueError, match=match):
+        verify_onnx_contract(FakeSession(outputs=outputs))
+
+
 def test_onnx_output_names_probability_metadata_and_extras_are_audit_only() -> None:
     outputs = (
         ("opaque_aux", "tensor(int64)", (9,)),
-        ("opaque_target", "tensor(double)", (3, 5)),
+        ("opaque_target", "tensor(float)", (1, 1)),
         OUTPUTS[2],
         OUTPUTS[3],
         ("opaque_extra", "tensor(string)", (1,)),
@@ -281,10 +316,7 @@ def test_onnx_output_names_probability_metadata_and_extras_are_audit_only() -> N
     assert contract["probability_output_index"] == 1
 
 
-@pytest.mark.parametrize(
-    "missing",
-    ["pvad.onnx", "NOTICE", "README.md"],
-)
+@pytest.mark.parametrize("missing", sorted(RAW_FILES))
 def test_missing_required_asset_is_rejected_and_destination_absent(
     tmp_path: Path,
     missing: str,
@@ -294,24 +326,6 @@ def test_missing_required_asset_is_rejected_and_destination_absent(
     del files[missing]
 
     with pytest.raises(ValueError, match="required model asset"):
-        download_and_verify_model(
-            root,
-            downloader=fake_downloader([], files=files),
-            session_factory=fake_session_factory,
-        )
-
-    assert not root.exists()
-
-
-def test_empty_ecapa_asset_tree_is_rejected(tmp_path: Path) -> None:
-    root = tmp_path / "model"
-    files = {
-        name: payload
-        for name, payload in RAW_FILES.items()
-        if not name.startswith("spkrec-ecapa-voxceleb/")
-    }
-
-    with pytest.raises(ValueError, match="below spkrec-ecapa-voxceleb"):
         download_and_verify_model(
             root,
             downloader=fake_downloader([], files=files),
@@ -332,6 +346,37 @@ def test_extra_asset_is_rejected_as_identity_ambiguity(tmp_path: Path) -> None:
         )
 
     assert not root.exists()
+
+
+def test_nested_extra_ecapa_asset_is_rejected_as_identity_ambiguity(tmp_path: Path) -> None:
+    root = tmp_path / "model"
+
+    with pytest.raises(ValueError, match="unexpected model asset"):
+        download_and_verify_model(
+            root,
+            downloader=fake_downloader(
+                [], extra=("spkrec-ecapa-voxceleb/nested/mystery.bin", b"foreign")
+            ),
+            session_factory=fake_session_factory,
+        )
+
+    assert not root.exists()
+
+
+def test_download_cli_default_is_anchored_to_repository_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    script = load_download_script()
+
+    assert script.build_parser().parse_args([]).model_root == (
+        Path(__file__).resolve().parents[1]
+        / "output"
+        / "models"
+        / "FireRedChat-pvad"
+        / FIRERED_REVISION
+    )
 
 
 def test_huggingface_local_dir_metadata_is_not_published(tmp_path: Path) -> None:
@@ -380,6 +425,56 @@ def test_valid_existing_root_is_reused_without_downloading(tmp_path: Path) -> No
 
     assert calls == []
     assert paths.root == root
+    assert snapshot_tree(root) == before
+
+
+@pytest.mark.parametrize("missing", sorted(RAW_FILES))
+def test_existing_root_rejects_every_missing_raw_snapshot_file(
+    tmp_path: Path, missing: str
+) -> None:
+    root = tmp_path / "model"
+    download_and_verify_model(
+        root,
+        downloader=fake_downloader([]),
+        session_factory=fake_session_factory,
+    )
+    (root / missing).unlink()
+    before = snapshot_tree(root)
+
+    with pytest.raises(ValueError, match="not a recognized pinned FireRed model root"):
+        download_and_verify_model(
+            root,
+            downloader=fake_downloader([]),
+            session_factory=fake_session_factory,
+        )
+
+    assert snapshot_tree(root) == before
+
+
+@pytest.mark.parametrize(
+    "extra",
+    ["extra.bin", "spkrec-ecapa-voxceleb/nested/extra.bin"],
+)
+def test_existing_root_rejects_extra_raw_snapshot_file(
+    tmp_path: Path, extra: str
+) -> None:
+    root = tmp_path / "model"
+    download_and_verify_model(
+        root,
+        downloader=fake_downloader([]),
+        session_factory=fake_session_factory,
+    )
+    (root / extra).parent.mkdir(parents=True, exist_ok=True)
+    (root / extra).write_bytes(b"foreign")
+    before = snapshot_tree(root)
+
+    with pytest.raises(ValueError, match="not a recognized pinned FireRed model root"):
+        download_and_verify_model(
+            root,
+            downloader=fake_downloader([]),
+            session_factory=fake_session_factory,
+        )
+
     assert snapshot_tree(root) == before
 
 
