@@ -49,8 +49,8 @@ def _full_cpu_manifest(cache: list[dict]) -> dict:
         "sample_rate_hz": 16000, "frame_samples": 160,
         "probability_output_index": 1, "mel_state_output_index": 2,
         "gru_state_output_index": 3,
-        "inputs": [{"name": name, "type": "tensor(float)", "shape": list(shape)} for name, shape in (("input_audio", (1, 160)), ("spkemb", (1, 192)), ("mel_buffer", (1, 80, 15)), ("gru_buffer", (2, 1, 256)))],
-        "outputs": [{"name": name, "type": "tensor(float)", "shape": list(shape)} for name, shape in (("output", (1, 1)), ("prob", (1, 1)), ("mel_buffer_out", (1, 80, 15)), ("gru_buffer_out", (2, 1, 256)))],
+        "inputs": [{"name": name, "type": "tensor(float)", "shape": list(shape)} for name, shape in (("input_audio", ("batch_size", 160)), ("spkemb", ("batch_size", 192)), ("mel_buffer", ("batch_size", 80, 15)), ("gru_buffer", (2, "batch_size", 256)))],
+        "outputs": [{"name": name, "type": "tensor(float)", "shape": list(shape)} for name, shape in (("output", ("batch_size", 1)), ("prob", ("batch_size", "Iflinear_out_dim_1")), ("mel_buffer_out", ("batch_size", 80, 15)), ("gru_buffer_out", (2, "batch_size", 256)))],
     }
     model = {"manifest_sha256": "1" * 64, "aggregate_sha256": aggregate.hexdigest(), "raw_sha256": raw, "upstream": _UPSTREAM_IDENTITY, "onnx": onnx, "required_dependency_versions": _REQUIRED_DEPENDENCY_VERSIONS}
     model["identity_sha256"] = pvad_cache._digest(model)
