@@ -30,6 +30,63 @@ _SCHEMA_SHA256 = "610c7e711fda490405a66a01e5ca6e7b01bf230c00333d891ebbaf20140e27
 _RESUME_PREFIX = "context-"
 _CONTEXT_IDENTITY = "context_identity.json"
 _AUDIT_COMMON = {"elapsed_seconds", "audio_seconds", "rtf", "peak_rss_delta_bytes", "dropped_tail_samples", "extraction_phase", "onnx_provider", "ecapa_device"}
+# Frozen cross-device gate features; audit-only tail padding remains schema-validated evidence.
+_PVAD_PARITY_FEATURE_ALLOWLIST: tuple[str, ...] = (
+    "frame_count",
+    "analyzed_duration_sec",
+    "command_duration_sec",
+    "raw_mean",
+    "raw_std",
+    "raw_min",
+    "raw_max",
+    "raw_q10",
+    "raw_q25",
+    "raw_q50",
+    "raw_q75",
+    "raw_q90",
+    "raw_q95",
+    "raw_fraction_ge_0_1",
+    "raw_fraction_ge_0_3",
+    "raw_fraction_ge_0_5",
+    "raw_fraction_ge_0_7",
+    "raw_fraction_ge_0_9",
+    "ema_mean",
+    "ema_std",
+    "ema_min",
+    "ema_max",
+    "ema_q10",
+    "ema_q25",
+    "ema_q50",
+    "ema_q75",
+    "ema_q90",
+    "ema_q95",
+    "ema_fraction_ge_0_1",
+    "ema_fraction_ge_0_3",
+    "ema_fraction_ge_0_5",
+    "ema_fraction_ge_0_7",
+    "ema_fraction_ge_0_9",
+    "ema_longest_run_ge_0_3_frames",
+    "ema_longest_run_ge_0_3_seconds",
+    "ema_first_crossing_ge_0_3_frame",
+    "ema_last_crossing_ge_0_3_frame",
+    "ema_active_span_ge_0_3_frames",
+    "ema_transitions_ge_0_3",
+    "ema_longest_run_ge_0_5_frames",
+    "ema_longest_run_ge_0_5_seconds",
+    "ema_first_crossing_ge_0_5_frame",
+    "ema_last_crossing_ge_0_5_frame",
+    "ema_active_span_ge_0_5_frames",
+    "ema_transitions_ge_0_5",
+    "ema_longest_run_ge_0_7_frames",
+    "ema_longest_run_ge_0_7_seconds",
+    "ema_first_crossing_ge_0_7_frame",
+    "ema_last_crossing_ge_0_7_frame",
+    "ema_active_span_ge_0_7_frames",
+    "ema_transitions_ge_0_7",
+    "enrollment_duration_sec",
+    "embedding_norm_before",
+    "embedding_norm_after",
+)
 
 
 def _canonical(value: object) -> str:
@@ -526,6 +583,13 @@ def _validate_values(values: Mapping[str, object]) -> OrderedDict[str, float | i
     return OrderedDict((name, _finite(values[name], f"feature {name}")) for name in PVAD_GATE_FEATURE_SCHEMA)
 
 
+def _max_abs_feature_delta(reference: Mapping[str, object], current: Mapping[str, object]) -> float:
+    return max(
+        (abs(float(reference[name]) - float(current[name])) for name in _PVAD_PARITY_FEATURE_ALLOWLIST),
+        default=0.0,
+    )
+
+
 def _validate_audit(audit: Mapping[str, object], config: PvadRuntimeConfig) -> dict[str, object]:
     expected = _AUDIT_COMMON | ({"cuda_peak_bytes"} if config.ecapa_device.startswith("cuda") else set())
     if not isinstance(audit, Mapping) or set(audit) != expected:
@@ -753,7 +817,7 @@ def build_pvad_cache(dataset_root: Path, model_paths: FireRedModelPaths, output_
             checked_provenance, current_parity_provenance = _parity_provenance(checked_manifest, current_provenance, cuda=config.ecapa_device.startswith("cuda"))
             if reference_manifest != checked_manifest or checked_provenance != current_parity_provenance:
                 raise ValueError("parity reference provenance changed before publish")
-            maximum = max((abs(float(reference[sample_id][name]) - float(features[sample_id][name])) for sample_id in selected for name in PVAD_GATE_FEATURE_SCHEMA), default=0.0)
+            maximum = max((_max_abs_feature_delta(reference[sample_id], features[sample_id]) for sample_id in selected), default=0.0)
             if maximum > 1e-4:
                 raise ValueError(f"parity failed: maximum feature delta {maximum}")
             parity = {"status": "passed", "passed": True, "max_abs_feature_delta": maximum}

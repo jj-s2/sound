@@ -63,6 +63,7 @@ class FakeRuntime:
     instances: list["FakeRuntime"] = []
     fail_id: str | None = None
     nonfinite = False
+    feature_mutation: tuple[str, float] | None = None
 
     def __init__(self, _paths: FireRedModelPaths, *, config: object, cuda_peak_bytes: object = None) -> None:
         self.config = config
@@ -75,6 +76,9 @@ class FakeRuntime:
         if sample_id == self.fail_id:
             raise RuntimeError("forced inference failure")
         values = OrderedDict((name, float(index + 1)) for index, name in enumerate(PVAD_GATE_FEATURE_SCHEMA))
+        if self.feature_mutation is not None and self.config.ecapa_device.startswith("cuda"):
+            name, amount = self.feature_mutation
+            values[name] += amount
         if self.nonfinite:
             values[PVAD_GATE_FEATURE_SCHEMA[0]] = math.nan
         audit = {"elapsed_seconds": 1.0, "audio_seconds": 2.0, "rtf": 0.5, "peak_rss_delta_bytes": 3, "dropped_tail_samples": 0, "extraction_phase": "cold", "onnx_provider": "CPUExecutionProvider", "ecapa_device": self.config.ecapa_device}
@@ -90,6 +94,7 @@ def fake_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeRuntime.instances = []
     FakeRuntime.fail_id = None
     FakeRuntime.nonfinite = False
+    FakeRuntime.feature_mutation = None
     monkeypatch.setattr(pvad_cache, "FireRedPvadRuntime", FakeRuntime)
     monkeypatch.setattr(pvad_cache, "verify_existing_model", lambda paths: paths)
 
@@ -263,6 +268,36 @@ def test_parity_reference_pass_fail_and_schema_id_validation(tmp_path: Path) -> 
     bad.write_text(_json({"id": "other", "features": {}}) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="parity"):
         call(root, model, tmp_path / "bad", parity_reference=bad)
+
+
+def test_cuda_parity_ignores_audit_only_feature_and_rejects_core_mutation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from xh202615 import pvad_cache
+
+    root, model = bundle(tmp_path), fake_model(tmp_path)
+    reference = call(root, model, tmp_path / "reference")
+    adapter = FakeCudaAudit()
+    monkeypatch.setattr(pvad_cache, "_cuda_audit_adapter", lambda _device: adapter)
+    FakeRuntime.feature_mutation = ("dropped_tail_samples", 35.0)
+    audit_only = build_pvad_cache(
+        root,
+        model,
+        tmp_path / "audit-only" / "out",
+        resume_root=tmp_path / "audit-only" / "resume",
+        ecapa_device="cuda:0",
+        parity_reference=reference["features"],
+    )
+    assert json.loads(audit_only["manifest"].read_text(encoding="utf-8"))["parity"]["passed"] is True
+
+    FakeRuntime.feature_mutation = ("frame_count", 1.0)
+    with pytest.raises(ValueError, match="parity"):
+        build_pvad_cache(
+            root,
+            model,
+            tmp_path / "core" / "out",
+            resume_root=tmp_path / "core" / "resume",
+            ecapa_device="cuda:0",
+            parity_reference=reference["features"],
+        )
 
 
 def test_cli_defaults_are_repo_anchored_and_help_is_lightweight(monkeypatch: pytest.MonkeyPatch) -> None:
