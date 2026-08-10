@@ -27,7 +27,7 @@ _ARTIFACT_KIND = "r11_e2_firered_cache"
 _SCHEMA_VERSION = "v1"
 _FEATURES, _MANIFEST, _REPORT = "pvad_features.jsonl", "pvad_manifest.json", "pvad_report.md"
 _CONTRACT = ArtifactContract(_ARTIFACT_KIND, _SCHEMA_VERSION, (_FEATURES, _MANIFEST, _REPORT), (_MANIFEST,))
-_SCHEMA_SHA256 = "5ca5d2c0f2bbbec0c5c1251518ca3fa8aac4c04144211de7cb6448bd7087830a"
+_SCHEMA_SHA256 = "610c7e711fda490405a66a01e5ca6e7b01bf230c00333d891ebbaf20140e270f"
 _RESUME_PREFIX = "context-"
 _CONTEXT_IDENTITY = "context_identity.json"
 _AUDIT_COMMON = {"elapsed_seconds", "audio_seconds", "rtf", "peak_rss_delta_bytes", "dropped_tail_samples", "extraction_phase", "onnx_provider", "ecapa_device"}
@@ -132,7 +132,7 @@ def _safe_audio(root: Path, relative: str, label: str) -> Path:
 
 
 def _schema_digest() -> str:
-    digest = _sha256("\n".join(PVAD_GATE_FEATURE_SCHEMA).encode("utf-8"))
+    digest = _sha256((r"\n".join(PVAD_GATE_FEATURE_SCHEMA) + r"\n").encode("utf-8"))
     if digest != _SCHEMA_SHA256:
         raise ValueError("fixed feature schema digest disagrees with the frozen Task 3 constant")
     return digest
@@ -157,6 +157,61 @@ def _model_identity(paths: FireRedModelPaths) -> dict[str, object]:
     if not isinstance(dependencies, Mapping) or not dependencies or any(not isinstance(key, str) or not key or not isinstance(value, str) or not value for key, value in dependencies.items()):
         raise ValueError("verified model manifest has invalid required_dependency_versions")
     return {"manifest_sha256": _file_sha256(paths.manifest), "aggregate_sha256": parsed["aggregate_sha256"], "raw_sha256": parsed["raw_sha256"], "upstream": parsed["upstream"], "onnx": parsed["onnx"], "required_dependency_versions": dict(dependencies)}
+
+
+def _digest(value: object) -> str:
+    return _sha256(_canonical(value).encode("utf-8"))
+
+
+def _sha256_value(value: object) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise ValueError("digest must be a lowercase SHA-256 hexadecimal string")
+    return value
+
+
+def _aggregate_digest(raw_sha256: Mapping[str, object]) -> str:
+    digest = hashlib.sha256()
+    for relative_path in sorted(raw_sha256):
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(bytes.fromhex(_sha256_value(raw_sha256[relative_path])))
+    return digest.hexdigest()
+
+
+def _json_value(value: object) -> None:
+    if value is None or isinstance(value, (str, bool)):
+        return
+    if type(value) in (int, float):
+        _finite(value, "provenance value")
+        return
+    if isinstance(value, list):
+        for item in value:
+            _json_value(item)
+        return
+    if isinstance(value, Mapping) and all(isinstance(key, str) and key for key in value):
+        for item in value.values():
+            _json_value(item)
+        return
+    raise ValueError("provenance value is outside the JSON domain")
+
+
+def _runtime_config(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping) or set(value) != set(asdict(_config("cpu"))):
+        raise ValueError("runtime config has an invalid exact key contract")
+    try:
+        return asdict(PvadRuntimeConfig(**dict(value)))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("runtime config has invalid values") from exc
+
+
+def _provenance(model: Mapping[str, object], source: Mapping[str, object], coverage: Mapping[str, object], config: Mapping[str, object]) -> dict[str, object]:
+    return {"model": {key: value for key, value in model.items() if key != "identity_sha256"}, "source": dict(source), "coverage": dict(coverage), "feature_schema": list(PVAD_GATE_FEATURE_SCHEMA), "feature_schema_sha256": _schema_digest(), "runtime_config": dict(config)}
+
+
+def _cpu_config(config: Mapping[str, object]) -> dict[str, object]:
+    result = dict(config)
+    result["ecapa_device"] = "cpu"
+    return result
 
 
 def _overlap(left: Path, right: Path) -> bool:
@@ -198,24 +253,70 @@ def _validate_package(root: Path, selected: list[str] | None = None, *, cpu_only
         rows[record["id"]] = _validate_values(record["features"])
     ids = list(rows)
     coverage = manifest.get("coverage")
-    if not isinstance(coverage, Mapping) or not isinstance(coverage.get("selected"), Mapping) or coverage["selected"].get("ids") != ids or coverage["selected"].get("count") != len(ids) or manifest.get("records_sha256") != _sha256(text.encode("utf-8")) or manifest.get("per_id_record_sha256") != {sample_id: _sha256(line.encode("utf-8")) for sample_id, line in zip(ids, lines)}:
+    if not isinstance(coverage, Mapping) or set(coverage) != {"selected", "source"} or not isinstance(coverage.get("selected"), Mapping) or not isinstance(coverage.get("source"), Mapping) or set(coverage["selected"]) != {"count", "ids", "id_sha256"} or set(coverage["source"]) != {"count", "ids", "id_sha256"} or coverage["selected"].get("ids") != ids or coverage["selected"].get("count") != len(ids) or coverage["selected"].get("id_sha256") != _digest(ids) or not isinstance(coverage["source"].get("ids"), list) or coverage["source"].get("count") != len(coverage["source"]["ids"]) or coverage["source"].get("id_sha256") != _digest(coverage["source"]["ids"]) or manifest.get("records_sha256") != _sha256(text.encode("utf-8")) or manifest.get("per_id_record_sha256") != {sample_id: _sha256(line.encode("utf-8")) for sample_id, line in zip(ids, lines)}:
         raise ValueError("parity reference coverage or digest disagrees")
+    try:
+        if ids != sorted(ids, key=_id_key) or len(set(ids)) != len(ids) or any(_valid_id(sample_id) != sample_id for sample_id in ids) or coverage["source"]["ids"] != sorted(coverage["source"]["ids"], key=_id_key) or len(set(coverage["source"]["ids"])) != len(coverage["source"]["ids"]) or any(_valid_id(sample_id) != sample_id for sample_id in coverage["source"]["ids"]) or not set(ids) <= set(coverage["source"]["ids"]):
+            raise ValueError("coverage IDs are invalid")
+    except (TypeError, ValueError):
+        raise ValueError("parity reference coverage or digest disagrees") from None
     if selected is not None and ids != selected:
         raise ValueError("parity reference IDs disagree")
     source = manifest.get("source")
     model = manifest.get("model")
     environment = manifest.get("environment")
-    if not isinstance(source, Mapping) or set(source) != {"jsonl_sha256", "per_id_audio_sha256"} or not isinstance(source["jsonl_sha256"], Mapping) or not isinstance(source["per_id_audio_sha256"], Mapping) or set(source["per_id_audio_sha256"]) != set(ids) or not isinstance(model, Mapping) or set(model) != {"manifest_sha256", "aggregate_sha256", "raw_sha256", "upstream", "onnx", "required_dependency_versions"} or not isinstance(model["required_dependency_versions"], Mapping) or not model["required_dependency_versions"] or not isinstance(environment, Mapping) or set(environment) != {"python", "platform", "observed_dependencies"} or not isinstance(environment["observed_dependencies"], Mapping):
+    if not isinstance(source, Mapping) or set(source) != {"jsonl_sha256", "per_id_audio_sha256", "projection_sha256"} or not isinstance(source["jsonl_sha256"], Mapping) or set(source["jsonl_sha256"]) != {"pos", "neg"} or not isinstance(source["per_id_audio_sha256"], Mapping) or set(source["per_id_audio_sha256"]) != set(ids) or source["projection_sha256"] != _digest({"jsonl_sha256": source["jsonl_sha256"], "per_id_audio_sha256": source["per_id_audio_sha256"]}) or not isinstance(model, Mapping) or set(model) != {"manifest_sha256", "aggregate_sha256", "raw_sha256", "upstream", "onnx", "required_dependency_versions", "identity_sha256"} or not isinstance(model["required_dependency_versions"], Mapping) or not model["required_dependency_versions"] or model["identity_sha256"] != _digest({key: model[key] for key in model if key != "identity_sha256"}) or not isinstance(environment, Mapping) or set(environment) != {"python", "platform", "observed_dependencies"} or not isinstance(environment["observed_dependencies"], Mapping):
         raise ValueError("parity/output root provenance is incomplete")
+    try:
+        for value in source["jsonl_sha256"].values():
+            _sha256_value(value)
+        _sha256_value(model["manifest_sha256"])
+        _sha256_value(model["aggregate_sha256"])
+        if not isinstance(model["raw_sha256"], Mapping) or not model["raw_sha256"] or any(not isinstance(key, str) or not key for key in model["raw_sha256"]):
+            raise ValueError("model raw digest domain is invalid")
+        for value in model["raw_sha256"].values():
+            _sha256_value(value)
+        if model["aggregate_sha256"] != _aggregate_digest(model["raw_sha256"]):
+            raise ValueError("model aggregate digest disagrees")
+        if not isinstance(model["upstream"], Mapping) or not model["upstream"] or not isinstance(model["onnx"], Mapping) or not isinstance(model["required_dependency_versions"], Mapping) or any(not isinstance(key, str) or not key or not isinstance(value, str) or not value for key, value in model["required_dependency_versions"].items()):
+            raise ValueError("model identity domain is invalid")
+        _json_value(model["upstream"])
+        _json_value(model["onnx"])
+        if not isinstance(environment["python"], str) or not environment["python"] or not isinstance(environment["platform"], str) or not environment["platform"] or any(not isinstance(key, str) or not key or value is not None and not isinstance(value, str) for key, value in environment["observed_dependencies"].items()):
+            raise ValueError("environment domain is invalid")
+        config = _runtime_config(manifest.get("runtime_config"))
+    except (AttributeError, ValueError):
+        raise ValueError("parity/output root provenance is invalid") from None
+    if manifest.get("runtime_config_sha256") != _digest(config) or manifest.get("provider") != config["onnx_provider"] or manifest.get("device") != config["ecapa_device"]:
+        raise ValueError("parity/output root runtime config disagrees")
     for sample_id, audio in source["per_id_audio_sha256"].items():
         if not isinstance(audio, Mapping) or set(audio) != {"wake_sha256", "command_sha256"} or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value) for value in audio.values()):
             raise ValueError("parity/output root source audio provenance is invalid")
     algorithms = manifest.get("digest_algorithms")
-    if not isinstance(algorithms, Mapping) or {"feature_schema_sha256", "records_sha256", "per_id_record_sha256", "joined_state_sha256", "source_audio_sha256", "model_sha256"} - set(algorithms):
+    expected_algorithms = {"feature_schema_sha256": "sha256(UTF-8 ordered schema names joined and terminated by literal backslash-n bytes)", "records_sha256": "sha256(UTF-8 canonical JSONL bytes)", "per_id_record_sha256": "sha256(UTF-8 canonical JSON record bytes)", "joined_state_sha256": "sha256(UTF-8 canonical JSON)", "source_audio_sha256": "sha256(raw wake/command audio bytes)", "source_projection_sha256": "sha256(UTF-8 canonical JSON source projection)", "model_sha256": "sha256(UTF-8 canonical JSON verified model identity)"}
+    if algorithms != expected_algorithms:
         raise ValueError("parity/output root digest algorithms are incomplete")
+    if manifest.get("joined_state_sha256") != _digest({sample_id: _resume_expected(sample_id, source["per_id_audio_sha256"][sample_id], model, config) for sample_id in ids}):
+        raise ValueError("parity/output root joined state disagrees")
+    _validate_manifest_domains(manifest, ids)
     if (root / _REPORT).read_text(encoding="utf-8") != _report(manifest):
         raise ValueError("parity/output root report disagrees with manifest")
     return manifest, rows, text
+
+
+def _validate_manifest_domains(manifest: Mapping[str, object], ids: list[str]) -> None:
+    for value in (manifest["records_sha256"], manifest["joined_state_sha256"], manifest["runtime_config_sha256"]):
+        _sha256_value(value)
+    if not isinstance(manifest["per_id_record_sha256"], Mapping) or set(manifest["per_id_record_sha256"]) != set(ids):
+        raise ValueError("parity/output root record digest domain is invalid")
+    for value in manifest["per_id_record_sha256"].values():
+        _sha256_value(value)
+    reuse, parity, limit, timing = manifest["reuse"], manifest["parity"], manifest["limit"], manifest["timing"]
+    if not isinstance(reuse, Mapping) or set(reuse) != {"reused", "new"} or any(type(value) is not int or value < 0 for value in reuse.values()) or not isinstance(parity, Mapping) or set(parity) != {"status", "passed", "max_abs_feature_delta"} or parity["status"] not in {"not-run", "passed"} or parity["passed"] not in {None, True} or (parity["status"] == "passed") != (parity["passed"] is True) or not (parity["max_abs_feature_delta"] is None or type(parity["max_abs_feature_delta"]) in (int, float) and parity["max_abs_feature_delta"] >= 0) or not isinstance(limit, Mapping) or set(limit) != {"value", "canonical", "reason"} or type(limit["canonical"]) is not bool or (limit["value"] is None and (not limit["canonical"] or limit["reason"] is not None)) or (limit["value"] is not None and (limit["canonical"] or type(limit["value"]) is not int or limit["value"] <= 0 or limit["reason"] != "explicit noncanonical partial cache")) or not isinstance(timing, Mapping) or set(timing) != {"cold_elapsed_seconds", "warm_elapsed_seconds", "rtf", "peak_rss_delta_bytes", "cuda_peak_bytes"}:
+        raise ValueError("parity/output root manifest domain is invalid")
+    for percentile in timing.values():
+        if not isinstance(percentile, Mapping) or set(percentile) != {"count", "p50", "p95", "max"} or type(percentile["count"]) is not int or percentile["count"] < 0 or any(value is not None and (type(value) not in (int, float) or value < 0) for key, value in percentile.items() if key != "count"):
+            raise ValueError("parity/output root timing domain is invalid")
 
 
 def _preflight_output(path: Path) -> None:
@@ -249,39 +350,86 @@ def _resume_name(sample_id: str) -> str:
     return "record-" + _sha256(sample_id.encode("utf-8"))[:32] + ".json"
 
 
-def _context_name(model: Mapping[str, object], config_digest: str) -> str:
-    return _RESUME_PREFIX + _sha256(_canonical({"model": model, "runtime_config_sha256": config_digest, "feature_schema_sha256": _schema_digest()}).encode("utf-8"))
+def _context_name(model: Mapping[str, object], config: Mapping[str, object]) -> str:
+    return _RESUME_PREFIX + _digest(_context_identity(model, config))
 
 
-def _context_identity(model: Mapping[str, object], config_digest: str) -> dict[str, object]:
-    return {"feature_schema_sha256": _schema_digest(), "model": dict(model), "runtime_config_sha256": config_digest}
+def _context_identity(model: Mapping[str, object], config: Mapping[str, object]) -> dict[str, object]:
+    config = _runtime_config(config)
+    return {"feature_schema": list(PVAD_GATE_FEATURE_SCHEMA), "feature_schema_sha256": _schema_digest(), "model": dict(model), "runtime_config": config, "runtime_config_sha256": _digest(config)}
 
 
-def _validate_context(path: Path, model: Mapping[str, object] | None = None, config_digest: str | None = None) -> None:
+def _validate_context(path: Path, model: Mapping[str, object] | None = None, config: Mapping[str, object] | None = None) -> None:
     identity_path = path / _CONTEXT_IDENTITY
     if not identity_path.is_file() or identity_path.is_symlink():
         raise ValueError(f"resume namespace identity is missing or unsafe: {path}")
     identity_bytes = identity_path.read_bytes()
     identity = _load_object(identity_bytes.decode("utf-8"), "resume namespace identity")
-    if identity_bytes != (_canonical(identity) + "\n").encode("utf-8") or set(identity) != {"feature_schema_sha256", "model", "runtime_config_sha256"} or _RESUME_PREFIX + _sha256(_canonical(identity).encode("utf-8")) != path.name:
+    if identity_bytes != (_canonical(identity) + "\n").encode("utf-8") or set(identity) != {"feature_schema", "feature_schema_sha256", "model", "runtime_config", "runtime_config_sha256"} or identity != _context_identity(identity.get("model", {}), identity.get("runtime_config", {})) or _context_name(identity["model"], identity["runtime_config"]) != path.name:
         raise ValueError(f"resume namespace identity disagrees with its directory: {path}")
-    if model is not None and identity != _context_identity(model, config_digest or ""):
+    if model is not None and identity != _context_identity(model, config or {}):
         raise ValueError(f"resume namespace identity disagrees with current context: {path}")
     for child in path.iterdir():
         if child.name == _CONTEXT_IDENTITY:
             continue
         if re.fullmatch(r"\.record-[0-9a-f]{32}\.json\.[0-9a-f]{16}\.tmp", child.name):
+            _validate_context_record(child, identity, child.name.removeprefix(".").rsplit(".", 2)[0])
             continue
         if child.is_symlink() or not child.is_file() or not re.fullmatch(r"record-[0-9a-f]{32}\.json", child.name):
             raise ValueError(f"foreign resume namespace state is preserved: {child}")
-        record = _load_object(child.read_text(encoding="utf-8"), f"resume record {child}")
-        sample_id = record.get("id")
-        if not isinstance(sample_id, str) or child.name != _resume_name(sample_id) or record.get("model") != identity["model"] or record.get("runtime_config_sha256") != identity["runtime_config_sha256"] or record.get("feature_schema_sha256") != identity["feature_schema_sha256"] or record.get("feature_schema") != list(PVAD_GATE_FEATURE_SCHEMA):
-            raise ValueError(f"resume namespace contains a forged record: {child}")
+        _validate_context_record(child, identity, child.name)
 
 
-def _resume_expected(sample_id: str, input_state: Mapping[str, object], model: Mapping[str, object], config_digest: str) -> dict[str, object]:
-    return {"id": sample_id, "input": {"wake_sha256": input_state["wake_sha256"], "command_sha256": input_state["command_sha256"]}, "model": dict(model), "runtime_config_sha256": config_digest, "feature_schema": list(PVAD_GATE_FEATURE_SCHEMA), "feature_schema_sha256": _schema_digest()}
+def _create_namespace(root: Path, name: str, identity: Mapping[str, object]) -> Path:
+    """Atomically publish a complete resume context under the caller-held lock."""
+    namespace = root / name
+    if os.path.lexists(namespace):
+        if not _regular_directory(namespace):
+            raise ValueError("resume namespace must be a regular non-symlink directory")
+        _validate_context(namespace, identity["model"], identity["runtime_config"])
+        return namespace
+    staging = root / f".{name}.{secrets.token_hex(8)}.tmp"
+    created_staging = False
+    try:
+        staging.mkdir()
+        created_staging = True
+        with (staging / _CONTEXT_IDENTITY).open("x", encoding="utf-8", newline="\n") as handle:
+            handle.write(_canonical(identity) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.rename(staging, namespace)
+    except FileExistsError:
+        if not os.path.lexists(namespace) or not _regular_directory(namespace):
+            raise ValueError("resume namespace publication collided with unsafe state") from None
+        _validate_context(namespace, identity["model"], identity["runtime_config"])
+    finally:
+        # Staging is unique to this invocation and remains only after a failed rename.
+        if created_staging and _regular_directory(staging):
+            try:
+                (staging / _CONTEXT_IDENTITY).unlink()
+                staging.rmdir()
+            except OSError:
+                pass
+    _validate_context(namespace, identity["model"], identity["runtime_config"])
+    return namespace
+
+
+def _validate_context_record(path: Path, identity: Mapping[str, object], expected_name: str) -> None:
+    record_bytes = path.read_bytes()
+    record = _load_object(record_bytes.decode("utf-8"), f"resume record {path}")
+    sample_id = record.get("id")
+    required = {"id", "input", "model", "runtime_config", "runtime_config_sha256", "feature_schema", "feature_schema_sha256", "values", "audit"}
+    if record_bytes != (_ordered(record) + "\n").encode("utf-8") or set(record) != required or not isinstance(sample_id, str) or expected_name != _resume_name(sample_id) or record.get("model") != identity["model"] or record.get("runtime_config") != identity["runtime_config"] or record.get("runtime_config_sha256") != identity["runtime_config_sha256"] or record.get("feature_schema") != identity["feature_schema"] or record.get("feature_schema_sha256") != identity["feature_schema_sha256"] or not isinstance(record.get("input"), Mapping) or set(record["input"]) != {"wake_sha256", "command_sha256"} or not isinstance(record.get("values"), Mapping) or not isinstance(record.get("audit"), Mapping):
+        raise ValueError(f"resume namespace contains a forged record: {path}")
+    for value in record["input"].values():
+        _sha256_value(value)
+    _validate_values(record["values"])
+    _validate_audit(record["audit"], PvadRuntimeConfig(**identity["runtime_config"]))
+
+
+def _resume_expected(sample_id: str, input_state: Mapping[str, object], model: Mapping[str, object], config: Mapping[str, object]) -> dict[str, object]:
+    config = _runtime_config(config)
+    return {"id": sample_id, "input": {"wake_sha256": input_state["wake_sha256"], "command_sha256": input_state["command_sha256"]}, "model": dict(model), "runtime_config": config, "runtime_config_sha256": _digest(config), "feature_schema": list(PVAD_GATE_FEATURE_SCHEMA), "feature_schema_sha256": _schema_digest()}
 
 
 def _validate_values(values: Mapping[str, object]) -> OrderedDict[str, float | int]:
@@ -456,31 +604,34 @@ def build_pvad_cache(dataset_root: Path, model_paths: FireRedModelPaths, output_
         _validate_package(reference_root, selected, cpu_only=config.ecapa_device.startswith("cuda"))
     verified = verify_existing_model(model_paths)
     model = _model_identity(verified)
-    config_digest = _sha256(_canonical(asdict(config)).encode("utf-8"))
+    model = {**model, "identity_sha256": _digest(model)}
+    config_state = asdict(config)
+    config_digest = _digest(config_state)
     state: dict[str, dict[str, object]] = {}
     for sample_id in selected:
         wake = _safe_audio(dataset_root, raw[sample_id]["wakeup_audio"], "wake")
         command = _safe_audio(dataset_root, raw[sample_id]["command_audio"], "command")
         state[sample_id] = {"wake_sha256": _file_sha256(wake), "command_sha256": _file_sha256(command), "wake_path": wake, "command_path": command}
-    expected = {sample_id: _resume_expected(sample_id, state[sample_id], model, config_digest) for sample_id in selected}
+    expected = {sample_id: _resume_expected(sample_id, state[sample_id], model, config_state) for sample_id in selected}
+    per_id_audio = {sample_id: {"wake_sha256": state[sample_id]["wake_sha256"], "command_sha256": state[sample_id]["command_sha256"]} for sample_id in selected}
+    source = {"jsonl_sha256": source_digests, "per_id_audio_sha256": per_id_audio, "projection_sha256": _digest({"jsonl_sha256": source_digests, "per_id_audio_sha256": per_id_audio})}
+    coverage = {"selected": {"count": len(selected), "ids": selected, "id_sha256": _digest(selected)}, "source": {"count": len(raw), "ids": sorted(raw, key=_id_key), "id_sha256": _digest(sorted(raw, key=_id_key))}}
+    current_provenance = _provenance(model, source, coverage, config_state)
+    reference_manifest: dict[str, object] | None = None
+    if reference_root is not None:
+        reference_manifest, _, _ = _validate_package(reference_root, selected, cpu_only=config.ecapa_device.startswith("cuda"))
+        if config.ecapa_device.startswith("cuda") and _provenance(reference_manifest["model"], reference_manifest["source"], reference_manifest["coverage"], _cpu_config(reference_manifest["runtime_config"])) != _provenance(model, current_provenance["source"], current_provenance["coverage"], _cpu_config(config_state)):
+            raise ValueError("parity reference provenance disagrees with current CPU identity")
     lock, lock_identity = _lock(resume_root)
     try:
-        namespace_name = _context_name(model, config_digest)
+        namespace_name = _context_name(model, config_state)
         for child in resume_root.iterdir():
             if child.name == ".resume.lock":
                 continue
             if not child.name.startswith(_RESUME_PREFIX) or not re.fullmatch(r"context-[0-9a-f]{64}", child.name) or not _regular_directory(child):
                 raise ValueError(f"foreign resume namespace is preserved: {child}")
             _validate_context(child)
-        namespace = resume_root / namespace_name
-        try:
-            namespace.mkdir()
-            (namespace / _CONTEXT_IDENTITY).write_bytes((_canonical(_context_identity(model, config_digest)) + "\n").encode("utf-8"))
-        except FileExistsError:
-            pass
-        if not _regular_directory(namespace):
-            raise ValueError("resume namespace must be a regular non-symlink directory")
-        _validate_context(namespace, model, config_digest)
+        namespace = _create_namespace(resume_root, namespace_name, _context_identity(model, config_state))
         existing, audits = _resume_records(namespace, expected, config)
         cuda = _cuda_audit_adapter(config.ecapa_device) if config.ecapa_device.startswith("cuda") else None
         runtime = FireRedPvadRuntime(verified, config=config, cuda_peak_bytes=cuda.peak_bytes if cuda else None)
@@ -504,7 +655,9 @@ def build_pvad_cache(dataset_root: Path, model_paths: FireRedModelPaths, output_
             raise ValueError("incomplete resume coverage")
         parity = {"status": "not-run", "passed": None, "max_abs_feature_delta": None}
         if reference_root is not None:
-            _, reference, _ = _validate_package(reference_root, selected, cpu_only=config.ecapa_device.startswith("cuda"))
+            checked_manifest, reference, _ = _validate_package(reference_root, selected, cpu_only=config.ecapa_device.startswith("cuda"))
+            if config.ecapa_device.startswith("cuda") and (reference_manifest != checked_manifest or _provenance(checked_manifest["model"], checked_manifest["source"], checked_manifest["coverage"], _cpu_config(checked_manifest["runtime_config"])) != _provenance(model, current_provenance["source"], current_provenance["coverage"], _cpu_config(config_state))):
+                raise ValueError("parity reference provenance changed before publish")
             maximum = max((abs(float(reference[sample_id][name]) - float(features[sample_id][name])) for sample_id in selected for name in PVAD_GATE_FEATURE_SCHEMA), default=0.0)
             if maximum > 1e-4:
                 raise ValueError(f"parity failed: maximum feature delta {maximum}")
@@ -514,7 +667,8 @@ def build_pvad_cache(dataset_root: Path, model_paths: FireRedModelPaths, output_
         cold = [float(a["elapsed_seconds"]) for a in audits if a["extraction_phase"] == "cold"]
         warm = [float(a["elapsed_seconds"]) for a in audits if a["extraction_phase"] == "warm"]
         cuda_peaks = [float(a["cuda_peak_bytes"]) for a in audits if "cuda_peak_bytes" in a]
-        manifest: dict[str, Any] = {"artifact_kind": _ARTIFACT_KIND, "schema_version": _SCHEMA_VERSION, "feature_schema": list(PVAD_GATE_FEATURE_SCHEMA), "feature_schema_sha256": _schema_digest(), "digest_algorithms": {"feature_schema_sha256": "sha256(newline-joined ordered schema names with trailing newline)", "records_sha256": "sha256(UTF-8 canonical JSONL bytes)", "per_id_record_sha256": "sha256(UTF-8 canonical JSON record bytes)", "joined_state_sha256": "sha256(UTF-8 canonical JSON)", "source_audio_sha256": "sha256(raw wake/command audio bytes)", "model_sha256": "sha256(verified Task 2 model manifest/assets)"}, "coverage": {"selected": {"count": len(selected), "ids": selected, "id_sha256": _sha256(_canonical(selected).encode())}, "source": {"count": len(raw), "ids": sorted(raw, key=_id_key), "id_sha256": _sha256(_canonical(sorted(raw, key=_id_key)).encode())}}, "source": {"jsonl_sha256": source_digests, "per_id_audio_sha256": {sample_id: {"wake_sha256": state[sample_id]["wake_sha256"], "command_sha256": state[sample_id]["command_sha256"]} for sample_id in selected}}, "model": model, "runtime_config": asdict(config), "runtime_config_sha256": config_digest, "provider": config.onnx_provider, "device": config.ecapa_device, "environment": {"python": sys.version.split()[0], "platform": platform.platform(), "observed_dependencies": _observed_dependencies()}, "reuse": {"reused": len(existing), "new": new_count}, "timing": {"cold_elapsed_seconds": _percentiles(cold), "warm_elapsed_seconds": _percentiles(warm), "rtf": _percentiles([float(a["rtf"]) for a in audits]), "peak_rss_delta_bytes": _percentiles([float(a["peak_rss_delta_bytes"]) for a in audits]), "cuda_peak_bytes": _percentiles(cuda_peaks)}, "parity": parity, "limit": {"value": limit, "canonical": limit is None, "reason": None if limit is None else "explicit noncanonical partial cache"}, "records_sha256": _sha256(feature_text.encode()), "per_id_record_sha256": {sample_id: _sha256(line.encode()) for sample_id, line in zip(selected, lines)}, "joined_state_sha256": _sha256(_canonical({sample_id: expected[sample_id] for sample_id in selected}).encode())}
+        source = current_provenance["source"]
+        manifest: dict[str, Any] = {"artifact_kind": _ARTIFACT_KIND, "schema_version": _SCHEMA_VERSION, "feature_schema": list(PVAD_GATE_FEATURE_SCHEMA), "feature_schema_sha256": _schema_digest(), "digest_algorithms": {"feature_schema_sha256": "sha256(UTF-8 ordered schema names joined and terminated by literal backslash-n bytes)", "records_sha256": "sha256(UTF-8 canonical JSONL bytes)", "per_id_record_sha256": "sha256(UTF-8 canonical JSON record bytes)", "joined_state_sha256": "sha256(UTF-8 canonical JSON)", "source_audio_sha256": "sha256(raw wake/command audio bytes)", "source_projection_sha256": "sha256(UTF-8 canonical JSON source projection)", "model_sha256": "sha256(UTF-8 canonical JSON verified model identity)"}, "coverage": current_provenance["coverage"], "source": source, "model": model, "runtime_config": config_state, "runtime_config_sha256": config_digest, "provider": config.onnx_provider, "device": config.ecapa_device, "environment": {"python": sys.version.split()[0], "platform": platform.platform(), "observed_dependencies": _observed_dependencies()}, "reuse": {"reused": len(existing), "new": new_count}, "timing": {"cold_elapsed_seconds": _percentiles(cold), "warm_elapsed_seconds": _percentiles(warm), "rtf": _percentiles([float(a["rtf"]) for a in audits]), "peak_rss_delta_bytes": _percentiles([float(a["peak_rss_delta_bytes"]) for a in audits]), "cuda_peak_bytes": _percentiles(cuda_peaks)}, "parity": parity, "limit": {"value": limit, "canonical": limit is None, "reason": None if limit is None else "explicit noncanonical partial cache"}, "records_sha256": _sha256(feature_text.encode()), "per_id_record_sha256": {sample_id: _sha256(line.encode()) for sample_id, line in zip(selected, lines)}, "joined_state_sha256": _digest({sample_id: {**expected[sample_id], "model": model} for sample_id in selected})}
         if cuda:
             manifest["cuda"] = {**cuda.evidence(), "peak_bytes": _percentiles(cuda_peaks)}
         report = _report(manifest)
