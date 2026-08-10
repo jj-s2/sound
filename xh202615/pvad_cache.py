@@ -82,8 +82,10 @@ def _id_key(value: str) -> tuple[int, int | str, str]:
 
 
 def _valid_id(value: object) -> str:
+    if type(value) is int:
+        value = str(value)
     if not isinstance(value, str) or not value or value in {".", ".."} or "/" in value or "\\" in value or "\0" in value:
-        raise ValueError("Dataset-A id must be a nonempty traversal-safe string")
+        raise ValueError("Dataset-A id must be a nonempty traversal-safe string or integer")
     return value
 
 

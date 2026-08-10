@@ -144,6 +144,35 @@ def test_numeric_aware_order_limit_and_label_mutation_independence(tmp_path: Pat
     assert first["features"].read_bytes() == second["features"].read_bytes()
 
 
+def test_official_integer_ids_are_canonicalized_for_digests_order_and_coverage(tmp_path: Path) -> None:
+    integer_root = bundle(tmp_path / "integer", pos=[_row(1000, "w1000.wav", "c1000.wav"), _row(1, "w1.wav", "c1.wav")], neg=[_row(0, "w0.wav", "c0.wav")])
+    string_root = bundle(tmp_path / "string", pos=[_row("1000", "w1000.wav", "c1000.wav"), _row("1", "w1.wav", "c1.wav")], neg=[_row("0", "w0.wav", "c0.wav")])
+    model = fake_model(tmp_path)
+    integer = call(integer_root, model, tmp_path / "integer-run")
+    repeated_integer = call(integer_root, model, tmp_path / "repeated-integer-run")
+    string = call(string_root, model, tmp_path / "string-run")
+
+    integer_manifest = json.loads(integer["manifest"].read_text(encoding="utf-8"))
+    repeated_integer_manifest = json.loads(repeated_integer["manifest"].read_text(encoding="utf-8"))
+    string_manifest = json.loads(string["manifest"].read_text(encoding="utf-8"))
+    assert [row["id"] for row in records(integer["features"])] == ["0", "1", "1000"]
+    assert integer_manifest["source"] == repeated_integer_manifest["source"]
+    assert integer_manifest["coverage"] == repeated_integer_manifest["coverage"]
+    assert integer_manifest["coverage"] == string_manifest["coverage"]
+    assert integer_manifest["joined_state_sha256"] == string_manifest["joined_state_sha256"]
+
+
+@pytest.mark.parametrize("sample_id", [True, False, 1.0, -1.5, "", "../escape"])
+def test_ids_reject_noncanonical_types_and_unsafe_values(tmp_path: Path, sample_id: object) -> None:
+    with pytest.raises(ValueError, match="id"):
+        call(bundle(tmp_path, pos=[_row(sample_id, "wake.wav", "command.wav")], neg=[]), fake_model(tmp_path), tmp_path)
+
+
+def test_integer_and_string_ids_are_duplicate_after_canonicalization(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="duplicate"):
+        call(bundle(tmp_path, pos=[_row(1, "wake-int.wav", "command-int.wav")], neg=[_row("1", "wake-string.wav", "command-string.wav")]), fake_model(tmp_path), tmp_path)
+
+
 @pytest.mark.parametrize("limit", [0, -1, True, 1.5])
 def test_limit_must_be_positive_integer(tmp_path: Path, limit: object) -> None:
     with pytest.raises(ValueError, match="limit"):
