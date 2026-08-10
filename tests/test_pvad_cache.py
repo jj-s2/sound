@@ -672,3 +672,90 @@ def test_cpu_parity_package_is_recognized_and_staging_content_mutation_is_preser
     with pytest.raises(RuntimeError, match="cleanup"):
         pvad_cache._create_namespace(tmp_path / "resume", target, identity)
     assert (staging / "foreign").read_bytes() == b"preserve"
+
+
+@pytest.mark.parametrize("mutation", ["audio", "model", "config"])
+def test_cpu_parity_requires_current_provenance_before_runtime(tmp_path: Path, mutation: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from xh202615 import pvad_cache
+
+    root, model = bundle(tmp_path), fake_model(tmp_path)
+    reference = call(root, model, tmp_path / "reference")
+    if mutation == "audio":
+        (root / "command-10.wav").write_bytes(b"different command")
+    elif mutation == "model":
+        parsed = json.loads(model.manifest.read_text(encoding="utf-8"))
+        parsed["raw_sha256"]["NOTICE"] = "c" * 64
+        aggregate = hashlib.sha256()
+        for name in sorted(parsed["raw_sha256"]):
+            aggregate.update(name.encode("utf-8"))
+            aggregate.update(b"\0")
+            aggregate.update(bytes.fromhex(parsed["raw_sha256"][name]))
+        parsed["aggregate_sha256"] = aggregate.hexdigest()
+        model.manifest.write_text(_json(parsed), encoding="utf-8")
+    else:
+        original = pvad_cache._config
+        monkeypatch.setattr(pvad_cache, "_config", lambda device: type(original(device))(**{**pvad_cache.asdict(original(device)), "ema_alpha": 0.7}))
+    before = sum(len(instance.calls) for instance in FakeRuntime.instances)
+    with pytest.raises(ValueError, match="parity"):
+        call(root, model, tmp_path, parity_reference=reference["features"])
+    assert sum(len(instance.calls) for instance in FakeRuntime.instances) == before
+
+
+@pytest.mark.parametrize("field,value", [("dropped_tail_samples", 1.5), ("peak_rss_delta_bytes", 1.5), ("audio_seconds", 0.0), ("rtf", 0.1)])
+def test_reused_audit_numeric_domains_are_exact_and_preserved(tmp_path: Path, field: str, value: object) -> None:
+    root, model = bundle(tmp_path), fake_model(tmp_path)
+    call(root, model, tmp_path)
+    record_path = next(next((tmp_path / "resume").glob("context-*")).glob("record-*.json"))
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["audit"][field] = value
+    payload = json.dumps(record, separators=(",", ":")) + "\n"
+    record_path.write_text(payload, encoding="utf-8")
+    with pytest.raises(ValueError, match="resume"):
+        call(root, model, tmp_path)
+    assert record_path.read_text(encoding="utf-8") == payload
+
+
+def test_cuda_reused_memory_counter_must_be_integral_and_is_preserved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from xh202615 import pvad_cache
+
+    root, model = bundle(tmp_path), fake_model(tmp_path)
+    cpu = call(root, model, tmp_path / "cpu")
+    monkeypatch.setattr(pvad_cache, "_cuda_audit_adapter", lambda _device: FakeCudaAudit())
+    build_pvad_cache(root, model, tmp_path / "cuda" / "out", resume_root=tmp_path / "cuda" / "resume", ecapa_device="cuda", parity_reference=cpu["features"])
+    record_path = next(next((tmp_path / "cuda" / "resume").glob("context-*")).glob("record-*.json"))
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["audit"]["cuda_peak_bytes"] = 1.5
+    payload = json.dumps(record, separators=(",", ":")) + "\n"
+    record_path.write_text(payload, encoding="utf-8")
+    with pytest.raises(ValueError, match="resume"):
+        build_pvad_cache(root, model, tmp_path / "cuda" / "next", resume_root=tmp_path / "cuda" / "resume", ecapa_device="cuda", parity_reference=cpu["features"])
+    assert record_path.read_text(encoding="utf-8") == payload
+
+
+def test_nonregular_staging_replacement_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from xh202615 import pvad_cache
+
+    root, model = bundle(tmp_path), fake_model(tmp_path)
+    call(root, model, tmp_path)
+    resume = tmp_path / "resume"
+    identity = json.loads(next(resume.glob("context-*/context_identity.json")).read_text(encoding="utf-8"))
+    target = "context-" + "e" * 64
+    staging = resume / f".{target}.staging.owned"
+    moved = resume / ".moved-owned"
+    original = pvad_cache._rename_no_replace
+
+    def replace_then_publish(source: Path, destination: Path) -> None:
+        if source == staging:
+            os.rename(source, moved)
+            staging.write_bytes(b"foreign")
+            destination.mkdir()
+            (destination / "context_identity.json").write_bytes((pvad_cache._canonical(identity) + "\n").encode("utf-8"))
+            raise FileExistsError(destination)
+        original(source, destination)
+
+    monkeypatch.setattr(pvad_cache.secrets, "token_hex", lambda _size: "owned")
+    monkeypatch.setattr(pvad_cache, "_rename_no_replace", replace_then_publish)
+    with pytest.raises(RuntimeError, match="cleanup"):
+        pvad_cache._create_namespace(resume, target, identity)
+    assert staging.read_bytes() == b"foreign"
+    assert (moved / "context_identity.json").is_file()

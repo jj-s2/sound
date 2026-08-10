@@ -247,6 +247,15 @@ def _cpu_config(config: Mapping[str, object]) -> dict[str, object]:
     return result
 
 
+def _parity_provenance(manifest: Mapping[str, object], current: Mapping[str, object], *, cuda: bool) -> tuple[dict[str, object], dict[str, object]]:
+    reference_config = manifest["runtime_config"]
+    current_config = current["runtime_config"]
+    if cuda:
+        reference_config = _cpu_config(reference_config)
+        current_config = _cpu_config(current_config)
+    return _provenance(manifest["model"], manifest["source"], manifest["coverage"], reference_config), _provenance(current["model"], current["source"], current["coverage"], current_config)
+
+
 def _overlap(left: Path, right: Path) -> bool:
     left, right = left.resolve(strict=False), right.resolve(strict=False)
     return os.path.commonpath((str(left), str(right))) in {str(left), str(right)}
@@ -435,21 +444,25 @@ def _create_namespace(root: Path, name: str, identity: Mapping[str, object]) -> 
         return namespace
     staging, staging_identity = _create_unique_staging(root, f".{name}.staging")
     staging_bytes = (_canonical(identity) + "\n").encode("utf-8")
+    published = False
     try:
         with (staging / _CONTEXT_IDENTITY).open("x", encoding="utf-8", newline="\n") as handle:
             handle.write(staging_bytes.decode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
         _rename_no_replace(staging, namespace)
+        published = True
     except OSError:
         if not os.path.lexists(namespace) or not _regular_directory(namespace):
             raise ValueError("resume namespace publication collided with unsafe state") from None
         _validate_context(namespace, identity["model"], identity["runtime_config"])
     finally:
-        if _regular_directory(staging):
+        if published:
+            cleanup_error = "published staging path reappeared" if _lexists(staging) else None
+        else:
             cleanup_error = _cleanup_namespace_staging(staging, staging_identity, staging_bytes)
-            if cleanup_error is not None:
-                raise RuntimeError("resume namespace staging cleanup failed: " + cleanup_error)
+        if cleanup_error is not None:
+            raise RuntimeError("resume namespace staging cleanup failed: " + cleanup_error)
     _validate_context(namespace, identity["model"], identity["runtime_config"])
     return namespace
 
@@ -519,6 +532,10 @@ def _validate_audit(audit: Mapping[str, object], config: PvadRuntimeConfig) -> d
             if not isinstance(value, str):
                 raise ValueError(f"audit {key} must be a string")
             result[key] = value
+        elif key in {"dropped_tail_samples", "peak_rss_delta_bytes", "cuda_peak_bytes"}:
+            if type(value) is not int or value < 0:
+                raise ValueError(f"audit {key} must be a nonnegative integer")
+            result[key] = value
         else:
             numeric = _finite(value, f"audit {key}")
             if numeric < 0:
@@ -526,6 +543,8 @@ def _validate_audit(audit: Mapping[str, object], config: PvadRuntimeConfig) -> d
             result[key] = numeric
     if result["extraction_phase"] not in {"cold", "warm"} or result["onnx_provider"] != config.onnx_provider or result["ecapa_device"] != config.ecapa_device:
         raise ValueError("runtime audit provider/device/phase disagrees with runtime config")
+    if result["audio_seconds"] <= 0 or not math.isclose(float(result["rtf"]), float(result["elapsed_seconds"]) / float(result["audio_seconds"]), rel_tol=1e-9, abs_tol=1e-12):
+        raise ValueError("runtime audit duration and RTF disagree")
     return result
 
 
@@ -686,7 +705,8 @@ def build_pvad_cache(dataset_root: Path, model_paths: FireRedModelPaths, output_
     reference_manifest: dict[str, object] | None = None
     if reference_root is not None:
         reference_manifest, _, _ = _validate_package(reference_root, selected, cpu_only=config.ecapa_device.startswith("cuda"))
-        if config.ecapa_device.startswith("cuda") and _provenance(reference_manifest["model"], reference_manifest["source"], reference_manifest["coverage"], _cpu_config(reference_manifest["runtime_config"])) != _provenance(model, current_provenance["source"], current_provenance["coverage"], _cpu_config(config_state)):
+        reference_provenance, current_parity_provenance = _parity_provenance(reference_manifest, current_provenance, cuda=config.ecapa_device.startswith("cuda"))
+        if reference_provenance != current_parity_provenance:
             raise ValueError("parity reference provenance disagrees with current CPU identity")
     lock, lock_identity = _lock(resume_root)
     try:
@@ -722,7 +742,8 @@ def build_pvad_cache(dataset_root: Path, model_paths: FireRedModelPaths, output_
         parity = {"status": "not-run", "passed": None, "max_abs_feature_delta": None}
         if reference_root is not None:
             checked_manifest, reference, _ = _validate_package(reference_root, selected, cpu_only=config.ecapa_device.startswith("cuda"))
-            if config.ecapa_device.startswith("cuda") and (reference_manifest != checked_manifest or _provenance(checked_manifest["model"], checked_manifest["source"], checked_manifest["coverage"], _cpu_config(checked_manifest["runtime_config"])) != _provenance(model, current_provenance["source"], current_provenance["coverage"], _cpu_config(config_state))):
+            checked_provenance, current_parity_provenance = _parity_provenance(checked_manifest, current_provenance, cuda=config.ecapa_device.startswith("cuda"))
+            if reference_manifest != checked_manifest or checked_provenance != current_parity_provenance:
                 raise ValueError("parity reference provenance changed before publish")
             maximum = max((abs(float(reference[sample_id][name]) - float(features[sample_id][name])) for sample_id in selected for name in PVAD_GATE_FEATURE_SCHEMA), default=0.0)
             if maximum > 1e-4:
