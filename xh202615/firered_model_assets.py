@@ -84,19 +84,37 @@ _REQUIRED_DEPENDENCY_VERSIONS = {
     "tqdm": "4.65.2",
 }
 
+_BATCH_DIMENSION = "batch_size"
+_PROBABILITY_OUTPUT_DIMENSION = "Iflinear_out_dim_1"
+_ALLOWED_SYMBOLIC_DIMENSIONS = frozenset(
+    {_BATCH_DIMENSION, _PROBABILITY_OUTPUT_DIMENSION}
+)
+
 _EXPECTED_INPUTS = (
-    ("input_audio", "tensor(float)", (1, 160)),
-    ("spkemb", "tensor(float)", (1, 192)),
-    ("mel_buffer", "tensor(float)", (1, 80, 15)),
-    ("gru_buffer", "tensor(float)", (2, 1, 256)),
+    ("input_audio", "tensor(float)", (_BATCH_DIMENSION, 160)),
+    ("spkemb", "tensor(float)", (_BATCH_DIMENSION, 192)),
+    ("mel_buffer", "tensor(float)", (_BATCH_DIMENSION, 80, 15)),
+    ("gru_buffer", "tensor(float)", (2, _BATCH_DIMENSION, 256)),
 )
 _PROBABILITY_OUTPUT_INDEX = 1
 _MEL_STATE_OUTPUT_INDEX = 2
 _GRU_STATE_OUTPUT_INDEX = 3
 _EXPECTED_POSITIONAL_OUTPUTS = {
-    _PROBABILITY_OUTPUT_INDEX: ("probability output", "tensor(float)", (1, 1)),
-    _MEL_STATE_OUTPUT_INDEX: ("mel state output", "tensor(float)", (1, 80, 15)),
-    _GRU_STATE_OUTPUT_INDEX: ("GRU state output", "tensor(float)", (2, 1, 256)),
+    _PROBABILITY_OUTPUT_INDEX: (
+        "probability output",
+        "tensor(float)",
+        (_BATCH_DIMENSION, _PROBABILITY_OUTPUT_DIMENSION),
+    ),
+    _MEL_STATE_OUTPUT_INDEX: (
+        "mel state output",
+        "tensor(float)",
+        (_BATCH_DIMENSION, 80, 15),
+    ),
+    _GRU_STATE_OUTPUT_INDEX: (
+        "GRU state output",
+        "tensor(float)",
+        (2, _BATCH_DIMENSION, 256),
+    ),
 }
 
 
@@ -114,7 +132,7 @@ class FireRedModelPaths:
 class _MetadataRecord:
     name: str
     type: str
-    shape: tuple[int, ...]
+    shape: tuple[int | str, ...]
 
     def as_dict(self) -> dict[str, object]:
         return {"name": self.name, "type": self.type, "shape": list(self.shape)}
@@ -158,11 +176,18 @@ def _metadata_records(values: Iterable[object], *, kind: str) -> list[_MetadataR
             raise ValueError(
                 f"ONNX {kind} metadata {name!r} has no valid shape"
             )
-        dimensions: list[int] = []
+        dimensions: list[int | str] = []
         for dimension in shape:
-            if not isinstance(dimension, int) or isinstance(dimension, bool):
+            if isinstance(dimension, int) and not isinstance(dimension, bool):
+                dimensions.append(dimension)
+                continue
+            if (
+                not isinstance(dimension, str)
+                or dimension not in _ALLOWED_SYMBOLIC_DIMENSIONS
+            ):
                 raise ValueError(
-                    f"ONNX {kind} metadata {name!r} must have a concrete integer shape"
+                    f"ONNX {kind} metadata {name!r} has an undocumented symbolic "
+                    f"dimension {dimension!r}"
                 )
             dimensions.append(dimension)
         records.append(_MetadataRecord(name, type_name, tuple(dimensions)))

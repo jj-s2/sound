@@ -20,16 +20,16 @@ from xh202615.firered_model_assets import (
 
 
 INPUTS = (
-    ("input_audio", "tensor(float)", (1, 160)),
-    ("spkemb", "tensor(float)", (1, 192)),
-    ("mel_buffer", "tensor(float)", (1, 80, 15)),
-    ("gru_buffer", "tensor(float)", (2, 1, 256)),
+    ("input_audio", "tensor(float)", ("batch_size", 160)),
+    ("spkemb", "tensor(float)", ("batch_size", 192)),
+    ("mel_buffer", "tensor(float)", ("batch_size", 80, 15)),
+    ("gru_buffer", "tensor(float)", (2, "batch_size", 256)),
 )
 OUTPUTS = (
     ("output", "tensor(float)", (1, 1)),
-    ("prob", "tensor(float)", (1, 1)),
-    ("mel_buffer_out", "tensor(float)", (1, 80, 15)),
-    ("gru_buffer_out", "tensor(float)", (2, 1, 256)),
+    ("prob", "tensor(float)", ("batch_size", "Iflinear_out_dim_1")),
+    ("mel_buffer_out", "tensor(float)", ("batch_size", 80, 15)),
+    ("gru_buffer_out", "tensor(float)", (2, "batch_size", 256)),
 )
 RAW_FILES = {
     "NOTICE": b"Apache notice\n",
@@ -57,7 +57,7 @@ def load_download_script():
 
 
 class FakeMetadata:
-    def __init__(self, name: str, type_: str, shape: tuple[int, ...]) -> None:
+    def __init__(self, name: str, type_: str, shape: tuple[int | str, ...]) -> None:
         self.name = name
         self.type = type_
         self.shape = list(shape)
@@ -67,8 +67,8 @@ class FakeSession:
     def __init__(
         self,
         *,
-        inputs: tuple[tuple[str, str, tuple[int, ...]], ...] = INPUTS,
-        outputs: tuple[tuple[str, str, tuple[int, ...]], ...] = OUTPUTS,
+        inputs: tuple[tuple[str, str, tuple[int | str, ...]], ...] = INPUTS,
+        outputs: tuple[tuple[str, str, tuple[int | str, ...]], ...] = OUTPUTS,
     ) -> None:
         self._inputs = [FakeMetadata(*metadata) for metadata in inputs]
         self._outputs = [FakeMetadata(*metadata) for metadata in outputs]
@@ -242,12 +242,12 @@ def test_onnx_contract_records_official_inputs_and_observed_outputs() -> None:
         ((INPUTS[0], ("speaker", "tensor(float)", (1, 192)), *INPUTS[2:]), "input names"),
         ((INPUTS[0], ("spkemb", "tensor(float16)", (1, 192)), *INPUTS[2:]), "spkemb.*type"),
         ((INPUTS[0], ("spkemb", "tensor(float)", (192,)), *INPUTS[2:]), "spkemb.*shape"),
-        ((INPUTS[0], INPUTS[1], ("mel_buffer", "tensor(float)", (1, 80, 14)), INPUTS[3]), "mel_buffer.*shape"),
-        ((*INPUTS[:3], ("gru_buffer", "tensor(float)", (1, 2, 256))), "gru_buffer.*shape"),
+        ((INPUTS[0], INPUTS[1], ("mel_buffer", "tensor(float)", ("batch_size", 80, 14)), INPUTS[3]), "mel_buffer.*shape"),
+        ((*INPUTS[:3], ("gru_buffer", "tensor(float)", (2, 1, 256))), "gru_buffer.*shape"),
     ],
 )
 def test_onnx_contract_rejects_input_disagreement(
-    inputs: tuple[tuple[str, str, tuple[int, ...]], ...],
+    inputs: tuple[tuple[str, str, tuple[int | str, ...]], ...],
     match: str,
 ) -> None:
     with pytest.raises(ValueError, match=match):
@@ -269,13 +269,13 @@ def test_onnx_contract_accepts_input_metadata_in_any_listing_order() -> None:
     [
         (OUTPUTS[:3], "at least four outputs"),
         ((OUTPUTS[0], OUTPUTS[1], ("mel", "tensor(float16)", (1, 80, 15)), OUTPUTS[3]), "mel state output.*type"),
-        ((OUTPUTS[0], OUTPUTS[1], ("mel", "tensor(float)", (1, 80, 14)), OUTPUTS[3]), "mel state output.*shape"),
+        ((OUTPUTS[0], OUTPUTS[1], ("mel", "tensor(float)", ("batch_size", 80, 14)), OUTPUTS[3]), "mel state output.*shape"),
         ((OUTPUTS[0], OUTPUTS[1], OUTPUTS[2], ("gru", "tensor(float16)", (2, 1, 256))), "GRU state output.*type"),
-        ((OUTPUTS[0], OUTPUTS[1], OUTPUTS[2], ("gru", "tensor(float)", (1, 2, 256))), "GRU state output.*shape"),
+        ((OUTPUTS[0], OUTPUTS[1], OUTPUTS[2], ("gru", "tensor(float)", (2, 1, 256))), "GRU state output.*shape"),
     ],
 )
 def test_onnx_contract_rejects_output_disagreement(
-    outputs: tuple[tuple[str, str, tuple[int, ...]], ...],
+    outputs: tuple[tuple[str, str, tuple[int | str, ...]], ...],
     match: str,
 ) -> None:
     with pytest.raises(ValueError, match=match):
@@ -285,12 +285,12 @@ def test_onnx_contract_rejects_output_disagreement(
 @pytest.mark.parametrize(
     "probability,match",
     [
-        (("prob", "tensor(string)", (1, 1)), "probability output.*type"),
+        (("prob", "tensor(string)", ("batch_size", "Iflinear_out_dim_1")), "probability output.*type"),
         (("prob", "tensor(float)", (9,)), "probability output.*shape"),
     ],
 )
 def test_onnx_contract_rejects_invalid_probability_metadata(
-    probability: tuple[str, str, tuple[int, ...]], match: str
+    probability: tuple[str, str, tuple[int | str, ...]], match: str
 ) -> None:
     outputs = (OUTPUTS[0], probability, OUTPUTS[2], OUTPUTS[3])
 
@@ -298,10 +298,35 @@ def test_onnx_contract_rejects_invalid_probability_metadata(
         verify_onnx_contract(FakeSession(outputs=outputs))
 
 
+@pytest.mark.parametrize(
+    "inputs,outputs",
+    [
+        (
+            (("input_audio", "tensor(float)", ("unexpected_batch", 160)), *INPUTS[1:]),
+            OUTPUTS,
+        ),
+        (
+            INPUTS,
+            (
+                OUTPUTS[0],
+                ("prob", "tensor(float)", ("batch_size", "unexpected_output")),
+                *OUTPUTS[2:],
+            ),
+        ),
+    ],
+)
+def test_onnx_contract_rejects_undocumented_symbolic_dimensions(
+    inputs: tuple[tuple[str, str, tuple[int | str, ...]], ...],
+    outputs: tuple[tuple[str, str, tuple[int | str, ...]], ...],
+) -> None:
+    with pytest.raises(ValueError, match="undocumented symbolic dimension"):
+        verify_onnx_contract(FakeSession(inputs=inputs, outputs=outputs))
+
+
 def test_onnx_output_names_probability_metadata_and_extras_are_audit_only() -> None:
     outputs = (
         ("opaque_aux", "tensor(int64)", (9,)),
-        ("opaque_target", "tensor(float)", (1, 1)),
+        ("opaque_target", "tensor(float)", ("batch_size", "Iflinear_out_dim_1")),
         OUTPUTS[2],
         OUTPUTS[3],
         ("opaque_extra", "tensor(string)", (1,)),
