@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from xh202615.firered_model_assets import FireRedModelPaths
+from xh202615.firered_model_assets import _RAW_SNAPSHOT_FILES, _REQUIRED_DEPENDENCY_VERSIONS, _UPSTREAM_IDENTITY, FireRedModelPaths
 from xh202615.firered_pvad import PVAD_GATE_FEATURE_SCHEMA, PvadUtteranceFeatures
 from xh202615.pvad_cache import build_pvad_cache
 
@@ -47,9 +47,14 @@ def fake_model(tmp_path: Path) -> FireRedModelPaths:
     root = tmp_path / "model"
     root.mkdir(exist_ok=True)
     manifest = root / "model_manifest.json"
-    raw_sha256 = {"pvad.onnx": "b" * 64}
-    aggregate = hashlib.sha256(b"pvad.onnx\0" + bytes.fromhex(raw_sha256["pvad.onnx"])).hexdigest()
-    manifest.write_text(_json({"artifact_kind": "firered_model_assets", "schema_version": "v1", "aggregate_sha256": aggregate, "raw_sha256": raw_sha256, "upstream": {"repo_id": "fake", "revision": "r"}, "onnx": {"inputs": []}, "required_dependency_versions": {"torch": "fake"}}), encoding="utf-8")
+    raw_sha256 = {name: hashlib.sha256(name.encode("utf-8")).hexdigest() for name in _RAW_SNAPSHOT_FILES}
+    aggregate_hash = hashlib.sha256()
+    for name in sorted(raw_sha256):
+        aggregate_hash.update(name.encode("utf-8"))
+        aggregate_hash.update(b"\0")
+        aggregate_hash.update(bytes.fromhex(raw_sha256[name]))
+    onnx = {"sample_rate_hz": 16000, "frame_samples": 160, "probability_output_index": 1, "mel_state_output_index": 2, "gru_state_output_index": 3, "inputs": [{"name": name, "type": "tensor(float)", "shape": list(shape)} for name, shape in (("input_audio", (1, 160)), ("spkemb", (1, 192)), ("mel_buffer", (1, 80, 15)), ("gru_buffer", (2, 1, 256)))], "outputs": [{"name": name, "type": "tensor(float)", "shape": list(shape)} for name, shape in (("output", (1, 1)), ("prob", (1, 1)), ("mel_buffer_out", (1, 80, 15)), ("gru_buffer_out", (2, 1, 256)))]}
+    manifest.write_text(_json({"artifact_kind": "firered_model_assets", "schema_version": "v1", "aggregate_sha256": aggregate_hash.hexdigest(), "raw_sha256": raw_sha256, "upstream": _UPSTREAM_IDENTITY, "onnx": onnx, "required_dependency_versions": _REQUIRED_DEPENDENCY_VERSIONS}), encoding="utf-8")
     return FireRedModelPaths(root, root / "pvad.onnx", root / "ecapa", manifest)
 
 
@@ -254,8 +259,8 @@ class FakeCudaAudit:
     def peak_bytes(self) -> int:
         return 42
 
-    def evidence(self) -> dict[str, str]:
-        return {"cuda_device_name": "fake cuda", "cuda_driver_version": "fake-driver", "cuda_runtime_version": "fake-runtime"}
+    def evidence(self) -> dict[str, object]:
+        return {"cuda_device_name": "fake cuda", "cuda_driver": {"status": "available", "value": "fake-driver"}, "cuda_runtime_version": "fake-runtime"}
 
 
 def test_cpu_cuda_share_context_namespaced_resume_and_cuda_requires_cpu_parity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -326,8 +331,6 @@ def test_manifest_publishes_per_id_audio_model_dependencies_and_recomputed_schem
 
     root, model = bundle(tmp_path), fake_model(tmp_path)
     parsed = json.loads(model.manifest.read_text(encoding="utf-8"))
-    parsed["required_dependency_versions"] = {"onnxruntime-gpu": "1.28.0", "torchaudio": "2.4.1+cu121"}
-    model.manifest.write_text(_json(parsed), encoding="utf-8")
     files = call(root, model, tmp_path)
     manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
 
@@ -413,19 +416,21 @@ def test_frozen_schema_identity_uses_literal_backslash_n_and_fails_closed(monkey
 def test_atomic_namespace_creation_preserves_competing_or_malformed_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     from xh202615 import pvad_cache
 
-    model = {"identity_sha256": "a" * 64}
+    paths = fake_model(tmp_path)
+    model = pvad_cache._model_identity(paths)
+    model["identity_sha256"] = pvad_cache._digest(model)
     config = pvad_cache._runtime_config(pvad_cache.asdict(pvad_cache._config("cpu")))
     identity = pvad_cache._context_identity(model, config)
     root = tmp_path / "resume"
     root.mkdir()
     namespace = root / pvad_cache._context_name(model, config)
 
-    def competing_rename(_staging: str, destination: str) -> None:
+    def competing_rename(_staging: Path, destination: Path) -> None:
         Path(destination).mkdir()
         (Path(destination) / "context_identity.json").write_bytes((pvad_cache._canonical(identity) + "\n").encode("utf-8"))
         raise FileExistsError(destination)
 
-    monkeypatch.setattr(pvad_cache.os, "rename", competing_rename)
+    monkeypatch.setattr(pvad_cache, "_rename_no_replace", competing_rename)
     pvad_cache._create_namespace(root, namespace.name, identity)
     assert (namespace / "context_identity.json").read_bytes() == (pvad_cache._canonical(identity) + "\n").encode("utf-8")
     assert not list(root.glob(".context-*.tmp"))
@@ -534,3 +539,75 @@ def test_poisoned_sibling_record_and_matching_temp_fail_in_place(tmp_path: Path)
     with pytest.raises(ValueError, match="namespace|forged"):
         pvad_cache._validate_context(sibling)
     assert malformed.exists()
+
+
+@pytest.mark.parametrize("mutation", ["cuda-on-cpu", "cuda-without-parity", "reuse", "parity", "timing", "provider"])
+def test_package_cross_field_evidence_is_fail_closed(tmp_path: Path, mutation: str) -> None:
+    from xh202615 import pvad_cache
+
+    root, model = bundle(tmp_path), fake_model(tmp_path)
+    reference = call(root, model, tmp_path)
+    manifest_path = reference["manifest"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if mutation == "cuda-on-cpu":
+        manifest["cuda"] = {"evil": "accepted"}
+    elif mutation == "cuda-without-parity":
+        manifest["runtime_config"]["ecapa_device"] = "cuda"
+        manifest["runtime_config_sha256"] = pvad_cache._digest(manifest["runtime_config"])
+        manifest["device"] = "cuda"
+        manifest["joined_state_sha256"] = pvad_cache._digest({sample_id: pvad_cache._resume_expected(sample_id, manifest["source"]["per_id_audio_sha256"][sample_id], manifest["model"], manifest["runtime_config"]) for sample_id in manifest["coverage"]["selected"]["ids"]})
+    elif mutation == "reuse":
+        manifest["reuse"] = {"reused": 999, "new": 999}
+    elif mutation == "parity":
+        manifest["parity"] = {"status": "passed", "passed": True, "max_abs_feature_delta": 1.0}
+    elif mutation == "timing":
+        manifest["timing"]["rtf"] = {"count": 2, "p50": None, "p95": None, "max": None}
+    else:
+        manifest["runtime_config"]["onnx_provider"] = "CUDAExecutionProvider"
+        manifest["runtime_config_sha256"] = pvad_cache._digest(manifest["runtime_config"])
+        manifest["provider"] = "CUDAExecutionProvider"
+    _rewrite_manifest(manifest_path, manifest)
+
+    with pytest.raises(ValueError):
+        pvad_cache._validate_package(reference["features"].parent)
+
+
+def test_context_rejects_forged_model_and_swapped_staging_is_preserved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from xh202615 import pvad_cache
+
+    root, model = bundle(tmp_path), fake_model(tmp_path)
+    call(root, model, tmp_path)
+    resume = tmp_path / "resume"
+    namespace = next(path for path in resume.iterdir() if path.is_dir())
+    identity = json.loads((namespace / "context_identity.json").read_text(encoding="utf-8"))
+    identity["model"]["extra_label"] = "forged"
+    identity["model"]["identity_sha256"] = pvad_cache._digest({key: value for key, value in identity["model"].items() if key != "identity_sha256"})
+    forged = pvad_cache._context_identity(identity["model"], identity["runtime_config"])
+    sibling = resume / pvad_cache._context_name(forged["model"], forged["runtime_config"])
+    sibling.mkdir()
+    (sibling / "context_identity.json").write_bytes((pvad_cache._canonical(forged) + "\n").encode("utf-8"))
+    with pytest.raises(ValueError):
+        pvad_cache._validate_context(sibling)
+
+    clean_identity = json.loads((namespace / "context_identity.json").read_text(encoding="utf-8"))
+    name = pvad_cache._context_name(clean_identity["model"], clean_identity["runtime_config"])
+    target_name = name + "f"
+    staging = resume / f".{target_name}.staging.owned"
+    moved = resume / ".owned-moved"
+    foreign = b"competing evidence"
+    original_rename = pvad_cache._rename_no_replace
+
+    def swap_then_fail(source: Path, destination: Path) -> None:
+        if Path(source) == staging:
+            os.rename(source, moved)
+            staging.mkdir()
+            (staging / "evidence").write_bytes(foreign)
+            raise FileExistsError(destination)
+        original_rename(source, destination)
+
+    monkeypatch.setattr(pvad_cache.secrets, "token_hex", lambda _size: "owned")
+    monkeypatch.setattr(pvad_cache, "_rename_no_replace", swap_then_fail)
+    with pytest.raises((ValueError, RuntimeError)):
+        pvad_cache._create_namespace(resume, target_name, clean_identity)
+    assert (staging / "evidence").read_bytes() == foreign
+    assert (moved / "context_identity.json").is_file()

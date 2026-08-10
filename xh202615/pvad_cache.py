@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ctypes
 import hashlib
 import importlib.metadata
 import json
@@ -18,9 +17,9 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping
 
-from .artifact_publish import ArtifactContract, publish_text_package
+from .artifact_publish import ArtifactContract, _cleanup_owned_directory, _create_unique_staging, _rename_no_replace, publish_text_package
 from .data import FIELD_ALIASES, load_split
-from .firered_model_assets import FireRedModelPaths, download_and_verify_model
+from .firered_model_assets import _RAW_SNAPSHOT_FILES, _REQUIRED_DEPENDENCY_VERSIONS, _UPSTREAM_IDENTITY, FireRedModelPaths, download_and_verify_model
 from .firered_pvad import PVAD_GATE_FEATURE_SCHEMA, FireRedPvadRuntime, PvadRuntimeConfig
 
 _ARTIFACT_KIND = "r11_e2_firered_cache"
@@ -199,9 +198,41 @@ def _runtime_config(value: object) -> dict[str, object]:
     if not isinstance(value, Mapping) or set(value) != set(asdict(_config("cpu"))):
         raise ValueError("runtime config has an invalid exact key contract")
     try:
-        return asdict(PvadRuntimeConfig(**dict(value)))
+        config = asdict(PvadRuntimeConfig(**dict(value)))
     except (TypeError, ValueError) as exc:
         raise ValueError("runtime config has invalid values") from exc
+    if config["onnx_provider"] != "CPUExecutionProvider":
+        raise ValueError("runtime config must use the canonical CPU ONNX provider")
+    return config
+
+
+def _validate_model_identity(model: object) -> dict[str, object]:
+    if not isinstance(model, Mapping) or set(model) != {"manifest_sha256", "aggregate_sha256", "raw_sha256", "upstream", "onnx", "required_dependency_versions", "identity_sha256"}:
+        raise ValueError("model identity has an invalid exact key contract")
+    _sha256_value(model["manifest_sha256"])
+    _sha256_value(model["aggregate_sha256"])
+    raw = model["raw_sha256"]
+    onnx = model["onnx"]
+    if not isinstance(raw, Mapping) or set(raw) != _RAW_SNAPSHOT_FILES or any(not isinstance(key, str) or not key for key in raw):
+        raise ValueError("model raw digest domain is invalid")
+    for value in raw.values():
+        _sha256_value(value)
+    if model["aggregate_sha256"] != _aggregate_digest(raw) or model["upstream"] != _UPSTREAM_IDENTITY or model["required_dependency_versions"] != _REQUIRED_DEPENDENCY_VERSIONS:
+        raise ValueError("model identity disagrees with the pinned Task 2 contract")
+    if not isinstance(onnx, Mapping) or set(onnx) != {"sample_rate_hz", "frame_samples", "probability_output_index", "mel_state_output_index", "gru_state_output_index", "inputs", "outputs"} or {key: onnx[key] for key in ("sample_rate_hz", "frame_samples", "probability_output_index", "mel_state_output_index", "gru_state_output_index")} != {"sample_rate_hz": 16000, "frame_samples": 160, "probability_output_index": 1, "mel_state_output_index": 2, "gru_state_output_index": 3}:
+        raise ValueError("model ONNX contract is invalid")
+    inputs = [{"name": name, "type": "tensor(float)", "shape": list(shape)} for name, shape in (("input_audio", (1, 160)), ("spkemb", (1, 192)), ("mel_buffer", (1, 80, 15)), ("gru_buffer", (2, 1, 256)))]
+    if onnx["inputs"] != inputs or not isinstance(onnx["outputs"], list) or len(onnx["outputs"]) < 4:
+        raise ValueError("model ONNX contract is invalid")
+    for output in onnx["outputs"]:
+        if not isinstance(output, Mapping) or set(output) != {"name", "type", "shape"} or not isinstance(output["name"], str) or not output["name"] or not isinstance(output["type"], str) or not output["type"] or not isinstance(output["shape"], list) or any(type(item) is not int for item in output["shape"]):
+            raise ValueError("model ONNX output domain is invalid")
+    if [(onnx["outputs"][index]["type"], onnx["outputs"][index]["shape"]) for index in (1, 2, 3)] != [("tensor(float)", [1, 1]), ("tensor(float)", [1, 80, 15]), ("tensor(float)", [2, 1, 256])]:
+        raise ValueError("model ONNX output contract is invalid")
+    result = dict(model)
+    if result["identity_sha256"] != _digest({key: result[key] for key in result if key != "identity_sha256"}):
+        raise ValueError("model identity digest disagrees")
+    return result
 
 
 def _provenance(model: Mapping[str, object], source: Mapping[str, object], coverage: Mapping[str, object], config: Mapping[str, object]) -> dict[str, object]:
@@ -272,16 +303,7 @@ def _validate_package(root: Path, selected: list[str] | None = None, *, cpu_only
             _sha256_value(value)
         _sha256_value(model["manifest_sha256"])
         _sha256_value(model["aggregate_sha256"])
-        if not isinstance(model["raw_sha256"], Mapping) or not model["raw_sha256"] or any(not isinstance(key, str) or not key for key in model["raw_sha256"]):
-            raise ValueError("model raw digest domain is invalid")
-        for value in model["raw_sha256"].values():
-            _sha256_value(value)
-        if model["aggregate_sha256"] != _aggregate_digest(model["raw_sha256"]):
-            raise ValueError("model aggregate digest disagrees")
-        if not isinstance(model["upstream"], Mapping) or not model["upstream"] or not isinstance(model["onnx"], Mapping) or not isinstance(model["required_dependency_versions"], Mapping) or any(not isinstance(key, str) or not key or not isinstance(value, str) or not value for key, value in model["required_dependency_versions"].items()):
-            raise ValueError("model identity domain is invalid")
-        _json_value(model["upstream"])
-        _json_value(model["onnx"])
+        model = _validate_model_identity(model)
         if not isinstance(environment["python"], str) or not environment["python"] or not isinstance(environment["platform"], str) or not environment["platform"] or any(not isinstance(key, str) or not key or value is not None and not isinstance(value, str) for key, value in environment["observed_dependencies"].items()):
             raise ValueError("environment domain is invalid")
         config = _runtime_config(manifest.get("runtime_config"))
@@ -312,11 +334,25 @@ def _validate_manifest_domains(manifest: Mapping[str, object], ids: list[str]) -
     for value in manifest["per_id_record_sha256"].values():
         _sha256_value(value)
     reuse, parity, limit, timing = manifest["reuse"], manifest["parity"], manifest["limit"], manifest["timing"]
-    if not isinstance(reuse, Mapping) or set(reuse) != {"reused", "new"} or any(type(value) is not int or value < 0 for value in reuse.values()) or not isinstance(parity, Mapping) or set(parity) != {"status", "passed", "max_abs_feature_delta"} or parity["status"] not in {"not-run", "passed"} or parity["passed"] not in {None, True} or (parity["status"] == "passed") != (parity["passed"] is True) or not (parity["max_abs_feature_delta"] is None or type(parity["max_abs_feature_delta"]) in (int, float) and parity["max_abs_feature_delta"] >= 0) or not isinstance(limit, Mapping) or set(limit) != {"value", "canonical", "reason"} or type(limit["canonical"]) is not bool or (limit["value"] is None and (not limit["canonical"] or limit["reason"] is not None)) or (limit["value"] is not None and (limit["canonical"] or type(limit["value"]) is not int or limit["value"] <= 0 or limit["reason"] != "explicit noncanonical partial cache")) or not isinstance(timing, Mapping) or set(timing) != {"cold_elapsed_seconds", "warm_elapsed_seconds", "rtf", "peak_rss_delta_bytes", "cuda_peak_bytes"}:
+    config = _runtime_config(manifest["runtime_config"])
+    cuda = config["ecapa_device"].startswith("cuda")
+    expected_parity = {"status": "passed", "passed": True} if cuda else {"status": "not-run", "passed": None}
+    if not isinstance(reuse, Mapping) or set(reuse) != {"reused", "new"} or any(type(value) is not int or value < 0 for value in reuse.values()) or sum(reuse.values()) != len(ids) or not isinstance(parity, Mapping) or set(parity) != {"status", "passed", "max_abs_feature_delta"} or {key: parity[key] for key in ("status", "passed")} != expected_parity or (cuda and type(parity["max_abs_feature_delta"]) not in (int, float)) or (not cuda and parity["max_abs_feature_delta"] is not None) or not isinstance(limit, Mapping) or set(limit) != {"value", "canonical", "reason"} or type(limit["canonical"]) is not bool or (limit["value"] is None and (not limit["canonical"] or limit["reason"] is not None)) or (limit["value"] is not None and (limit["canonical"] or type(limit["value"]) is not int or limit["value"] <= 0 or limit["reason"] != "explicit noncanonical partial cache")) or not isinstance(timing, Mapping) or set(timing) != {"cold_elapsed_seconds", "warm_elapsed_seconds", "rtf", "peak_rss_delta_bytes", "cuda_peak_bytes"}:
         raise ValueError("parity/output root manifest domain is invalid")
-    for percentile in timing.values():
-        if not isinstance(percentile, Mapping) or set(percentile) != {"count", "p50", "p95", "max"} or type(percentile["count"]) is not int or percentile["count"] < 0 or any(value is not None and (type(value) not in (int, float) or value < 0) for key, value in percentile.items() if key != "count"):
+    if cuda and (not math.isfinite(parity["max_abs_feature_delta"]) or parity["max_abs_feature_delta"] < 0 or parity["max_abs_feature_delta"] > 1e-4):
+        raise ValueError("parity/output root CUDA parity domain is invalid")
+    for name, percentile in timing.items():
+        expected_count = len(ids) if name in {"rtf", "peak_rss_delta_bytes"} or (name == "cuda_peak_bytes" and cuda) else None
+        if not isinstance(percentile, Mapping) or set(percentile) != {"count", "p50", "p95", "max"} or type(percentile["count"]) is not int or percentile["count"] < 0 or (expected_count is not None and percentile["count"] != expected_count) or (name == "cuda_peak_bytes" and not cuda and percentile["count"] != 0) or (percentile["count"] == 0 and any(percentile[key] is not None for key in ("p50", "p95", "max"))) or (percentile["count"] > 0 and any(type(percentile[key]) not in (int, float) or not math.isfinite(percentile[key]) or percentile[key] < 0 for key in ("p50", "p95", "max"))) or (percentile["count"] > 0 and not percentile["p50"] <= percentile["p95"] <= percentile["max"]):
             raise ValueError("parity/output root timing domain is invalid")
+    if timing["cold_elapsed_seconds"]["count"] + timing["warm_elapsed_seconds"]["count"] != len(ids):
+        raise ValueError("parity/output root timing coverage disagrees")
+    if ("cuda" in manifest) != cuda:
+        raise ValueError("parity/output root CUDA evidence is invalid")
+    if cuda:
+        evidence = manifest["cuda"]
+        if not isinstance(evidence, Mapping) or set(evidence) != {"cuda_device_name", "cuda_driver", "cuda_runtime_version", "peak_bytes"} or not isinstance(evidence["cuda_device_name"], str) or not evidence["cuda_device_name"] or not isinstance(evidence["cuda_runtime_version"], str) or not evidence["cuda_runtime_version"] or not isinstance(evidence["cuda_driver"], Mapping) or set(evidence["cuda_driver"]) != {"status", "value"} or evidence["cuda_driver"].get("status") not in {"available", "unavailable"} or (evidence["cuda_driver"]["status"] == "available" and not isinstance(evidence["cuda_driver"]["value"], str)) or (evidence["cuda_driver"]["status"] == "unavailable" and evidence["cuda_driver"]["value"] is not None) or evidence["peak_bytes"] != timing["cuda_peak_bytes"]:
+            raise ValueError("parity/output root CUDA evidence is invalid")
 
 
 def _preflight_output(path: Path) -> None:
@@ -365,6 +401,10 @@ def _validate_context(path: Path, model: Mapping[str, object] | None = None, con
         raise ValueError(f"resume namespace identity is missing or unsafe: {path}")
     identity_bytes = identity_path.read_bytes()
     identity = _load_object(identity_bytes.decode("utf-8"), "resume namespace identity")
+    try:
+        _validate_model_identity(identity.get("model"))
+    except ValueError:
+        raise ValueError(f"resume namespace identity disagrees with its directory: {path}") from None
     if identity_bytes != (_canonical(identity) + "\n").encode("utf-8") or set(identity) != {"feature_schema", "feature_schema_sha256", "model", "runtime_config", "runtime_config_sha256"} or identity != _context_identity(identity.get("model", {}), identity.get("runtime_config", {})) or _context_name(identity["model"], identity["runtime_config"]) != path.name:
         raise ValueError(f"resume namespace identity disagrees with its directory: {path}")
     if model is not None and identity != _context_identity(model, config or {}):
@@ -388,28 +428,22 @@ def _create_namespace(root: Path, name: str, identity: Mapping[str, object]) -> 
             raise ValueError("resume namespace must be a regular non-symlink directory")
         _validate_context(namespace, identity["model"], identity["runtime_config"])
         return namespace
-    staging = root / f".{name}.{secrets.token_hex(8)}.tmp"
-    created_staging = False
+    staging, staging_identity = _create_unique_staging(root, f".{name}.staging")
     try:
-        staging.mkdir()
-        created_staging = True
         with (staging / _CONTEXT_IDENTITY).open("x", encoding="utf-8", newline="\n") as handle:
             handle.write(_canonical(identity) + "\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.rename(staging, namespace)
-    except FileExistsError:
+        _rename_no_replace(staging, namespace)
+    except OSError:
         if not os.path.lexists(namespace) or not _regular_directory(namespace):
             raise ValueError("resume namespace publication collided with unsafe state") from None
         _validate_context(namespace, identity["model"], identity["runtime_config"])
     finally:
-        # Staging is unique to this invocation and remains only after a failed rename.
-        if created_staging and _regular_directory(staging):
-            try:
-                (staging / _CONTEXT_IDENTITY).unlink()
-                staging.rmdir()
-            except OSError:
-                pass
+        if _regular_directory(staging):
+            cleanup_error = _cleanup_owned_directory(staging, staging_identity)
+            if cleanup_error is not None:
+                raise RuntimeError("resume namespace staging cleanup failed: " + cleanup_error)
     _validate_context(namespace, identity["model"], identity["runtime_config"])
     return namespace
 
@@ -492,7 +526,7 @@ def _resume_records(root: Path, expected: Mapping[str, Mapping[str, object]], co
                 if sample_id in result:
                     continue
             else:
-                os.rename(path, destination)
+                _rename_no_replace(path, destination)
             if sample_id in result:
                 raise ValueError(f"duplicate interrupted resume temp is preserved: {path}")
             _, values, audit = _validate_resume_record(destination, expected, config)
@@ -522,12 +556,7 @@ def _write_resume(root: Path, record: Mapping[str, object]) -> None:
         os.fsync(handle.fileno())
     if temporary.is_symlink() or os.path.lexists(destination):
         raise ValueError("resume write encountered a symlink")
-    if os.name == "nt":
-        if not ctypes.windll.kernel32.MoveFileW(str(temporary), str(destination)):
-            raise OSError(ctypes.get_last_error(), "could not publish resume record")
-    else:
-        os.link(temporary, destination)
-        temporary.unlink()
+    _rename_no_replace(temporary, destination)
 
 
 def _percentiles(values: list[float]) -> dict[str, float | int | None]:
