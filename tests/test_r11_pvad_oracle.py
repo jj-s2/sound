@@ -26,6 +26,12 @@ def _digest(value: object) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _refresh_record_digests(cache: list[dict], manifest: dict) -> None:
+    lines = [json.dumps(record, ensure_ascii=False, separators=(",", ":")) for record in cache]
+    manifest["records_sha256"] = hashlib.sha256(("\n".join(lines) + "\n").encode()).hexdigest()
+    manifest["per_id_record_sha256"] = {record["id"]: hashlib.sha256(line.encode()).hexdigest() for record, line in zip(cache, lines)}
+
+
 def _fixture() -> tuple[list[CandidateRow], dict[str, str | None], dict[str, str], list[dict], dict]:
     rows: list[CandidateRow] = []
     labels: dict[str, str | None] = {}
@@ -62,13 +68,22 @@ def _fixture() -> tuple[list[CandidateRow], dict[str, str | None], dict[str, str
                 features[f"ema_transitions_ge_{threshold}"] = 0
             cache.append({"id": sid, "features": features})
     ids = [row.id for row in rows]
+    lines = [json.dumps(record, ensure_ascii=False, separators=(",", ":")) for record in cache]
     manifest = {
+        "artifact_kind": "r11_e2_firered_cache",
+        "schema_version": "v1",
         "feature_schema": list(PVAD_GATE_FEATURE_SCHEMA),
         "feature_schema_sha256": hashlib.sha256((r"\n".join(PVAD_GATE_FEATURE_SCHEMA) + r"\n").encode("utf-8")).hexdigest(),
+        "digest_algorithms": {},
         "coverage": {"selected": {"ids": ids, "count": len(ids), "id_sha256": _digest(ids)}},
         "joined_state_sha256": "a" * 64,
+        "records_sha256": hashlib.sha256(("\n".join(lines) + "\n").encode()).hexdigest(),
+        "per_id_record_sha256": {record["id"]: hashlib.sha256(line.encode()).hexdigest() for record, line in zip(cache, lines)},
         "source": {"projection_sha256": "b" * 64},
         "model": {"identity_sha256": "c" * 64},
+        "runtime_config": {}, "runtime_config_sha256": "d" * 64,
+        "provider": "CPUExecutionProvider", "device": "cpu", "environment": {},
+        "reuse": {}, "timing": {}, "parity": {}, "limit": {},
     }
     return rows, labels, groups, cache, manifest
 
@@ -114,7 +129,9 @@ def test_held_out_pvad_values_do_not_change_training_fold_metadata() -> None:
     changed = copy.deepcopy(cache)
     first_test_id = baseline["families"]["firered_crossfit"]["folds"][0]["test_ids"][0]
     next(item for item in changed if item["id"] == first_test_id)["features"]["raw_std"] = 0.123
-    perturbed = run_pvad_oracle(rows, labels, groups, changed, manifest)
+    changed_manifest = copy.deepcopy(manifest)
+    _refresh_record_digests(changed, changed_manifest)
+    perturbed = run_pvad_oracle(rows, labels, groups, changed, changed_manifest)
     assert baseline["families"]["firered_crossfit"]["folds"][0]["training_state"] == perturbed["families"]["firered_crossfit"]["folds"][0]["training_state"]
 
 
@@ -159,13 +176,13 @@ def test_fused_representation_is_exact_frozen_e0_schema_and_score_banks_are_comp
     rows, labels, groups, cache, manifest = _fixture()
     result = run_pvad_oracle(rows, labels, groups, cache, manifest)
     fused = result["families"]["firered_fused_crossfit"]
-    assert fused["feature_allowlist"] == [*PVAD_FITTING_FEATURE_SCHEMA, *GATE_FEATURE_SCHEMA]
+    assert fused["feature_allowlist"] == [*PVAD_FITTING_FEATURE_SCHEMA, *E0_FITTING_FEATURE_SCHEMA]
     for family in result["families"].values():
         assert family["coverage"]["ids"] == [row.id for row in rows]
         assert len(family["score_bank"]) == len(family["model_specs"])
         for scores in family["score_bank"].values():
             assert len(scores) == len(rows)
-        assert family["outer_frontiers"]
+        assert family["outer_threshold_grid"]
 
 
 def test_reject_all_is_markerized_everywhere_and_is_json_safe() -> None:
@@ -205,3 +222,43 @@ def test_malformed_learned_probabilities_fail_closed(prediction: np.ndarray) -> 
     with patch("xh202615.r11_pvad_oracle._fit_gate_pipeline", return_value=BadPipeline()):
         with pytest.raises(ValueError, match="probabilities"):
             run_pvad_oracle(rows, labels, groups, cache, manifest)
+
+
+def test_round2_distinct_r10_source_digests_and_legitimate_runtime_metadata_pass() -> None:
+    rows, labels, groups, cache, manifest = _fixture()
+    for index, row in enumerate(rows):
+        rows[index] = CandidateRow(**{**row.__dict__, "source_digest": hashlib.sha256(row.id.encode()).hexdigest()})
+    manifest["runtime_config"] = {"frame_samples": 160, "sample_rate": 16000}
+    manifest["model"]["onnx"] = {"frame_samples": 160, "spkemb_shape": [1, 192]}
+    manifest["model"]["identity_sha256"] = _digest({"onnx": manifest["model"]["onnx"]})
+    assert len(join_pvad_e0_rows(rows, labels, groups, cache, manifest)) == len(rows)
+
+
+@pytest.mark.parametrize("mutation", ["inactive_run", "run_gt_span", "too_many_transitions"])
+def test_round2_temporal_invariants_fail_closed(mutation: str) -> None:
+    rows, labels, groups, cache, manifest = _fixture()
+    feature = cache[0]["features"]
+    if mutation == "inactive_run":
+        feature["ema_first_crossing_ge_0_3_frame"] = -1
+        feature["ema_last_crossing_ge_0_3_frame"] = -1
+        feature["ema_active_span_ge_0_3_frames"] = 0
+    elif mutation == "run_gt_span":
+        feature["ema_active_span_ge_0_3_frames"] = 0
+    else:
+        feature["ema_transitions_ge_0_3"] = feature["frame_count"]
+    with pytest.raises(ValueError):
+        join_pvad_e0_rows(rows, labels, groups, cache, manifest)
+
+
+def test_round2_float32_embedding_and_audit_exclusion_and_scalar_frontier_evidence() -> None:
+    rows, labels, groups, cache, manifest = _fixture()
+    cache[0]["features"]["embedding_norm_after"] = 1.0 + 5e-9
+    _refresh_record_digests(cache, manifest)
+    result = run_pvad_oracle(rows, labels, groups, cache, manifest)
+    fused = result["families"]["firered_fused_crossfit"]
+    assert "latency_ms" not in fused["feature_allowlist"]
+    scalar = result["families"]["firered_scalar"]
+    for fold in scalar["folds"]:
+        assert fold["inner_frontier"]
+        selected = [point for point in fold["inner_frontier"] if point["model"] == fold["selected_model"] and point["threshold"] == fold["selected_threshold"]]
+        assert selected

@@ -34,12 +34,21 @@ from .r11_gate_oracle import (
 
 SEED = 20260807
 RR_FLOOR = 0.93
-E0_FITTING_FEATURE_SCHEMA = GATE_FEATURE_SCHEMA
+# E2 reuses E0's builder, but excludes extraction timing from its fitting block.
+E0_FITTING_FEATURE_SCHEMA = tuple(name for name in GATE_FEATURE_SCHEMA if name not in {"latency_ms", "latency_ms_missing"})
 PVAD_FITTING_FEATURE_SCHEMA = PVAD_GATE_FEATURE_SCHEMA
 _SCALAR_FEATURES = ("raw_mean", "ema_mean", "ema_fraction_ge_0_5")
 _REJECT_ALL = "reject_all"
 _HEX = re.compile(r"[0-9a-f]{64}\Z")
 _TOL = 1e-9
+_EMBEDDING_NORM_TOL = 1e-6
+_TASK4_MANIFEST_KEYS = {
+    "artifact_kind", "schema_version", "feature_schema", "feature_schema_sha256",
+    "digest_algorithms", "coverage", "source", "model", "runtime_config",
+    "runtime_config_sha256", "provider", "device", "environment", "reuse",
+    "timing", "parity", "limit", "records_sha256", "per_id_record_sha256",
+    "joined_state_sha256",
+}
 
 
 def canonical_json(value: object) -> str:
@@ -49,6 +58,10 @@ def canonical_json(value: object) -> str:
 
 def _digest(value: object) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _ordered_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=False, separators=(",", ":"), allow_nan=False)
 
 
 def _sha(value: object, label: str) -> str:
@@ -62,7 +75,7 @@ def _reject_private(value: object) -> None:
         for key, item in value.items():
             if not isinstance(key, str):
                 raise ValueError("manifest key must be a string")
-            if any(token in key.lower() for token in ("label", "reference", "candidate", "cer", "action", "text", "embedding", "frame")):
+            if key.lower() in {"label", "reference", "reference_text", "candidate_texts", "candidate_cer", "optimal_action", "recognition_text", "raw_embeddings", "frame_arrays"}:
                 raise ValueError("manifest contains forbidden private field")
             _reject_private(item)
     elif isinstance(value, list):
@@ -99,7 +112,7 @@ def _validate_features(value: object) -> dict[str, float]:
     tail = _counter(value["dropped_tail_samples"], "dropped_tail_samples")
     if tail >= 160 or not math.isclose(result["analyzed_duration_sec"], frames / 100.0, rel_tol=_TOL, abs_tol=_TOL) or not math.isclose(result["command_duration_sec"], (frames * 160 + tail) / 16000.0, rel_tol=_TOL, abs_tol=_TOL):
         raise ValueError("pVAD frame/duration/tail invariant disagrees")
-    if not 0 < result["enrollment_duration_sec"] <= 5.0 or result["embedding_norm_before"] <= 0 or not math.isclose(result["embedding_norm_after"], 1.0, rel_tol=_TOL, abs_tol=_TOL):
+    if not 0 < result["enrollment_duration_sec"] <= 5.0 or result["embedding_norm_before"] <= 0 or not math.isclose(result["embedding_norm_after"], 1.0, rel_tol=_EMBEDDING_NORM_TOL, abs_tol=_EMBEDDING_NORM_TOL):
         raise ValueError("pVAD enrollment/embedding invariant disagrees")
     for prefix in ("raw", "ema"):
         ordered = [result[f"{prefix}_{name}"] for name in ("min", "q10", "q25", "q50", "q75", "q90", "q95", "max")]
@@ -122,7 +135,7 @@ def _validate_features(value: object) -> dict[str, float]:
         last = _counter(value[f"ema_last_crossing_ge_{threshold}_frame"], "last", minimum=-1)
         span = _counter(value[f"ema_active_span_ge_{threshold}_frames"], "span")
         transitions = _counter(value[f"ema_transitions_ge_{threshold}"], "transitions")
-        if not math.isclose(result[f"ema_longest_run_ge_{threshold}_seconds"], run / 100.0, rel_tol=_TOL, abs_tol=_TOL) or (first == -1) != (last == -1) or (first == -1 and span != 0) or (first != -1 and (not 1 <= first <= last <= frames or span != last - first + 1)) or transitions > frames:
+        if not math.isclose(result[f"ema_longest_run_ge_{threshold}_seconds"], run / 100.0, rel_tol=_TOL, abs_tol=_TOL) or run > span or transitions > frames - 1 or (first == -1) != (last == -1) or (first == -1 and (span != 0 or run != 0)) or (first != -1 and (not 1 <= first <= last <= frames or span != last - first + 1 or run == 0)):
             raise ValueError("pVAD run/crossing invariant disagrees")
     return result
 
@@ -162,6 +175,8 @@ def join_pvad_e0_rows(
         raise ValueError("pVAD cache ID coverage has missing or extra IDs")
     if not isinstance(cache_manifest, Mapping):
         raise ValueError("pVAD cache manifest is required")
+    if not _TASK4_MANIFEST_KEYS <= set(cache_manifest) or cache_manifest.get("artifact_kind") != "r11_e2_firered_cache" or cache_manifest.get("schema_version") != "v1":
+        raise ValueError("pVAD cache manifest is not the Task 4 identity contract")
     _reject_private(cache_manifest)
     if cache_manifest.get("feature_schema") != list(PVAD_GATE_FEATURE_SCHEMA):
         raise ValueError("pVAD cache feature schema disagrees")
@@ -169,6 +184,11 @@ def join_pvad_e0_rows(
     schema_digest = cache_manifest.get("feature_schema_sha256")
     if schema_digest != expected_schema_digest:
         raise ValueError("pVAD cache feature schema digest disagrees")
+    record_lines = [_ordered_json({"id": record["id"], "features": record["features"]}) for record in cache_records]
+    record_text = "\n".join(record_lines) + "\n"
+    per_id = {record["id"]: hashlib.sha256(line.encode("utf-8")).hexdigest() for record, line in zip(cache_records, record_lines)}
+    if _sha(cache_manifest.get("records_sha256"), "pVAD records digest") != hashlib.sha256(record_text.encode("utf-8")).hexdigest() or cache_manifest.get("per_id_record_sha256") != per_id:
+        raise ValueError("pVAD record digests disagree")
     coverage = cache_manifest.get("coverage")
     if not isinstance(coverage, Mapping) or not isinstance(coverage.get("selected"), Mapping):
         raise ValueError("pVAD cache manifest coverage is invalid")
@@ -192,8 +212,8 @@ def join_pvad_e0_rows(
         group = groups[row.id]
         if not isinstance(group, str) or not group:
             raise ValueError("wake_component group must be a nonempty string")
-        if _sha(row.source_digest, "canonical row source digest") != source_digest:
-            raise ValueError("canonical row source identity disagrees with cache")
+        # R10 candidate-text identity and pVAD audio/source identity are separate domains.
+        _sha(row.source_digest, "canonical row source digest")
         e0 = dict(zip(E0_FITTING_FEATURE_SCHEMA, build_gate_feature_matrix([row])[0].tolist()))
         joined.append(JoinedPvadRow(row.id, group, int(labels[row.id] is not None), cache[row.id], e0, row.source_digest))
     return joined
@@ -289,7 +309,7 @@ def _scalar_family(joined: Sequence[JoinedPvadRow], original: Mapping[str, Candi
     score_bank = {feature: np.full(len(joined), np.nan) for feature in _SCALAR_FEATURES}
     for fold_index, (train, test) in enumerate(folds):
         scores = {feature: np.asarray([joined[i].pvad[feature] for i in train], dtype=np.float64) for feature in _SCALAR_FEATURES}
-        selected, threshold, _frontier = _inner_select(
+        selected, threshold, frontier = _inner_select(
             scores, [original[joined[i].id] for i in train], labels
         )
         point = select_frontier_point(gate_oracle_frontier(scores[selected], build_oracle_contributions([original[joined[i].id] for i in train], labels)), RR_FLOOR)
@@ -302,7 +322,7 @@ def _scalar_family(joined: Sequence[JoinedPvadRow], original: Mapping[str, Candi
             records[index] = {"id": joined[index].id, "group": joined[index].group, "fold": fold_index, "model": selected, "score": score, "threshold": _safe_threshold(threshold), "action": "accept" if score >= threshold else "reject"}
             for feature in _SCALAR_FEATURES:
                 score_bank[feature][index] = joined[index].pvad[feature]
-        metadata.append({"fold": fold_index, "train_ids": [joined[i].id for i in train], "test_ids": [joined[i].id for i in test], "train_groups": sorted(set(groups[train])), "test_groups": sorted(set(groups[test])), "group_disjoint": True, "selected_model": selected, "selected_threshold": _safe_threshold(threshold), "inner_search_feasible": True, "training_state": _train_state(np.asarray([scores[selected]]).T, np.asarray([joined[i].target_present for i in train]))})
+        metadata.append({"fold": fold_index, "train_ids": [joined[i].id for i in train], "test_ids": [joined[i].id for i in test], "train_groups": sorted(set(groups[train])), "test_groups": sorted(set(groups[test])), "group_disjoint": True, "selected_model": selected, "selected_threshold": _safe_threshold(threshold), "inner_search_feasible": True, "inner_frontier": frontier, "training_state": _train_state(np.asarray([scores[selected]]).T, np.asarray([joined[i].target_present for i in train]))})
     scalar_specs = tuple(GateModelSpec(feature, "scalar", ()) for feature in _SCALAR_FEATURES)
     return _family_result("firered_scalar", _SCALAR_FEATURES, records, metadata, scalar_specs, score_bank)
 
@@ -314,7 +334,7 @@ def _family_result(name: str, features: Sequence[str], records: Sequence[dict[st
     bank = {key: values.tolist() for key, values in (score_bank or {}).items()}
     if any(not np.isfinite(values).all() or np.any((values < 0) | (values > 1)) for values in (score_bank or {}).values()):
         raise ValueError("outer score bank is incomplete or invalid")
-    return {"name": name, "feature_allowlist": list(features), "model_specs": [{"name": spec.name, "family": spec.family, "parameters": dict(spec.parameters)} for spec in specs], "rows": public, "folds": list(folds), "score_bank": bank, "outer_frontiers": [{"model": key, "thresholds": sorted(set(values), reverse=True)} for key, values in bank.items()], "coverage": {"ids": [item["id"] for item in public], "ids_sha256": _digest([item["id"] for item in public]), "n_rows_total": len(public), "n_rows_covered": len({item["id"] for item in public}), "once_only": len(public) == len({item["id"] for item in public})}}
+    return {"name": name, "feature_allowlist": list(features), "model_specs": [{"name": spec.name, "family": spec.family, "parameters": dict(spec.parameters)} for spec in specs], "rows": public, "folds": list(folds), "score_bank": bank, "outer_threshold_grid": [{"model": key, "thresholds": [_REJECT_ALL, *sorted(set(values), reverse=True)]} for key, values in bank.items()], "coverage": {"ids": [item["id"] for item in public], "ids_sha256": _digest([item["id"] for item in public]), "n_rows_total": len(public), "n_rows_covered": len({item["id"] for item in public}), "once_only": len(public) == len({item["id"] for item in public})}}
 
 
 def run_pvad_oracle(rows: Sequence[CandidateRow], labels: Mapping[str, str | None], groups: Mapping[str, str], cache_records: Sequence[Mapping[str, object]], cache_manifest: Mapping[str, object]) -> dict[str, object]:
