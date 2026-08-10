@@ -47,7 +47,7 @@ def fake_model(tmp_path: Path) -> FireRedModelPaths:
     root = tmp_path / "model"
     root.mkdir(exist_ok=True)
     manifest = root / "model_manifest.json"
-    manifest.write_text(_json({"artifact_kind": "firered_model_assets", "schema_version": "v1", "aggregate_sha256": "a" * 64, "raw_sha256": {}, "upstream": {"repo_id": "fake", "revision": "r"}, "onnx": {}}), encoding="utf-8")
+    manifest.write_text(_json({"artifact_kind": "firered_model_assets", "schema_version": "v1", "aggregate_sha256": "a" * 64, "raw_sha256": {"pvad.onnx": "b" * 64}, "upstream": {"repo_id": "fake", "revision": "r"}, "onnx": {"inputs": []}, "required_dependency_versions": {"torch": "fake"}}), encoding="utf-8")
     return FireRedModelPaths(root, root / "pvad.onnx", root / "ecapa", manifest)
 
 
@@ -308,7 +308,7 @@ def test_owned_interrupted_temp_is_quarantined_but_foreign_temp_fails(tmp_path: 
     root, model = bundle(tmp_path), fake_model(tmp_path)
     call(root, model, tmp_path)
     namespace = next(path for path in (tmp_path / "resume").iterdir() if path.is_dir())
-    record = next(namespace.glob("*.json"))
+    record = next(path for path in namespace.glob("record-*.json"))
     owned = namespace / f".{record.name}.{'a' * 16}.tmp"
     owned.write_bytes(record.read_bytes())
     call(root, model, tmp_path)
@@ -317,3 +317,74 @@ def test_owned_interrupted_temp_is_quarantined_but_foreign_temp_fails(tmp_path: 
     foreign.write_text("foreign", encoding="utf-8")
     with pytest.raises(ValueError, match="foreign resume"):
         call(root, model, tmp_path)
+
+
+def test_manifest_publishes_per_id_audio_model_dependencies_and_recomputed_schema(tmp_path: Path) -> None:
+    from xh202615 import pvad_cache
+
+    root, model = bundle(tmp_path), fake_model(tmp_path)
+    parsed = json.loads(model.manifest.read_text(encoding="utf-8"))
+    parsed["required_dependency_versions"] = {"onnxruntime-gpu": "1.28.0", "torchaudio": "2.4.1+cu121"}
+    model.manifest.write_text(_json(parsed), encoding="utf-8")
+    files = call(root, model, tmp_path)
+    manifest = json.loads(files["manifest"].read_text(encoding="utf-8"))
+
+    assert manifest["source"]["per_id_audio_sha256"] == {
+        "10": {"wake_sha256": hashlib.sha256(b"generated-audio").hexdigest(), "command_sha256": hashlib.sha256(b"generated-audio").hexdigest()},
+        "alpha": {"wake_sha256": hashlib.sha256(b"generated-audio").hexdigest(), "command_sha256": hashlib.sha256(b"generated-audio").hexdigest()},
+    }
+    assert manifest["model"]["required_dependency_versions"] == parsed["required_dependency_versions"]
+    assert {"onnxruntime-gpu", "torchaudio", "hyperpyyaml", "PyYAML"} <= set(manifest["environment"]["observed_dependencies"])
+    assert pvad_cache._schema_digest() == hashlib.sha256("\n".join(PVAD_GATE_FEATURE_SCHEMA).encode()).hexdigest()
+
+
+def test_incomplete_or_digest_forged_package_is_not_a_parity_reference(tmp_path: Path) -> None:
+    root, model = bundle(tmp_path), fake_model(tmp_path)
+    reference = call(root, model, tmp_path / "reference")
+    manifest_path = reference["manifest"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for key in ("model", "source", "runtime_config", "runtime_config_sha256", "environment", "timing", "parity"):
+        del manifest[key]
+    manifest_path.write_text(_json(manifest) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="recognizable"):
+        call(root, model, tmp_path, parity_reference=reference["features"])
+
+    reference = call(root, model, tmp_path / "different-reference")
+    manifest_path = reference["manifest"]
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["records_sha256"] = "0" * 64
+    manifest_path.write_text(_json(manifest) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="digest"):
+        call(root, model, tmp_path / "different-output", parity_reference=reference["features"])
+
+
+def test_unverified_matching_temp_is_preserved_and_verified_duplicate_is_promoted(tmp_path: Path) -> None:
+    root, model = bundle(tmp_path), fake_model(tmp_path)
+    call(root, model, tmp_path)
+    namespace = next(path for path in (tmp_path / "resume").iterdir() if path.is_dir())
+    record = next(path for path in namespace.glob("record-*.json"))
+    foreign = namespace / f".{record.name}.{'b' * 16}.tmp"
+    foreign.write_bytes(b"foreign user bytes")
+    with pytest.raises(ValueError, match="temp"):
+        call(root, model, tmp_path)
+    assert foreign.read_bytes() == b"foreign user bytes"
+
+    foreign.unlink()
+    promoted = namespace / f".{record.name}.{'c' * 16}.tmp"
+    record_bytes = record.read_bytes()
+    record.unlink()
+    promoted.write_bytes(record_bytes)
+    call(root, model, tmp_path)
+    assert record.read_bytes() == record_bytes
+    assert not promoted.exists()
+
+
+def test_resume_context_identity_rejects_empty_and_forged_siblings(tmp_path: Path) -> None:
+    root, model = bundle(tmp_path), fake_model(tmp_path)
+    resume = tmp_path / "resume"
+    resume.mkdir()
+    sibling = resume / ("context-" + "a" * 64)
+    sibling.mkdir()
+    with pytest.raises(ValueError, match="namespace"):
+        call(root, model, tmp_path)
+    assert sibling.is_dir() and not list(sibling.iterdir())

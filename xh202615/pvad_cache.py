@@ -27,8 +27,9 @@ _ARTIFACT_KIND = "r11_e2_firered_cache"
 _SCHEMA_VERSION = "v1"
 _FEATURES, _MANIFEST, _REPORT = "pvad_features.jsonl", "pvad_manifest.json", "pvad_report.md"
 _CONTRACT = ArtifactContract(_ARTIFACT_KIND, _SCHEMA_VERSION, (_FEATURES, _MANIFEST, _REPORT), (_MANIFEST,))
-_SCHEMA_SHA256 = "610c7e711fda490405a66a01e5ca6e7b01bf230c00333d891ebbaf20140e270f"
+_SCHEMA_SHA256 = "5ca5d2c0f2bbbec0c5c1251518ca3fa8aac4c04144211de7cb6448bd7087830a"
 _RESUME_PREFIX = "context-"
+_CONTEXT_IDENTITY = "context_identity.json"
 _AUDIT_COMMON = {"elapsed_seconds", "audio_seconds", "rtf", "peak_rss_delta_bytes", "dropped_tail_samples", "extraction_phase", "onnx_provider", "ecapa_device"}
 
 
@@ -131,8 +132,10 @@ def _safe_audio(root: Path, relative: str, label: str) -> Path:
 
 
 def _schema_digest() -> str:
-    # This is the frozen Task 3 identity, defined as SHA-256 of ordered names joined by newlines.
-    return _SCHEMA_SHA256
+    digest = _sha256("\n".join(PVAD_GATE_FEATURE_SCHEMA).encode("utf-8"))
+    if digest != _SCHEMA_SHA256:
+        raise ValueError("fixed feature schema digest disagrees with the frozen Task 3 constant")
+    return digest
 
 
 def _config(device: str) -> PvadRuntimeConfig:
@@ -147,7 +150,13 @@ def verify_existing_model(paths: FireRedModelPaths) -> FireRedModelPaths:
 
 def _model_identity(paths: FireRedModelPaths) -> dict[str, object]:
     parsed = _load_object(paths.manifest.read_text(encoding="utf-8"), "model manifest")
-    return {"manifest_sha256": _file_sha256(paths.manifest), "aggregate_sha256": parsed.get("aggregate_sha256"), "raw_sha256": parsed.get("raw_sha256"), "upstream": parsed.get("upstream"), "onnx": parsed.get("onnx"), "required_dependencies": parsed.get("required_dependencies", parsed.get("dependencies", {}))}
+    required = {"aggregate_sha256", "raw_sha256", "upstream", "onnx", "required_dependency_versions"}
+    if not required <= set(parsed) or any(parsed[key] in ({}, None, "") for key in required):
+        raise ValueError("verified model manifest is missing required identity fields")
+    dependencies = parsed["required_dependency_versions"]
+    if not isinstance(dependencies, Mapping) or not dependencies or any(not isinstance(key, str) or not key or not isinstance(value, str) or not value for key, value in dependencies.items()):
+        raise ValueError("verified model manifest has invalid required_dependency_versions")
+    return {"manifest_sha256": _file_sha256(paths.manifest), "aggregate_sha256": parsed["aggregate_sha256"], "raw_sha256": parsed["raw_sha256"], "upstream": parsed["upstream"], "onnx": parsed["onnx"], "required_dependency_versions": dict(dependencies)}
 
 
 def _overlap(left: Path, right: Path) -> bool:
@@ -169,8 +178,11 @@ def _validate_package(root: Path, selected: list[str] | None = None, *, cpu_only
     children = list(root.iterdir())
     if {child.name for child in children} != {_FEATURES, _MANIFEST, _REPORT} or any(child.is_symlink() or not child.is_file() for child in children):
         raise ValueError("parity/output root is not a recognizable cache package")
-    manifest = _load_object((root / _MANIFEST).read_text(encoding="utf-8"), "cache manifest")
-    if manifest.get("artifact_kind") != _ARTIFACT_KIND or manifest.get("schema_version") != _SCHEMA_VERSION or manifest.get("feature_schema") != list(PVAD_GATE_FEATURE_SCHEMA) or manifest.get("feature_schema_sha256") != _schema_digest():
+    manifest_bytes = (root / _MANIFEST).read_bytes()
+    manifest = _load_object(manifest_bytes.decode("utf-8"), "cache manifest")
+    required = {"artifact_kind", "schema_version", "feature_schema", "feature_schema_sha256", "digest_algorithms", "coverage", "source", "model", "runtime_config", "runtime_config_sha256", "provider", "device", "environment", "reuse", "timing", "parity", "limit", "records_sha256", "per_id_record_sha256", "joined_state_sha256"}
+    allowed = required | {"cuda"}
+    if set(manifest) not in (required, allowed) or manifest_bytes.replace(b"\r\n", b"\n") != (_canonical(manifest) + "\n").encode("utf-8") or manifest.get("artifact_kind") != _ARTIFACT_KIND or manifest.get("schema_version") != _SCHEMA_VERSION or manifest.get("feature_schema") != list(PVAD_GATE_FEATURE_SCHEMA) or manifest.get("feature_schema_sha256") != _schema_digest():
         raise ValueError("parity/output root is not a recognizable cache package")
     if cpu_only and (manifest.get("provider") != "CPUExecutionProvider" or manifest.get("device") != "cpu"):
         raise ValueError("parity reference must be a CPU cache package")
@@ -190,6 +202,19 @@ def _validate_package(root: Path, selected: list[str] | None = None, *, cpu_only
         raise ValueError("parity reference coverage or digest disagrees")
     if selected is not None and ids != selected:
         raise ValueError("parity reference IDs disagree")
+    source = manifest.get("source")
+    model = manifest.get("model")
+    environment = manifest.get("environment")
+    if not isinstance(source, Mapping) or set(source) != {"jsonl_sha256", "per_id_audio_sha256"} or not isinstance(source["jsonl_sha256"], Mapping) or not isinstance(source["per_id_audio_sha256"], Mapping) or set(source["per_id_audio_sha256"]) != set(ids) or not isinstance(model, Mapping) or set(model) != {"manifest_sha256", "aggregate_sha256", "raw_sha256", "upstream", "onnx", "required_dependency_versions"} or not isinstance(model["required_dependency_versions"], Mapping) or not model["required_dependency_versions"] or not isinstance(environment, Mapping) or set(environment) != {"python", "platform", "observed_dependencies"} or not isinstance(environment["observed_dependencies"], Mapping):
+        raise ValueError("parity/output root provenance is incomplete")
+    for sample_id, audio in source["per_id_audio_sha256"].items():
+        if not isinstance(audio, Mapping) or set(audio) != {"wake_sha256", "command_sha256"} or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value) for value in audio.values()):
+            raise ValueError("parity/output root source audio provenance is invalid")
+    algorithms = manifest.get("digest_algorithms")
+    if not isinstance(algorithms, Mapping) or {"feature_schema_sha256", "records_sha256", "per_id_record_sha256", "joined_state_sha256", "source_audio_sha256", "model_sha256"} - set(algorithms):
+        raise ValueError("parity/output root digest algorithms are incomplete")
+    if (root / _REPORT).read_text(encoding="utf-8") != _report(manifest):
+        raise ValueError("parity/output root report disagrees with manifest")
     return manifest, rows, text
 
 
@@ -228,6 +253,33 @@ def _context_name(model: Mapping[str, object], config_digest: str) -> str:
     return _RESUME_PREFIX + _sha256(_canonical({"model": model, "runtime_config_sha256": config_digest, "feature_schema_sha256": _schema_digest()}).encode("utf-8"))
 
 
+def _context_identity(model: Mapping[str, object], config_digest: str) -> dict[str, object]:
+    return {"feature_schema_sha256": _schema_digest(), "model": dict(model), "runtime_config_sha256": config_digest}
+
+
+def _validate_context(path: Path, model: Mapping[str, object] | None = None, config_digest: str | None = None) -> None:
+    identity_path = path / _CONTEXT_IDENTITY
+    if not identity_path.is_file() or identity_path.is_symlink():
+        raise ValueError(f"resume namespace identity is missing or unsafe: {path}")
+    identity_bytes = identity_path.read_bytes()
+    identity = _load_object(identity_bytes.decode("utf-8"), "resume namespace identity")
+    if identity_bytes != (_canonical(identity) + "\n").encode("utf-8") or set(identity) != {"feature_schema_sha256", "model", "runtime_config_sha256"} or _RESUME_PREFIX + _sha256(_canonical(identity).encode("utf-8")) != path.name:
+        raise ValueError(f"resume namespace identity disagrees with its directory: {path}")
+    if model is not None and identity != _context_identity(model, config_digest or ""):
+        raise ValueError(f"resume namespace identity disagrees with current context: {path}")
+    for child in path.iterdir():
+        if child.name == _CONTEXT_IDENTITY:
+            continue
+        if re.fullmatch(r"\.record-[0-9a-f]{32}\.json\.[0-9a-f]{16}\.tmp", child.name):
+            continue
+        if child.is_symlink() or not child.is_file() or not re.fullmatch(r"record-[0-9a-f]{32}\.json", child.name):
+            raise ValueError(f"foreign resume namespace state is preserved: {child}")
+        record = _load_object(child.read_text(encoding="utf-8"), f"resume record {child}")
+        sample_id = record.get("id")
+        if not isinstance(sample_id, str) or child.name != _resume_name(sample_id) or record.get("model") != identity["model"] or record.get("runtime_config_sha256") != identity["runtime_config_sha256"] or record.get("feature_schema_sha256") != identity["feature_schema_sha256"] or record.get("feature_schema") != list(PVAD_GATE_FEATURE_SCHEMA):
+            raise ValueError(f"resume namespace contains a forged record: {child}")
+
+
 def _resume_expected(sample_id: str, input_state: Mapping[str, object], model: Mapping[str, object], config_digest: str) -> dict[str, object]:
     return {"id": sample_id, "input": {"wake_sha256": input_state["wake_sha256"], "command_sha256": input_state["command_sha256"]}, "model": dict(model), "runtime_config_sha256": config_digest, "feature_schema": list(PVAD_GATE_FEATURE_SCHEMA), "feature_schema_sha256": _schema_digest()}
 
@@ -258,11 +310,15 @@ def _validate_audit(audit: Mapping[str, object], config: PvadRuntimeConfig) -> d
     return result
 
 
-def _quarantine_temp(path: Path) -> None:
-    quarantine = path.with_name(path.name + ".quarantined")
-    if os.path.lexists(quarantine):
-        raise ValueError(f"owned interrupted resume temp cannot be safely quarantined: {path}")
-    os.rename(path, quarantine)
+def _validate_resume_record(path: Path, expected: Mapping[str, Mapping[str, object]], config: PvadRuntimeConfig, *, expected_name: str | None = None) -> tuple[str, OrderedDict[str, float | int], Mapping[str, object]]:
+    record = _load_object(path.read_text(encoding="utf-8"), f"resume record {path}")
+    sample_id = record.get("id")
+    required = set(expected.get(sample_id, {})) | {"values", "audit"} if isinstance(sample_id, str) else set()
+    if set(record) != required or not isinstance(sample_id, str) or (expected_name or path.name) != _resume_name(sample_id) or sample_id not in expected:
+        raise ValueError(f"foreign resume record is preserved: {path}")
+    if {key: record[key] for key in expected[sample_id]} != expected[sample_id] or not isinstance(record["values"], Mapping) or not isinstance(record["audit"], Mapping):
+        raise ValueError(f"resume record identity mismatch is preserved: {path}")
+    return sample_id, _validate_values(record["values"]), _validate_audit(record["audit"], config)
 
 
 def _resume_records(root: Path, expected: Mapping[str, Mapping[str, object]], config: PvadRuntimeConfig) -> tuple[dict[str, OrderedDict[str, float | int]], list[Mapping[str, object]]]:
@@ -270,24 +326,40 @@ def _resume_records(root: Path, expected: Mapping[str, Mapping[str, object]], co
     audits: list[Mapping[str, object]] = []
     temp_pattern = re.compile(r"^\.record-[0-9a-f]{32}\.json\.[0-9a-f]{16}\.tmp$")
     for path in root.iterdir():
+        if path.name == _CONTEXT_IDENTITY:
+            continue
         if temp_pattern.fullmatch(path.name) and path.is_file() and not path.is_symlink():
-            _quarantine_temp(path)
+            destination = root / path.name.removeprefix(".").rsplit(".", 2)[0]
+            try:
+                sample_id, _, _ = _validate_resume_record(path, expected, config, expected_name=destination.name)
+            except ValueError as exc:
+                # Filename similarity does not establish ownership; preserve unknown bytes.
+                raise ValueError(f"unverified interrupted resume temp is preserved: {path}") from exc
+            if _resume_name(sample_id) != destination.name:
+                raise ValueError(f"unverified interrupted resume temp is preserved: {path}")
+            if os.path.lexists(destination):
+                if destination.read_bytes() != path.read_bytes():
+                    raise ValueError(f"competing interrupted resume temp is preserved: {path}")
+                path.unlink()
+                if sample_id in result:
+                    continue
+            else:
+                os.rename(path, destination)
+            if sample_id in result:
+                raise ValueError(f"duplicate interrupted resume temp is preserved: {path}")
+            _, values, audit = _validate_resume_record(destination, expected, config)
+            result[sample_id] = values
+            audits.append(audit)
             continue
         if temp_pattern.fullmatch(path.name.removesuffix(".quarantined")) and path.name.endswith(".quarantined") and path.is_file() and not path.is_symlink():
             continue
         if path.is_symlink() or not path.is_file() or not path.name.endswith(".json"):
             raise ValueError(f"foreign resume state is preserved: {path}")
-        record = _load_object(path.read_text(encoding="utf-8"), f"resume record {path}")
-        sample_id = record.get("id")
-        required = set(expected.get(sample_id, {})) | {"values", "audit"} if isinstance(sample_id, str) else set()
-        if set(record) != required or not isinstance(sample_id, str) or path.name != _resume_name(sample_id) or sample_id in result or sample_id not in expected:
-            raise ValueError(f"foreign resume record is preserved: {path}")
-        if {key: record[key] for key in expected[sample_id]} != expected[sample_id]:
-            raise ValueError(f"resume record identity mismatch is preserved: {path}")
-        if not isinstance(record["values"], Mapping) or not isinstance(record["audit"], Mapping):
-            raise ValueError(f"malformed resume record is preserved: {path}")
-        result[sample_id] = _validate_values(record["values"])
-        audits.append(_validate_audit(record["audit"], config))
+        sample_id, values, audit = _validate_resume_record(path, expected, config)
+        if sample_id in result:
+            continue
+        result[sample_id] = values
+        audits.append(audit)
     return result, audits
 
 
@@ -328,19 +400,36 @@ def _cuda_audit_adapter(device: str) -> object:
             torch.cuda.reset_peak_memory_stats(index)
         def peak_bytes(self) -> int:
             return int(torch.cuda.max_memory_allocated(index))
-        def evidence(self) -> dict[str, str]:
-            return {"cuda_device_name": str(torch.cuda.get_device_name(index)), "cuda_driver_version": str(getattr(torch.version, "cuda", "unknown")), "cuda_runtime_version": str(getattr(torch.version, "cuda", "unknown"))}
+        def evidence(self) -> dict[str, object]:
+            driver: str | None = None
+            try:
+                import pynvml
+                pynvml.nvmlInit()
+                driver = str(pynvml.nvmlSystemGetDriverVersion())
+            except Exception:
+                pass
+            return {"cuda_device_name": str(torch.cuda.get_device_name(index)), "cuda_driver": {"status": "available", "value": driver} if driver else {"status": "unavailable", "value": None}, "cuda_runtime_version": str(getattr(torch.version, "cuda", "unknown"))}
     return Adapter()
 
 
 def _observed_dependencies() -> dict[str, str | None]:
     observed: dict[str, str | None] = {}
-    for name in ("numpy", "scipy", "soundfile", "onnxruntime", "speechbrain", "torch"):
+    for name in ("numpy", "scipy", "soundfile", "onnxruntime", "onnxruntime-gpu", "speechbrain", "torch", "torchaudio", "huggingface-hub", "hyperpyyaml", "joblib", "packaging", "PyYAML", "ruamel.yaml", "ruamel.yaml.clib", "sentencepiece", "tqdm"):
         try:
             observed[name] = importlib.metadata.version(name)
         except importlib.metadata.PackageNotFoundError:
             observed[name] = None
     return observed
+
+
+def _report(manifest: Mapping[str, object]) -> str:
+    coverage = manifest["coverage"]
+    reuse = manifest["reuse"]
+    parity = manifest["parity"]
+    assert isinstance(coverage, Mapping) and isinstance(reuse, Mapping) and isinstance(parity, Mapping)
+    selected = coverage["selected"]
+    assert isinstance(selected, Mapping)
+    return f"# FireRed pVAD Cache\n\n- Selected IDs: {selected['count']}\n- New records: {reuse['new']}\n- Reused records: {reuse['reused']}\n- Parity: {parity['status']}\n"
 
 
 def build_pvad_cache(dataset_root: Path, model_paths: FireRedModelPaths, output_root: Path, *, resume_root: Path, ecapa_device: str, limit: int | None = None, parity_reference: Path | None = None) -> dict[str, Path]:
@@ -382,10 +471,16 @@ def build_pvad_cache(dataset_root: Path, model_paths: FireRedModelPaths, output_
                 continue
             if not child.name.startswith(_RESUME_PREFIX) or not re.fullmatch(r"context-[0-9a-f]{64}", child.name) or not _regular_directory(child):
                 raise ValueError(f"foreign resume namespace is preserved: {child}")
+            _validate_context(child)
         namespace = resume_root / namespace_name
-        namespace.mkdir(exist_ok=True)
+        try:
+            namespace.mkdir()
+            (namespace / _CONTEXT_IDENTITY).write_bytes((_canonical(_context_identity(model, config_digest)) + "\n").encode("utf-8"))
+        except FileExistsError:
+            pass
         if not _regular_directory(namespace):
             raise ValueError("resume namespace must be a regular non-symlink directory")
+        _validate_context(namespace, model, config_digest)
         existing, audits = _resume_records(namespace, expected, config)
         cuda = _cuda_audit_adapter(config.ecapa_device) if config.ecapa_device.startswith("cuda") else None
         runtime = FireRedPvadRuntime(verified, config=config, cuda_peak_bytes=cuda.peak_bytes if cuda else None)
@@ -419,10 +514,10 @@ def build_pvad_cache(dataset_root: Path, model_paths: FireRedModelPaths, output_
         cold = [float(a["elapsed_seconds"]) for a in audits if a["extraction_phase"] == "cold"]
         warm = [float(a["elapsed_seconds"]) for a in audits if a["extraction_phase"] == "warm"]
         cuda_peaks = [float(a["cuda_peak_bytes"]) for a in audits if "cuda_peak_bytes" in a]
-        manifest: dict[str, Any] = {"artifact_kind": _ARTIFACT_KIND, "schema_version": _SCHEMA_VERSION, "feature_schema": list(PVAD_GATE_FEATURE_SCHEMA), "feature_schema_sha256": _schema_digest(), "digest_algorithms": {"feature_schema_sha256": "sha256(newline-joined ordered schema names with trailing newline)", "records_sha256": "sha256(UTF-8 canonical JSONL bytes)", "per_id_record_sha256": "sha256(UTF-8 canonical JSON record bytes)", "joined_state_sha256": "sha256(UTF-8 canonical JSON)"}, "coverage": {"selected": {"count": len(selected), "ids": selected, "id_sha256": _sha256(_canonical(selected).encode())}, "source": {"count": len(raw), "ids": sorted(raw, key=_id_key), "id_sha256": _sha256(_canonical(sorted(raw, key=_id_key)).encode())}}, "source": {"jsonl_sha256": source_digests}, "model": model, "runtime_config": asdict(config), "runtime_config_sha256": config_digest, "provider": config.onnx_provider, "device": config.ecapa_device, "environment": {"python": sys.version.split()[0], "platform": platform.platform(), "observed_dependencies": _observed_dependencies()}, "reuse": {"reused": len(existing), "new": new_count}, "timing": {"cold_elapsed_seconds": _percentiles(cold), "warm_elapsed_seconds": _percentiles(warm), "rtf": _percentiles([float(a["rtf"]) for a in audits]), "peak_rss_delta_bytes": _percentiles([float(a["peak_rss_delta_bytes"]) for a in audits]), "cuda_peak_bytes": _percentiles(cuda_peaks)}, "parity": parity, "limit": {"value": limit, "canonical": limit is None, "reason": None if limit is None else "explicit noncanonical partial cache"}, "records_sha256": _sha256(feature_text.encode()), "per_id_record_sha256": {sample_id: _sha256(line.encode()) for sample_id, line in zip(selected, lines)}, "joined_state_sha256": _sha256(_canonical({sample_id: expected[sample_id] for sample_id in selected}).encode())}
+        manifest: dict[str, Any] = {"artifact_kind": _ARTIFACT_KIND, "schema_version": _SCHEMA_VERSION, "feature_schema": list(PVAD_GATE_FEATURE_SCHEMA), "feature_schema_sha256": _schema_digest(), "digest_algorithms": {"feature_schema_sha256": "sha256(newline-joined ordered schema names with trailing newline)", "records_sha256": "sha256(UTF-8 canonical JSONL bytes)", "per_id_record_sha256": "sha256(UTF-8 canonical JSON record bytes)", "joined_state_sha256": "sha256(UTF-8 canonical JSON)", "source_audio_sha256": "sha256(raw wake/command audio bytes)", "model_sha256": "sha256(verified Task 2 model manifest/assets)"}, "coverage": {"selected": {"count": len(selected), "ids": selected, "id_sha256": _sha256(_canonical(selected).encode())}, "source": {"count": len(raw), "ids": sorted(raw, key=_id_key), "id_sha256": _sha256(_canonical(sorted(raw, key=_id_key)).encode())}}, "source": {"jsonl_sha256": source_digests, "per_id_audio_sha256": {sample_id: {"wake_sha256": state[sample_id]["wake_sha256"], "command_sha256": state[sample_id]["command_sha256"]} for sample_id in selected}}, "model": model, "runtime_config": asdict(config), "runtime_config_sha256": config_digest, "provider": config.onnx_provider, "device": config.ecapa_device, "environment": {"python": sys.version.split()[0], "platform": platform.platform(), "observed_dependencies": _observed_dependencies()}, "reuse": {"reused": len(existing), "new": new_count}, "timing": {"cold_elapsed_seconds": _percentiles(cold), "warm_elapsed_seconds": _percentiles(warm), "rtf": _percentiles([float(a["rtf"]) for a in audits]), "peak_rss_delta_bytes": _percentiles([float(a["peak_rss_delta_bytes"]) for a in audits]), "cuda_peak_bytes": _percentiles(cuda_peaks)}, "parity": parity, "limit": {"value": limit, "canonical": limit is None, "reason": None if limit is None else "explicit noncanonical partial cache"}, "records_sha256": _sha256(feature_text.encode()), "per_id_record_sha256": {sample_id: _sha256(line.encode()) for sample_id, line in zip(selected, lines)}, "joined_state_sha256": _sha256(_canonical({sample_id: expected[sample_id] for sample_id in selected}).encode())}
         if cuda:
             manifest["cuda"] = {**cuda.evidence(), "peak_bytes": _percentiles(cuda_peaks)}
-        report = f"# FireRed pVAD Cache\n\n- Selected IDs: {len(selected)}\n- New records: {new_count}\n- Reused records: {len(existing)}\n- Parity: {parity['status']}\n"
+        report = _report(manifest)
         return {"features": path for name, path in publish_text_package(output_root, _CONTRACT, {_FEATURES: feature_text, _MANIFEST: _canonical(manifest) + "\n", _REPORT: report}).items() if name == _FEATURES} | {"manifest": output_root / _MANIFEST, "report": output_root / _REPORT}
     finally:
         _unlock(lock, lock_identity)
