@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-import hashlib
 import ctypes
+import hashlib
+import importlib.metadata
 import json
 import math
 import os
 import platform
+import re
 import secrets
 import stat
 import sys
@@ -21,20 +23,20 @@ from .data import FIELD_ALIASES, load_split
 from .firered_model_assets import FireRedModelPaths, download_and_verify_model
 from .firered_pvad import PVAD_GATE_FEATURE_SCHEMA, FireRedPvadRuntime, PvadRuntimeConfig
 
-
 _ARTIFACT_KIND = "r11_e2_firered_cache"
 _SCHEMA_VERSION = "v1"
-_FEATURES = "pvad_features.jsonl"
-_MANIFEST = "pvad_manifest.json"
-_REPORT = "pvad_report.md"
+_FEATURES, _MANIFEST, _REPORT = "pvad_features.jsonl", "pvad_manifest.json", "pvad_report.md"
 _CONTRACT = ArtifactContract(_ARTIFACT_KIND, _SCHEMA_VERSION, (_FEATURES, _MANIFEST, _REPORT), (_MANIFEST,))
+_SCHEMA_SHA256 = "610c7e711fda490405a66a01e5ca6e7b01bf230c00333d891ebbaf20140e270f"
+_RESUME_PREFIX = "context-"
+_AUDIT_COMMON = {"elapsed_seconds", "audio_seconds", "rtf", "peak_rss_delta_bytes", "dropped_tail_samples", "extraction_phase", "onnx_provider", "ecapa_device"}
 
 
 def _canonical(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def _ordered_json(value: object) -> str:
+def _ordered(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=False, separators=(",", ":"), allow_nan=False)
 
 
@@ -51,13 +53,9 @@ def _file_sha256(path: Path) -> str:
 
 
 def _finite(value: object, label: str) -> float | int:
-    if isinstance(value, bool) or type(value) not in (int, float) or not math.isfinite(value):
+    if type(value) not in (int, float) or not math.isfinite(value):
         raise ValueError(f"{label} must be a native finite JSON number")
     return value
-
-
-def _reject_constant(value: str) -> None:
-    raise ValueError(f"non-finite JSON value {value!r} is forbidden")
 
 
 def _object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -71,34 +69,33 @@ def _object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 def _load_object(text: str, label: str) -> dict[str, object]:
     try:
-        value = json.loads(text, object_pairs_hook=_object_pairs, parse_constant=_reject_constant)
-    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        value = json.loads(text, object_pairs_hook=_object_pairs, parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError(f"invalid {label}: {exc}") from exc
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object")
     return value
 
 
-def _id_key(sample_id: str) -> tuple[int, int | str, str]:
-    # The tag makes all-numeric and textual IDs comparable while retaining a total order.
-    return (0, int(sample_id), sample_id) if sample_id.isdigit() else (1, sample_id, sample_id)
+def _id_key(value: str) -> tuple[int, int | str, str]:
+    return (0, int(value), value) if value.isdigit() else (1, value, value)
 
 
 def _valid_id(value: object) -> str:
-    if not isinstance(value, str) or not value or value in {".", ".."} or "/" in value or "\\" in value or "\x00" in value:
+    if not isinstance(value, str) or not value or value in {".", ".."} or "/" in value or "\\" in value or "\0" in value:
         raise ValueError("Dataset-A id must be a nonempty traversal-safe string")
     return value
 
 
 def _first(row: Mapping[str, object], field: str) -> object | None:
-    return next((row[name] for name in FIELD_ALIASES[field] if name in row), None)
+    return next((row[key] for key in FIELD_ALIASES[field] if key in row), None)
 
 
-def _raw_rows(dataset_root: Path) -> tuple[dict[str, dict[str, object]], dict[str, str]]:
-    rows: dict[str, dict[str, object]] = {}
+def _raw_rows(root: Path) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
+    rows: dict[str, dict[str, str]] = {}
     sources: dict[str, str] = {}
     for split in ("pos", "neg"):
-        path = dataset_root / f"{split}.jsonl"
+        path = root / f"{split}.jsonl"
         if not path.is_file() or path.is_symlink():
             raise ValueError(f"Dataset-A split must be a regular non-symlink file: {path}")
         sources[split] = _file_sha256(path)
@@ -107,18 +104,23 @@ def _raw_rows(dataset_root: Path) -> tuple[dict[str, dict[str, object]], dict[st
                 raise ValueError(f"Dataset-A JSONL {path}:{number} must not contain an empty row")
             row = _load_object(line, f"Dataset-A JSONL {path}:{number}")
             sample_id = _valid_id(_first(row, "id"))
-            if sample_id in rows:
-                raise ValueError(f"duplicate Dataset-A id {sample_id!r} within or across splits")
             wake, command = _first(row, "wakeup_audio"), _first(row, "command_audio")
-            if not isinstance(wake, str) or not wake or not isinstance(command, str) or not command:
-                raise ValueError(f"Dataset-A id {sample_id!r} is missing wake/command audio")
-            rows[sample_id] = {"id": sample_id, "split": split, "wakeup_audio": wake, "command_audio": command}
+            if sample_id in rows or not isinstance(wake, str) or not wake or not isinstance(command, str) or not command:
+                raise ValueError(f"Dataset-A id {sample_id!r} is duplicate or missing wake/command audio")
+            rows[sample_id] = {"wakeup_audio": wake, "command_audio": command}
     if not rows:
         raise ValueError("Dataset-A contains no rows")
     return rows, sources
 
 
-def _regular_audio(path: Path, label: str) -> Path:
+def _safe_audio(root: Path, relative: str, label: str) -> Path:
+    if Path(relative).is_absolute():
+        raise ValueError(f"{label} audio path must be relative to Dataset-A root")
+    path = root / relative
+    try:
+        path.resolve(strict=False).relative_to(root.resolve(strict=False))
+    except ValueError as exc:
+        raise ValueError(f"{label} audio path escapes Dataset-A root") from exc
     try:
         metadata = path.lstat()
     except OSError as exc:
@@ -128,24 +130,13 @@ def _regular_audio(path: Path, label: str) -> Path:
     return path
 
 
-def _safe_path(root: Path, relative: str, label: str) -> Path:
-    if Path(relative).is_absolute():
-        raise ValueError(f"{label} audio path must be relative to Dataset-A root")
-    candidate = root / relative
-    # Dataset data is local, but reject lexical traversal before any filesystem access.
-    try:
-        candidate.resolve(strict=False).relative_to(root.resolve(strict=False))
-    except ValueError as exc:
-        raise ValueError(f"{label} audio path escapes Dataset-A root") from exc
-    return _regular_audio(candidate, label)
-
-
 def _schema_digest() -> str:
-    return _sha256(_canonical(list(PVAD_GATE_FEATURE_SCHEMA)).encode("utf-8"))
+    # This is the frozen Task 3 identity, defined as SHA-256 of ordered names joined by newlines.
+    return _SCHEMA_SHA256
 
 
-def _config(ecapa_device: str) -> PvadRuntimeConfig:
-    return PvadRuntimeConfig(onnx_provider="CPUExecutionProvider", ecapa_device=ecapa_device)
+def _config(device: str) -> PvadRuntimeConfig:
+    return PvadRuntimeConfig(onnx_provider="CPUExecutionProvider", ecapa_device=device)
 
 
 def verify_existing_model(paths: FireRedModelPaths) -> FireRedModelPaths:
@@ -156,18 +147,60 @@ def verify_existing_model(paths: FireRedModelPaths) -> FireRedModelPaths:
 
 def _model_identity(paths: FireRedModelPaths) -> dict[str, object]:
     parsed = _load_object(paths.manifest.read_text(encoding="utf-8"), "model manifest")
-    return {
-        "manifest_sha256": _file_sha256(paths.manifest),
-        "aggregate_sha256": parsed.get("aggregate_sha256"),
-        "raw_sha256": parsed.get("raw_sha256"),
-        "upstream": parsed.get("upstream"),
-        "onnx": parsed.get("onnx"),
-    }
+    return {"manifest_sha256": _file_sha256(paths.manifest), "aggregate_sha256": parsed.get("aggregate_sha256"), "raw_sha256": parsed.get("raw_sha256"), "upstream": parsed.get("upstream"), "onnx": parsed.get("onnx"), "required_dependencies": parsed.get("required_dependencies", parsed.get("dependencies", {}))}
+
+
+def _overlap(left: Path, right: Path) -> bool:
+    left, right = left.resolve(strict=False), right.resolve(strict=False)
+    return os.path.commonpath((str(left), str(right))) in {str(left), str(right)}
+
+
+def _regular_directory(path: Path) -> bool:
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        return False
+    return stat.S_ISDIR(mode) and not path.is_symlink()
+
+
+def _validate_package(root: Path, selected: list[str] | None = None, *, cpu_only: bool = False) -> tuple[dict[str, object], dict[str, OrderedDict[str, float | int]], str]:
+    if not _regular_directory(root):
+        raise ValueError("parity/output root is not a recognizable cache package")
+    children = list(root.iterdir())
+    if {child.name for child in children} != {_FEATURES, _MANIFEST, _REPORT} or any(child.is_symlink() or not child.is_file() for child in children):
+        raise ValueError("parity/output root is not a recognizable cache package")
+    manifest = _load_object((root / _MANIFEST).read_text(encoding="utf-8"), "cache manifest")
+    if manifest.get("artifact_kind") != _ARTIFACT_KIND or manifest.get("schema_version") != _SCHEMA_VERSION or manifest.get("feature_schema") != list(PVAD_GATE_FEATURE_SCHEMA) or manifest.get("feature_schema_sha256") != _schema_digest():
+        raise ValueError("parity/output root is not a recognizable cache package")
+    if cpu_only and (manifest.get("provider") != "CPUExecutionProvider" or manifest.get("device") != "cpu"):
+        raise ValueError("parity reference must be a CPU cache package")
+    text = (root / _FEATURES).read_text(encoding="utf-8")
+    rows: dict[str, OrderedDict[str, float | int]] = {}
+    lines = text.splitlines()
+    if text != "\n".join(lines) + "\n":
+        raise ValueError("parity reference feature bytes are not canonical")
+    for number, line in enumerate(lines, 1):
+        record = _load_object(line, f"parity record {number}")
+        if tuple(record) != ("id", "features") or not isinstance(record.get("id"), str) or record["id"] in rows or not isinstance(record.get("features"), Mapping):
+            raise ValueError("malformed parity reference")
+        rows[record["id"]] = _validate_values(record["features"])
+    ids = list(rows)
+    coverage = manifest.get("coverage")
+    if not isinstance(coverage, Mapping) or not isinstance(coverage.get("selected"), Mapping) or coverage["selected"].get("ids") != ids or coverage["selected"].get("count") != len(ids) or manifest.get("records_sha256") != _sha256(text.encode("utf-8")) or manifest.get("per_id_record_sha256") != {sample_id: _sha256(line.encode("utf-8")) for sample_id, line in zip(ids, lines)}:
+        raise ValueError("parity reference coverage or digest disagrees")
+    if selected is not None and ids != selected:
+        raise ValueError("parity reference IDs disagree")
+    return manifest, rows, text
+
+
+def _preflight_output(path: Path) -> None:
+    if os.path.lexists(path) and _validate_package(path) is None:
+        raise AssertionError("unreachable")
 
 
 def _lock(root: Path) -> tuple[Path, tuple[int, int]]:
     root.mkdir(parents=True, exist_ok=True)
-    if root.is_symlink() or not root.is_dir():
+    if not _regular_directory(root):
         raise ValueError("resume root must be a regular non-symlink directory")
     lock = root / ".resume.lock"
     try:
@@ -181,23 +214,22 @@ def _lock(root: Path) -> tuple[Path, tuple[int, int]]:
 def _unlock(lock: Path, identity: tuple[int, int]) -> None:
     try:
         item = lock.lstat()
+        if (item.st_dev, item.st_ino) == identity and not lock.is_symlink():
+            lock.rmdir()
     except OSError:
-        return
-    if (item.st_dev, item.st_ino) != identity or lock.is_symlink():
-        return
-    owner = lock / "owner.json"
-    if owner.exists():
-        owner.unlink()
-    lock.rmdir()
+        pass
 
 
 def _resume_name(sample_id: str) -> str:
-    return "record-" + _sha256(sample_id.encode("utf-8")) + ".json"
+    return "record-" + _sha256(sample_id.encode("utf-8"))[:32] + ".json"
+
+
+def _context_name(model: Mapping[str, object], config_digest: str) -> str:
+    return _RESUME_PREFIX + _sha256(_canonical({"model": model, "runtime_config_sha256": config_digest, "feature_schema_sha256": _schema_digest()}).encode("utf-8"))
 
 
 def _resume_expected(sample_id: str, input_state: Mapping[str, object], model: Mapping[str, object], config_digest: str) -> dict[str, object]:
-    public_input = {key: value for key, value in input_state.items() if key not in {"wake_path", "command_path"}}
-    return {"id": sample_id, "input": public_input, "model": dict(model), "config_sha256": config_digest, "schema": list(PVAD_GATE_FEATURE_SCHEMA), "schema_sha256": _schema_digest()}
+    return {"id": sample_id, "input": {"wake_sha256": input_state["wake_sha256"], "command_sha256": input_state["command_sha256"]}, "model": dict(model), "runtime_config_sha256": config_digest, "feature_schema": list(PVAD_GATE_FEATURE_SCHEMA), "feature_schema_sha256": _schema_digest()}
 
 
 def _validate_values(values: Mapping[str, object]) -> OrderedDict[str, float | int]:
@@ -206,120 +238,109 @@ def _validate_values(values: Mapping[str, object]) -> OrderedDict[str, float | i
     return OrderedDict((name, _finite(values[name], f"feature {name}")) for name in PVAD_GATE_FEATURE_SCHEMA)
 
 
-def _validate_audit(audit: Mapping[str, object], config: PvadRuntimeConfig | None = None) -> dict[str, object]:
-    if not isinstance(audit, Mapping):
-        raise ValueError("runtime audit must be an object")
+def _validate_audit(audit: Mapping[str, object], config: PvadRuntimeConfig) -> dict[str, object]:
+    expected = _AUDIT_COMMON | ({"cuda_peak_bytes"} if config.ecapa_device.startswith("cuda") else set())
+    if not isinstance(audit, Mapping) or set(audit) != expected:
+        raise ValueError("runtime audit has an invalid exact key contract")
     result: dict[str, object] = {}
-    for name, value in audit.items():
-        if type(name) is not str or not name:
-            raise ValueError("runtime audit names must be nonempty strings")
-        if isinstance(value, str):
-            result[name] = value
+    for key, value in audit.items():
+        if key in {"extraction_phase", "onnx_provider", "ecapa_device"}:
+            if not isinstance(value, str):
+                raise ValueError(f"audit {key} must be a string")
+            result[key] = value
         else:
-            result[name] = _finite(value, f"audit {name}")
-    required = {"elapsed_seconds", "audio_seconds", "rtf", "peak_rss_delta_bytes", "extraction_phase", "onnx_provider", "ecapa_device"}
-    if not required.issubset(result) or result["extraction_phase"] not in {"cold", "warm"}:
-        raise ValueError("runtime audit is incomplete or has an invalid extraction phase")
-    if config is not None and (result["onnx_provider"] != config.onnx_provider or result["ecapa_device"] != config.ecapa_device):
-        raise ValueError("runtime audit provider/device disagrees with runtime config")
+            numeric = _finite(value, f"audit {key}")
+            if numeric < 0:
+                raise ValueError(f"audit {key} must be nonnegative")
+            result[key] = numeric
+    if result["extraction_phase"] not in {"cold", "warm"} or result["onnx_provider"] != config.onnx_provider or result["ecapa_device"] != config.ecapa_device:
+        raise ValueError("runtime audit provider/device/phase disagrees with runtime config")
     return result
 
 
-def _resume_records(root: Path, expected: Mapping[str, Mapping[str, object]]) -> tuple[dict[str, OrderedDict[str, float | int]], list[Mapping[str, object]]]:
+def _quarantine_temp(path: Path) -> None:
+    quarantine = path.with_name(path.name + ".quarantined")
+    if os.path.lexists(quarantine):
+        raise ValueError(f"owned interrupted resume temp cannot be safely quarantined: {path}")
+    os.rename(path, quarantine)
+
+
+def _resume_records(root: Path, expected: Mapping[str, Mapping[str, object]], config: PvadRuntimeConfig) -> tuple[dict[str, OrderedDict[str, float | int]], list[Mapping[str, object]]]:
     result: dict[str, OrderedDict[str, float | int]] = {}
     audits: list[Mapping[str, object]] = []
+    temp_pattern = re.compile(r"^\.record-[0-9a-f]{32}\.json\.[0-9a-f]{16}\.tmp$")
     for path in root.iterdir():
-        if path.name == ".resume.lock":
+        if temp_pattern.fullmatch(path.name) and path.is_file() and not path.is_symlink():
+            _quarantine_temp(path)
+            continue
+        if temp_pattern.fullmatch(path.name.removesuffix(".quarantined")) and path.name.endswith(".quarantined") and path.is_file() and not path.is_symlink():
             continue
         if path.is_symlink() or not path.is_file() or not path.name.endswith(".json"):
             raise ValueError(f"foreign resume state is preserved: {path}")
         record = _load_object(path.read_text(encoding="utf-8"), f"resume record {path}")
         sample_id = record.get("id")
-        if not isinstance(sample_id, str) or sample_id not in expected or path.name != _resume_name(sample_id):
+        required = set(expected.get(sample_id, {})) | {"values", "audit"} if isinstance(sample_id, str) else set()
+        if set(record) != required or not isinstance(sample_id, str) or path.name != _resume_name(sample_id) or sample_id in result or sample_id not in expected:
             raise ValueError(f"foreign resume record is preserved: {path}")
-        if sample_id in result or {key: record.get(key) for key in expected[sample_id]} != expected[sample_id]:
+        if {key: record[key] for key in expected[sample_id]} != expected[sample_id]:
             raise ValueError(f"resume record identity mismatch is preserved: {path}")
-        input_state = expected[sample_id]["input"]
-        if record.get("wake_sha256") != input_state["wake_sha256"] or record.get("command_sha256") != input_state["command_sha256"]:
-            raise ValueError(f"resume record audio digest mismatch is preserved: {path}")
-        values = record.get("values")
-        audit = record.get("audit")
-        if not isinstance(values, Mapping) or not isinstance(audit, Mapping):
+        if not isinstance(record["values"], Mapping) or not isinstance(record["audit"], Mapping):
             raise ValueError(f"malformed resume record is preserved: {path}")
-        audits.append(_validate_audit(audit))
-        result[sample_id] = _validate_values(values)
+        result[sample_id] = _validate_values(record["values"])
+        audits.append(_validate_audit(record["audit"], config))
     return result, audits
 
 
 def _write_resume(root: Path, record: Mapping[str, object]) -> None:
-    sample_id = str(record["id"])
-    destination = root / _resume_name(sample_id)
+    destination = root / _resume_name(str(record["id"]))
     if os.path.lexists(destination):
         raise ValueError(f"resume destination already exists and is preserved: {destination}")
     temporary = root / f".{destination.name}.{secrets.token_hex(8)}.tmp"
-    try:
-        with temporary.open("x", encoding="utf-8", newline="\n") as handle:
-            handle.write(_ordered_json(record) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        if temporary.is_symlink() or os.path.lexists(destination):
-            raise ValueError("resume write encountered a symlink")
-        if os.name == "nt":
-            move = ctypes.windll.kernel32.MoveFileW
-            move.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
-            move.restype = ctypes.c_int
-            if not move(str(temporary), str(destination)):
-                error = ctypes.get_last_error()
-                raise OSError(error, ctypes.FormatError(error), str(destination))
-        else:
-            os.link(temporary, destination)
-            temporary.unlink()
-    except Exception:
-        # A temporary can be evidence of an interrupted write, so it is never deleted here.
-        raise
+    with temporary.open("x", encoding="utf-8", newline="\n") as handle:
+        handle.write(_ordered(record) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    if temporary.is_symlink() or os.path.lexists(destination):
+        raise ValueError("resume write encountered a symlink")
+    if os.name == "nt":
+        if not ctypes.windll.kernel32.MoveFileW(str(temporary), str(destination)):
+            raise OSError(ctypes.get_last_error(), "could not publish resume record")
+    else:
+        os.link(temporary, destination)
+        temporary.unlink()
 
 
-def _percentiles(values: list[float]) -> dict[str, float | None]:
+def _percentiles(values: list[float]) -> dict[str, float | int | None]:
     if not values:
         return {"count": 0, "p50": None, "p95": None, "max": None}
     ordered = sorted(values)
-    def at(fraction: float) -> float:
-        return ordered[round((len(ordered) - 1) * fraction)]
-    return {"count": len(ordered), "p50": at(0.5), "p95": at(0.95), "max": ordered[-1]}
+    return {"count": len(ordered), "p50": ordered[round((len(ordered) - 1) * .5)], "p95": ordered[round((len(ordered) - 1) * .95)], "max": ordered[-1]}
 
 
-def _parity(reference: Path | None, selected: list[str], features: Mapping[str, Mapping[str, float | int]]) -> dict[str, object]:
-    if reference is None:
-        return {"status": "not-run", "passed": None, "max_abs_feature_delta": None}
-    parent = reference.parent
-    manifest = parent / _MANIFEST
-    if reference.name != _FEATURES or not manifest.is_file():
-        raise ValueError("parity reference parent is not a recognized cache package")
-    identity = _load_object(manifest.read_text(encoding="utf-8"), "parity manifest")
-    if identity.get("artifact_kind") != _ARTIFACT_KIND or identity.get("schema_version") != _SCHEMA_VERSION:
-        raise ValueError("parity reference parent is not a recognized cache package")
-    output: dict[str, Mapping[str, object]] = {}
-    for number, line in enumerate(reference.read_text(encoding="utf-8").splitlines(), 1):
-        record = _load_object(line, f"parity record {number}")
-        sample_id, values = record.get("id"), record.get("features")
-        if not isinstance(sample_id, str) or sample_id in output or not isinstance(values, Mapping):
-            raise ValueError("malformed parity reference")
-        output[sample_id] = values
-    if list(output) != selected:
-        raise ValueError("parity reference IDs disagree")
-    maximum = 0.0
-    for sample_id in selected:
-        reference_values = _validate_values(output[sample_id])
-        for name in PVAD_GATE_FEATURE_SCHEMA:
-            maximum = max(maximum, abs(float(reference_values[name]) - float(features[sample_id][name])))
-    if maximum > 1e-4:
-        raise ValueError(f"parity failed: maximum feature delta {maximum}")
-    return {"status": "passed", "passed": True, "max_abs_feature_delta": maximum}
+def _cuda_audit_adapter(device: str) -> object:
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError("torch is required for CUDA audit evidence") from exc
+    index = 0 if device == "cuda" else int(device.split(":", 1)[1])
+    class Adapter:
+        def reset_peak(self) -> None:
+            torch.cuda.reset_peak_memory_stats(index)
+        def peak_bytes(self) -> int:
+            return int(torch.cuda.max_memory_allocated(index))
+        def evidence(self) -> dict[str, str]:
+            return {"cuda_device_name": str(torch.cuda.get_device_name(index)), "cuda_driver_version": str(getattr(torch.version, "cuda", "unknown")), "cuda_runtime_version": str(getattr(torch.version, "cuda", "unknown"))}
+    return Adapter()
 
 
-def _overlap(left: Path, right: Path) -> bool:
-    a, b = str(left.resolve(strict=False)), str(right.resolve(strict=False))
-    return os.path.commonpath((a, b)) in {a, b}
+def _observed_dependencies() -> dict[str, str | None]:
+    observed: dict[str, str | None] = {}
+    for name in ("numpy", "scipy", "soundfile", "onnxruntime", "speechbrain", "torch"):
+        try:
+            observed[name] = importlib.metadata.version(name)
+        except importlib.metadata.PackageNotFoundError:
+            observed[name] = None
+    return observed
 
 
 def build_pvad_cache(dataset_root: Path, model_paths: FireRedModelPaths, output_root: Path, *, resume_root: Path, ecapa_device: str, limit: int | None = None, parity_reference: Path | None = None) -> dict[str, Path]:
@@ -327,59 +348,81 @@ def build_pvad_cache(dataset_root: Path, model_paths: FireRedModelPaths, output_
     dataset_root, output_root, resume_root = Path(dataset_root), Path(output_root), Path(resume_root)
     if limit is not None and (type(limit) is not int or limit <= 0):
         raise ValueError("limit must be a positive integer")
-    if any(_overlap(left, right) for left, right in ((output_root, resume_root), (output_root, dataset_root), (output_root, model_paths.root), (resume_root, dataset_root), (resume_root, model_paths.root), (dataset_root, model_paths.root))):
+    if any(_overlap(a, b) for a, b in ((output_root, resume_root), (output_root, dataset_root), (output_root, model_paths.root), (resume_root, dataset_root), (resume_root, model_paths.root), (dataset_root, model_paths.root))):
         raise ValueError("output, resume, model, and Dataset-A roots must not overlap")
+    if os.path.lexists(output_root):
+        _validate_package(output_root)
     raw, source_digests = _raw_rows(dataset_root)
-    # Reuse the project loader only after raw IDs were independently validated.
-    loaded = {sample.id: sample for split in ("pos", "neg") for sample in load_split(dataset_root, split)}
-    if set(loaded) != set(raw):
+    loaded = {sample.id for split in ("pos", "neg") for sample in load_split(dataset_root, split)}
+    if loaded != set(raw):
         raise ValueError("Dataset-A loader disagrees with independently parsed raw IDs")
-    selected = sorted(raw, key=_id_key)
-    if limit is not None:
-        selected = selected[:limit]
+    selected = sorted(raw, key=_id_key)[:limit] if limit is not None else sorted(raw, key=_id_key)
+    config = _config(ecapa_device)
+    reference_root = Path(parity_reference).parent if parity_reference else None
+    if config.ecapa_device.startswith("cuda") and parity_reference is None:
+        raise ValueError("CUDA cache requires a complete CPU parity reference before inference")
+    if reference_root is not None:
+        if Path(parity_reference).name != _FEATURES or any(_overlap(reference_root, root) for root in (output_root, resume_root, dataset_root, model_paths.root)):
+            raise ValueError("parity reference overlaps an unsafe root")
+        _validate_package(reference_root, selected, cpu_only=config.ecapa_device.startswith("cuda"))
     verified = verify_existing_model(model_paths)
     model = _model_identity(verified)
-    config = _config(ecapa_device)
     config_digest = _sha256(_canonical(asdict(config)).encode("utf-8"))
     state: dict[str, dict[str, object]] = {}
     for sample_id in selected:
-        wake = _safe_path(dataset_root, str(raw[sample_id]["wakeup_audio"]), "wake")
-        command = _safe_path(dataset_root, str(raw[sample_id]["command_audio"]), "command")
-        state[sample_id] = {"wake_sha256": _file_sha256(wake), "command_sha256": _file_sha256(command), "projection": raw[sample_id], "wake_path": wake, "command_path": command}
+        wake = _safe_audio(dataset_root, raw[sample_id]["wakeup_audio"], "wake")
+        command = _safe_audio(dataset_root, raw[sample_id]["command_audio"], "command")
+        state[sample_id] = {"wake_sha256": _file_sha256(wake), "command_sha256": _file_sha256(command), "wake_path": wake, "command_path": command}
     expected = {sample_id: _resume_expected(sample_id, state[sample_id], model, config_digest) for sample_id in selected}
     lock, lock_identity = _lock(resume_root)
     try:
-        existing, prior_audits = _resume_records(resume_root, expected)
-        runtime = FireRedPvadRuntime(verified, config=config)
-        features: dict[str, OrderedDict[str, float | int]] = dict(existing)
-        audits: list[Mapping[str, object]] = list(prior_audits)
-        new_audits = 0
+        namespace_name = _context_name(model, config_digest)
+        for child in resume_root.iterdir():
+            if child.name == ".resume.lock":
+                continue
+            if not child.name.startswith(_RESUME_PREFIX) or not re.fullmatch(r"context-[0-9a-f]{64}", child.name) or not _regular_directory(child):
+                raise ValueError(f"foreign resume namespace is preserved: {child}")
+        namespace = resume_root / namespace_name
+        namespace.mkdir(exist_ok=True)
+        if not _regular_directory(namespace):
+            raise ValueError("resume namespace must be a regular non-symlink directory")
+        existing, audits = _resume_records(namespace, expected, config)
+        cuda = _cuda_audit_adapter(config.ecapa_device) if config.ecapa_device.startswith("cuda") else None
+        runtime = FireRedPvadRuntime(verified, config=config, cuda_peak_bytes=cuda.peak_bytes if cuda else None)
+        features = dict(existing)
+        new_count = 0
         for sample_id in selected:
             if sample_id in features:
                 continue
+            if cuda:
+                cuda.reset_peak()
             result = runtime.extract(sample_id, state[sample_id]["wake_path"], state[sample_id]["command_path"])
             if result.sample_id != sample_id:
                 raise ValueError("runtime returned a foreign sample ID")
-            values = _validate_values(result.values)
-            audit = _validate_audit(result.audit, config)
-            record = {**expected[sample_id], "wake_sha256": state[sample_id]["wake_sha256"], "command_sha256": state[sample_id]["command_sha256"], "values": values, "audit": audit}
-            _write_resume(resume_root, record)
+            values, audit = _validate_values(result.values), _validate_audit(result.audit, config)
+            record = {**expected[sample_id], "values": values, "audit": audit}
+            _write_resume(namespace, record)
             features[sample_id] = values
             audits.append(audit)
-            new_audits += 1
+            new_count += 1
         if set(features) != set(selected):
             raise ValueError("incomplete resume coverage")
-        parity = _parity(Path(parity_reference) if parity_reference else None, selected, features)
-        lines = [_ordered_json(OrderedDict((("id", sample_id), ("features", features[sample_id])))) for sample_id in selected]
+        parity = {"status": "not-run", "passed": None, "max_abs_feature_delta": None}
+        if reference_root is not None:
+            _, reference, _ = _validate_package(reference_root, selected, cpu_only=config.ecapa_device.startswith("cuda"))
+            maximum = max((abs(float(reference[sample_id][name]) - float(features[sample_id][name])) for sample_id in selected for name in PVAD_GATE_FEATURE_SCHEMA), default=0.0)
+            if maximum > 1e-4:
+                raise ValueError(f"parity failed: maximum feature delta {maximum}")
+            parity = {"status": "passed", "passed": True, "max_abs_feature_delta": maximum}
+        lines = [_ordered(OrderedDict((("id", sample_id), ("features", features[sample_id])))) for sample_id in selected]
         feature_text = "\n".join(lines) + "\n"
-        per_id = {sample_id: _sha256(lines[index].encode("utf-8")) for index, sample_id in enumerate(selected)}
-        elapsed = [float(a["elapsed_seconds"]) for a in audits if isinstance(a.get("elapsed_seconds"), (int, float))]
-        rtf = [float(a["rtf"]) for a in audits if isinstance(a.get("rtf"), (int, float))]
-        public_projection = {sample_id: {key: value for key, value in state[sample_id].items() if key not in {"wake_path", "command_path"}} for sample_id in selected}
-        manifest = {"artifact_kind": _ARTIFACT_KIND, "schema_version": _SCHEMA_VERSION, "feature_schema": list(PVAD_GATE_FEATURE_SCHEMA), "feature_schema_sha256": _schema_digest(), "coverage": {"selected": {"count": len(selected), "ids": selected, "id_sha256": _sha256(_canonical(selected).encode("utf-8"))}, "source": {"count": len(raw), "ids": sorted(raw, key=_id_key), "id_sha256": _sha256(_canonical(sorted(raw, key=_id_key)).encode("utf-8"))}}, "source": {"jsonl_sha256": source_digests, "input_projection": public_projection}, "model": model, "runtime_config": asdict(config), "runtime_config_sha256": config_digest, "provider": "CPUExecutionProvider", "device": ecapa_device, "environment": {"python": sys.version.split()[0], "platform": platform.platform()}, "reuse": {"reused": len(existing), "new": new_audits}, "timing": {"cold_warm_elapsed_seconds": _percentiles(elapsed), "rtf": _percentiles(rtf)}, "parity": parity, "limit": {"value": limit, "canonical": limit is None, "reason": None if limit is None else "explicit noncanonical partial cache"}, "records_sha256": _sha256(feature_text.encode("utf-8")), "per_id_record_sha256": per_id, "joined_state_sha256": _sha256(_canonical({sample_id: expected[sample_id] for sample_id in selected}).encode("utf-8"))}
-        manifest_text = _canonical(manifest) + "\n"
-        report = f"# FireRed pVAD Cache\n\n- Selected IDs: {len(selected)}\n- New records: {new_audits}\n- Reused records: {len(existing)}\n- Parity: {parity['status']}\n"
-        published = publish_text_package(output_root, _CONTRACT, {_FEATURES: feature_text, _MANIFEST: manifest_text, _REPORT: report})
-        return {"features": published[_FEATURES], "manifest": published[_MANIFEST], "report": published[_REPORT]}
+        cold = [float(a["elapsed_seconds"]) for a in audits if a["extraction_phase"] == "cold"]
+        warm = [float(a["elapsed_seconds"]) for a in audits if a["extraction_phase"] == "warm"]
+        cuda_peaks = [float(a["cuda_peak_bytes"]) for a in audits if "cuda_peak_bytes" in a]
+        manifest: dict[str, Any] = {"artifact_kind": _ARTIFACT_KIND, "schema_version": _SCHEMA_VERSION, "feature_schema": list(PVAD_GATE_FEATURE_SCHEMA), "feature_schema_sha256": _schema_digest(), "digest_algorithms": {"feature_schema_sha256": "sha256(newline-joined ordered schema names with trailing newline)", "records_sha256": "sha256(UTF-8 canonical JSONL bytes)", "per_id_record_sha256": "sha256(UTF-8 canonical JSON record bytes)", "joined_state_sha256": "sha256(UTF-8 canonical JSON)"}, "coverage": {"selected": {"count": len(selected), "ids": selected, "id_sha256": _sha256(_canonical(selected).encode())}, "source": {"count": len(raw), "ids": sorted(raw, key=_id_key), "id_sha256": _sha256(_canonical(sorted(raw, key=_id_key)).encode())}}, "source": {"jsonl_sha256": source_digests}, "model": model, "runtime_config": asdict(config), "runtime_config_sha256": config_digest, "provider": config.onnx_provider, "device": config.ecapa_device, "environment": {"python": sys.version.split()[0], "platform": platform.platform(), "observed_dependencies": _observed_dependencies()}, "reuse": {"reused": len(existing), "new": new_count}, "timing": {"cold_elapsed_seconds": _percentiles(cold), "warm_elapsed_seconds": _percentiles(warm), "rtf": _percentiles([float(a["rtf"]) for a in audits]), "peak_rss_delta_bytes": _percentiles([float(a["peak_rss_delta_bytes"]) for a in audits]), "cuda_peak_bytes": _percentiles(cuda_peaks)}, "parity": parity, "limit": {"value": limit, "canonical": limit is None, "reason": None if limit is None else "explicit noncanonical partial cache"}, "records_sha256": _sha256(feature_text.encode()), "per_id_record_sha256": {sample_id: _sha256(line.encode()) for sample_id, line in zip(selected, lines)}, "joined_state_sha256": _sha256(_canonical({sample_id: expected[sample_id] for sample_id in selected}).encode())}
+        if cuda:
+            manifest["cuda"] = {**cuda.evidence(), "peak_bytes": _percentiles(cuda_peaks)}
+        report = f"# FireRed pVAD Cache\n\n- Selected IDs: {len(selected)}\n- New records: {new_count}\n- Reused records: {len(existing)}\n- Parity: {parity['status']}\n"
+        return {"features": path for name, path in publish_text_package(output_root, _CONTRACT, {_FEATURES: feature_text, _MANIFEST: _canonical(manifest) + "\n", _REPORT: report}).items() if name == _FEATURES} | {"manifest": output_root / _MANIFEST, "report": output_root / _REPORT}
     finally:
         _unlock(lock, lock_identity)

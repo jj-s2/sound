@@ -56,8 +56,9 @@ class FakeRuntime:
     fail_id: str | None = None
     nonfinite = False
 
-    def __init__(self, _paths: FireRedModelPaths, *, config: object) -> None:
+    def __init__(self, _paths: FireRedModelPaths, *, config: object, cuda_peak_bytes: object = None) -> None:
         self.config = config
+        self.cuda_peak_bytes = cuda_peak_bytes
         self.calls: list[tuple[str, Path, Path]] = []
         FakeRuntime.instances.append(self)
 
@@ -68,7 +69,10 @@ class FakeRuntime:
         values = OrderedDict((name, float(index + 1)) for index, name in enumerate(PVAD_GATE_FEATURE_SCHEMA))
         if self.nonfinite:
             values[PVAD_GATE_FEATURE_SCHEMA[0]] = math.nan
-        return PvadUtteranceFeatures(sample_id, values, {"elapsed_seconds": 1.0, "audio_seconds": 2.0, "rtf": 0.5, "peak_rss_delta_bytes": 3, "extraction_phase": "cold", "onnx_provider": "CPUExecutionProvider", "ecapa_device": "cpu"})
+        audit = {"elapsed_seconds": 1.0, "audio_seconds": 2.0, "rtf": 0.5, "peak_rss_delta_bytes": 3, "dropped_tail_samples": 0, "extraction_phase": "cold", "onnx_provider": "CPUExecutionProvider", "ecapa_device": self.config.ecapa_device}
+        if self.cuda_peak_bytes is not None:
+            audit["cuda_peak_bytes"] = self.cuda_peak_bytes()
+        return PvadUtteranceFeatures(sample_id, values, audit)
 
 
 @pytest.fixture(autouse=True)
@@ -161,7 +165,7 @@ def test_resume_reuse_is_exactly_once_and_digest_mismatch_fails(tmp_path: Path) 
     assert sum(len(instance.calls) for instance in FakeRuntime.instances) == 2
     call(root, model, tmp_path)
     assert sum(len(instance.calls) for instance in FakeRuntime.instances) == 2
-    resume = next((tmp_path / "resume").glob("*.json"))
+    resume = next(next(path for path in (tmp_path / "resume").iterdir() if path.is_dir()).glob("*.json"))
     record = json.loads(resume.read_text(encoding="utf-8"))
     record["wake_sha256"] = "0" * 64
     resume.write_text(_json(record) + "\n", encoding="utf-8")
@@ -236,3 +240,80 @@ def test_cli_defaults_are_repo_anchored_and_help_is_lightweight(monkeypatch: pyt
     assert args.output_root == module.REPO_ROOT / "output" / "r11_e2_firered_cache"
     with pytest.raises(SystemExit, match="0"):
         parser.parse_args(["--help"])
+
+
+class FakeCudaAudit:
+    def __init__(self) -> None:
+        self.resets = 0
+
+    def reset_peak(self) -> None:
+        self.resets += 1
+
+    def peak_bytes(self) -> int:
+        return 42
+
+    def evidence(self) -> dict[str, str]:
+        return {"cuda_device_name": "fake cuda", "cuda_driver_version": "fake-driver", "cuda_runtime_version": "fake-runtime"}
+
+
+def test_cpu_cuda_share_context_namespaced_resume_and_cuda_requires_cpu_parity(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from xh202615 import pvad_cache
+
+    root, model, resume = bundle(tmp_path), fake_model(tmp_path), tmp_path / "resume"
+    cpu = build_pvad_cache(root, model, tmp_path / "cpu" / "out", resume_root=resume, ecapa_device="cpu", limit=2)
+    with pytest.raises(ValueError, match="parity"):
+        build_pvad_cache(root, model, tmp_path / "cuda-no-reference", resume_root=resume, ecapa_device="cuda:0", limit=2)
+    adapter = FakeCudaAudit()
+    monkeypatch.setattr(pvad_cache, "_cuda_audit_adapter", lambda _device: adapter)
+    cuda = build_pvad_cache(root, model, tmp_path / "cuda", resume_root=resume, ecapa_device="cuda:0", limit=2, parity_reference=cpu["features"])
+    assert len([child for child in resume.iterdir() if child.is_dir()]) == 2
+    manifest = json.loads(cuda["manifest"].read_text(encoding="utf-8"))
+    assert manifest["parity"]["passed"] is True
+    assert manifest["cuda"]["peak_bytes"]["max"] == 42
+    assert adapter.resets == 2
+
+
+def test_resume_rejects_extra_label_and_poisoned_audit_before_runtime(tmp_path: Path) -> None:
+    root, model = bundle(tmp_path), fake_model(tmp_path)
+    call(root, model, tmp_path)
+    resume = next(path for path in (tmp_path / "resume").iterdir() if path.is_dir())
+    record_path = next(resume.glob("*.json"))
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["label"] = "positive"
+    record_path.write_text(_json(record) + "\n", encoding="utf-8")
+    before = sum(len(instance.calls) for instance in FakeRuntime.instances)
+    with pytest.raises(ValueError, match="resume"):
+        call(root, model, tmp_path)
+    assert sum(len(instance.calls) for instance in FakeRuntime.instances) == before
+
+
+def test_forged_parity_and_foreign_output_fail_before_runtime(tmp_path: Path) -> None:
+    root, model = bundle(tmp_path), fake_model(tmp_path)
+    forged = tmp_path / "forged"
+    forged.mkdir()
+    (forged / "pvad_features.jsonl").write_text("", encoding="utf-8")
+    before = sum(len(instance.calls) for instance in FakeRuntime.instances)
+    with pytest.raises(ValueError, match="parity"):
+        build_pvad_cache(root, model, tmp_path / "cuda", resume_root=tmp_path / "resume", ecapa_device="cuda", parity_reference=forged / "pvad_features.jsonl")
+    assert sum(len(instance.calls) for instance in FakeRuntime.instances) == before
+    foreign = tmp_path / "out"
+    foreign.mkdir()
+    (foreign / "foreign").write_text("keep", encoding="utf-8")
+    with pytest.raises(ValueError, match="recognizable"):
+        call(root, model, tmp_path)
+    assert sum(len(instance.calls) for instance in FakeRuntime.instances) == before
+
+
+def test_owned_interrupted_temp_is_quarantined_but_foreign_temp_fails(tmp_path: Path) -> None:
+    root, model = bundle(tmp_path), fake_model(tmp_path)
+    call(root, model, tmp_path)
+    namespace = next(path for path in (tmp_path / "resume").iterdir() if path.is_dir())
+    record = next(namespace.glob("*.json"))
+    owned = namespace / f".{record.name}.{'a' * 16}.tmp"
+    owned.write_bytes(record.read_bytes())
+    call(root, model, tmp_path)
+    assert not owned.exists()
+    foreign = namespace / ".not-ours.tmp"
+    foreign.write_text("foreign", encoding="utf-8")
+    with pytest.raises(ValueError, match="foreign resume"):
+        call(root, model, tmp_path)
