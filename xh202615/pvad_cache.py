@@ -19,7 +19,7 @@ from typing import Any, Mapping
 
 from .artifact_publish import ArtifactContract, _create_unique_staging, _directory_identity, _lexists, _rename_no_replace, _rename_no_replace_native, publish_text_package
 from .data import FIELD_ALIASES, load_split
-from .firered_model_assets import _RAW_SNAPSHOT_FILES, _REQUIRED_DEPENDENCY_VERSIONS, _UPSTREAM_IDENTITY, FireRedModelPaths, download_and_verify_model
+from .firered_model_assets import _EXPECTED_INPUTS, _EXPECTED_POSITIONAL_OUTPUTS, _RAW_SNAPSHOT_FILES, _REQUIRED_DEPENDENCY_VERSIONS, _UPSTREAM_IDENTITY, _ALLOWED_SYMBOLIC_DIMENSIONS, FireRedModelPaths, download_and_verify_model
 from .firered_pvad import PVAD_GATE_FEATURE_SCHEMA, FireRedPvadRuntime, PvadRuntimeConfig
 
 _ARTIFACT_KIND = "r11_e2_firered_cache"
@@ -223,15 +223,17 @@ def _validate_model_identity(model: object) -> dict[str, object]:
         raise ValueError("model identity disagrees with the pinned Task 2 contract")
     if not isinstance(onnx, Mapping) or set(onnx) != {"sample_rate_hz", "frame_samples", "probability_output_index", "mel_state_output_index", "gru_state_output_index", "inputs", "outputs"} or {key: onnx[key] for key in ("sample_rate_hz", "frame_samples", "probability_output_index", "mel_state_output_index", "gru_state_output_index")} != {"sample_rate_hz": 16000, "frame_samples": 160, "probability_output_index": 1, "mel_state_output_index": 2, "gru_state_output_index": 3}:
         raise ValueError("model ONNX contract is invalid")
-    inputs = [{"name": name, "type": "tensor(float)", "shape": list(shape)} for name, shape in (("input_audio", (1, 160)), ("spkemb", (1, 192)), ("mel_buffer", (1, 80, 15)), ("gru_buffer", (2, 1, 256)))]
+    inputs = [{"name": name, "type": type_, "shape": list(shape)} for name, type_, shape in _EXPECTED_INPUTS]
     if onnx["inputs"] != inputs or not isinstance(onnx["outputs"], list) or len(onnx["outputs"]) < 4:
         raise ValueError("model ONNX contract is invalid")
+    if len({input_['name'] for input_ in onnx["inputs"]}) != len(onnx["inputs"]):
+        raise ValueError("model ONNX input names must be unique")
     for output in onnx["outputs"]:
-        if not isinstance(output, Mapping) or set(output) != {"name", "type", "shape"} or not isinstance(output["name"], str) or not output["name"] or not isinstance(output["type"], str) or not output["type"] or not isinstance(output["shape"], list) or any(type(item) is not int for item in output["shape"]):
+        if not isinstance(output, Mapping) or set(output) != {"name", "type", "shape"} or not isinstance(output["name"], str) or not output["name"] or not isinstance(output["type"], str) or not output["type"] or not isinstance(output["shape"], list) or any((type(item) is not int and item not in _ALLOWED_SYMBOLIC_DIMENSIONS) for item in output["shape"]):
             raise ValueError("model ONNX output domain is invalid")
     if len({output["name"] for output in onnx["outputs"]}) != len(onnx["outputs"]):
         raise ValueError("model ONNX output names must be unique")
-    if [(onnx["outputs"][index]["type"], onnx["outputs"][index]["shape"]) for index in (1, 2, 3)] != [("tensor(float)", [1, 1]), ("tensor(float)", [1, 80, 15]), ("tensor(float)", [2, 1, 256])]:
+    if not all((onnx["outputs"][index]["type"], onnx["outputs"][index]["shape"]) == (expected_type, list(expected_shape)) for index, (_, expected_type, expected_shape) in _EXPECTED_POSITIONAL_OUTPUTS.items()):
         raise ValueError("model ONNX output contract is invalid")
     result = dict(model)
     if result["identity_sha256"] != _digest({key: result[key] for key in result if key != "identity_sha256"}):

@@ -53,7 +53,7 @@ def fake_model(tmp_path: Path) -> FireRedModelPaths:
         aggregate_hash.update(name.encode("utf-8"))
         aggregate_hash.update(b"\0")
         aggregate_hash.update(bytes.fromhex(raw_sha256[name]))
-    onnx = {"sample_rate_hz": 16000, "frame_samples": 160, "probability_output_index": 1, "mel_state_output_index": 2, "gru_state_output_index": 3, "inputs": [{"name": name, "type": "tensor(float)", "shape": list(shape)} for name, shape in (("input_audio", (1, 160)), ("spkemb", (1, 192)), ("mel_buffer", (1, 80, 15)), ("gru_buffer", (2, 1, 256)))], "outputs": [{"name": name, "type": "tensor(float)", "shape": list(shape)} for name, shape in (("output", (1, 1)), ("prob", (1, 1)), ("mel_buffer_out", (1, 80, 15)), ("gru_buffer_out", (2, 1, 256)))]}
+    onnx = {"sample_rate_hz": 16000, "frame_samples": 160, "probability_output_index": 1, "mel_state_output_index": 2, "gru_state_output_index": 3, "inputs": [{"name": name, "type": type_, "shape": list(shape)} for name, type_, shape in (("input_audio", "tensor(float)", ("batch_size", 160)), ("spkemb", "tensor(float)", ("batch_size", 192)), ("mel_buffer", "tensor(float)", ("batch_size", 80, 15)), ("gru_buffer", "tensor(float)", (2, "batch_size", 256)))], "outputs": [{"name": name, "type": "tensor(float)", "shape": list(shape)} for name, shape in (("output", (1, 1)), ("prob", ("batch_size", "Iflinear_out_dim_1")), ("mel_buffer_out", ("batch_size", 80, 15)), ("gru_buffer_out", (2, "batch_size", 256)))]}
     manifest.write_text(_json({"artifact_kind": "firered_model_assets", "schema_version": "v1", "aggregate_sha256": aggregate_hash.hexdigest(), "raw_sha256": raw_sha256, "upstream": _UPSTREAM_IDENTITY, "onnx": onnx, "required_dependency_versions": _REQUIRED_DEPENDENCY_VERSIONS}), encoding="utf-8")
     return FireRedModelPaths(root, root / "pvad.onnx", root / "ecapa", manifest)
 
@@ -370,6 +370,46 @@ def test_manifest_publishes_per_id_audio_model_dependencies_and_recomputed_schem
     assert manifest["model"]["required_dependency_versions"] == parsed["required_dependency_versions"]
     assert {"onnxruntime-gpu", "torchaudio", "hyperpyyaml", "PyYAML"} <= set(manifest["environment"]["observed_dependencies"])
     assert pvad_cache._schema_digest() == "610c7e711fda490405a66a01e5ca6e7b01bf230c00333d891ebbaf20140e270f"
+
+
+def test_model_identity_accepts_official_symbolic_onnx_manifest(tmp_path: Path) -> None:
+    from xh202615 import pvad_cache
+
+    model = fake_model(tmp_path)
+    identity = pvad_cache._model_identity(model)
+    identity["identity_sha256"] = pvad_cache._digest(identity)
+
+    validated = pvad_cache._validate_model_identity(identity)
+
+    assert validated["onnx"] == json.loads(model.manifest.read_text(encoding="utf-8"))["onnx"]
+    assert validated["onnx"]["inputs"][0]["shape"] == ["batch_size", 160]
+    assert validated["onnx"]["outputs"][1]["shape"] == ["batch_size", "Iflinear_out_dim_1"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        ("input_audio", ["unexpected_batch", 160]),
+        ("input_audio", [1, 160]),
+        ("prob", ["batch_size", "unexpected_output"]),
+        ("prob", [1, 1]),
+    ],
+)
+def test_model_identity_rejects_nonofficial_symbolic_onnx_shapes(
+    tmp_path: Path, mutation: tuple[str, list[object]]
+) -> None:
+    from xh202615 import pvad_cache
+
+    model = fake_model(tmp_path)
+    identity = pvad_cache._model_identity(model)
+    name, shape = mutation
+    records = identity["onnx"]["inputs"] + identity["onnx"]["outputs"]
+    record = next(record for record in records if record["name"] == name)
+    record["shape"] = shape
+    identity["identity_sha256"] = pvad_cache._digest(identity)
+
+    with pytest.raises(ValueError, match="ONNX"):
+        pvad_cache._validate_model_identity(identity)
 
 
 def test_incomplete_or_digest_forged_package_is_not_a_parity_reference(tmp_path: Path) -> None:
