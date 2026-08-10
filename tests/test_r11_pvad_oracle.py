@@ -5,14 +5,17 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+from dataclasses import asdict
 
 import pytest
 import numpy as np
 from unittest.mock import patch
 
-from xh202615.firered_pvad import PVAD_GATE_FEATURE_SCHEMA
+from xh202615.firered_model_assets import _RAW_SNAPSHOT_FILES, _REQUIRED_DEPENDENCY_VERSIONS, _UPSTREAM_IDENTITY
+from xh202615.firered_pvad import PVAD_GATE_FEATURE_SCHEMA, PvadRuntimeConfig
+from xh202615 import pvad_cache
 from xh202615.r10_selector import CandidateRow
-from xh202615.r11_gate_oracle import GATE_FEATURE_SCHEMA
+from xh202615.r11_gate_oracle import GATE_FEATURE_SCHEMA, build_gate_feature_matrix
 from xh202615.r11_pvad_oracle import (
     E0_FITTING_FEATURE_SCHEMA,
     PVAD_FITTING_FEATURE_SCHEMA,
@@ -30,6 +33,44 @@ def _refresh_record_digests(cache: list[dict], manifest: dict) -> None:
     lines = [json.dumps(record, ensure_ascii=False, separators=(",", ":")) for record in cache]
     manifest["records_sha256"] = hashlib.sha256(("\n".join(lines) + "\n").encode()).hexdigest()
     manifest["per_id_record_sha256"] = {record["id"]: hashlib.sha256(line.encode()).hexdigest() for record, line in zip(cache, lines)}
+
+
+def _full_cpu_manifest(cache: list[dict]) -> dict:
+    """Build a realistic canonical Task 4 CPU manifest for the oracle boundary."""
+    ids = [record["id"] for record in cache]
+    config = asdict(PvadRuntimeConfig())
+    raw = {name: hashlib.sha256(name.encode()).hexdigest() for name in _RAW_SNAPSHOT_FILES}
+    aggregate = hashlib.sha256()
+    for name in sorted(raw):
+        aggregate.update(name.encode())
+        aggregate.update(b"\0")
+        aggregate.update(bytes.fromhex(raw[name]))
+    onnx = {
+        "sample_rate_hz": 16000, "frame_samples": 160,
+        "probability_output_index": 1, "mel_state_output_index": 2,
+        "gru_state_output_index": 3,
+        "inputs": [{"name": name, "type": "tensor(float)", "shape": list(shape)} for name, shape in (("input_audio", (1, 160)), ("spkemb", (1, 192)), ("mel_buffer", (1, 80, 15)), ("gru_buffer", (2, 1, 256)))],
+        "outputs": [{"name": name, "type": "tensor(float)", "shape": list(shape)} for name, shape in (("output", (1, 1)), ("prob", (1, 1)), ("mel_buffer_out", (1, 80, 15)), ("gru_buffer_out", (2, 1, 256)))],
+    }
+    model = {"manifest_sha256": "1" * 64, "aggregate_sha256": aggregate.hexdigest(), "raw_sha256": raw, "upstream": _UPSTREAM_IDENTITY, "onnx": onnx, "required_dependency_versions": _REQUIRED_DEPENDENCY_VERSIONS}
+    model["identity_sha256"] = pvad_cache._digest(model)
+    audio = {sample_id: {"wake_sha256": hashlib.sha256((sample_id + "-wake").encode()).hexdigest(), "command_sha256": hashlib.sha256((sample_id + "-command").encode()).hexdigest()} for sample_id in ids}
+    source = {"jsonl_sha256": {"pos": "2" * 64, "neg": "3" * 64}, "per_id_audio_sha256": audio}
+    source["projection_sha256"] = pvad_cache._digest({"jsonl_sha256": source["jsonl_sha256"], "per_id_audio_sha256": audio})
+    coverage = {"selected": {"count": len(ids), "ids": ids, "id_sha256": _digest(ids)}, "source": {"count": len(ids), "ids": ids, "id_sha256": _digest(ids)}}
+    lines = [json.dumps(record, ensure_ascii=False, separators=(",", ":")) for record in cache]
+    percentile = {"count": len(ids), "p50": 1.0, "p95": 1.0, "max": 1.0}
+    return {
+        "artifact_kind": "r11_e2_firered_cache", "schema_version": "v1", "feature_schema": list(PVAD_GATE_FEATURE_SCHEMA),
+        "feature_schema_sha256": pvad_cache._schema_digest(),
+        "digest_algorithms": {"feature_schema_sha256": "sha256(UTF-8 ordered schema names joined and terminated by literal backslash-n bytes)", "records_sha256": "sha256(UTF-8 canonical JSONL bytes)", "per_id_record_sha256": "sha256(UTF-8 canonical JSON record bytes)", "joined_state_sha256": "sha256(UTF-8 canonical JSON)", "source_audio_sha256": "sha256(raw wake/command audio bytes)", "source_projection_sha256": "sha256(UTF-8 canonical JSON source projection)", "model_sha256": "sha256(UTF-8 canonical JSON verified model identity)"},
+        "coverage": coverage, "source": source, "model": model, "runtime_config": config, "runtime_config_sha256": pvad_cache._digest(config),
+        "provider": "CPUExecutionProvider", "device": "cpu", "environment": {"python": "3.12.0", "platform": "test", "observed_dependencies": pvad_cache._observed_dependencies()},
+        "reuse": {"reused": 0, "new": len(ids)}, "timing": {"cold_elapsed_seconds": percentile, "warm_elapsed_seconds": {"count": 0, "p50": None, "p95": None, "max": None}, "rtf": percentile, "peak_rss_delta_bytes": percentile, "cuda_peak_bytes": {"count": 0, "p50": None, "p95": None, "max": None}},
+        "parity": {"status": "not-run", "passed": None, "max_abs_feature_delta": None}, "limit": {"value": None, "canonical": True, "reason": None},
+        "records_sha256": hashlib.sha256(("\n".join(lines) + "\n").encode()).hexdigest(), "per_id_record_sha256": {record["id"]: hashlib.sha256(line.encode()).hexdigest() for record, line in zip(cache, lines)},
+        "joined_state_sha256": pvad_cache._digest({sample_id: pvad_cache._resume_expected(sample_id, audio[sample_id], model, config) for sample_id in ids}),
+    }
 
 
 def _fixture() -> tuple[list[CandidateRow], dict[str, str | None], dict[str, str], list[dict], dict]:
@@ -68,23 +109,7 @@ def _fixture() -> tuple[list[CandidateRow], dict[str, str | None], dict[str, str
                 features[f"ema_transitions_ge_{threshold}"] = 0
             cache.append({"id": sid, "features": features})
     ids = [row.id for row in rows]
-    lines = [json.dumps(record, ensure_ascii=False, separators=(",", ":")) for record in cache]
-    manifest = {
-        "artifact_kind": "r11_e2_firered_cache",
-        "schema_version": "v1",
-        "feature_schema": list(PVAD_GATE_FEATURE_SCHEMA),
-        "feature_schema_sha256": hashlib.sha256((r"\n".join(PVAD_GATE_FEATURE_SCHEMA) + r"\n").encode("utf-8")).hexdigest(),
-        "digest_algorithms": {},
-        "coverage": {"selected": {"ids": ids, "count": len(ids), "id_sha256": _digest(ids)}},
-        "joined_state_sha256": "a" * 64,
-        "records_sha256": hashlib.sha256(("\n".join(lines) + "\n").encode()).hexdigest(),
-        "per_id_record_sha256": {record["id"]: hashlib.sha256(line.encode()).hexdigest() for record, line in zip(cache, lines)},
-        "source": {"projection_sha256": "b" * 64},
-        "model": {"identity_sha256": "c" * 64},
-        "runtime_config": {}, "runtime_config_sha256": "d" * 64,
-        "provider": "CPUExecutionProvider", "device": "cpu", "environment": {},
-        "reuse": {}, "timing": {}, "parity": {}, "limit": {},
-    }
+    manifest = _full_cpu_manifest(cache)
     return rows, labels, groups, cache, manifest
 
 
@@ -185,6 +210,15 @@ def test_fused_representation_is_exact_frozen_e0_schema_and_score_banks_are_comp
         assert family["outer_threshold_grid"]
 
 
+def test_fused_e0_values_match_every_name_in_the_frozen_full_builder_vector() -> None:
+    rows, labels, groups, cache, manifest = _fixture()
+    row = rows[0]
+    rows[0] = CandidateRow(**{**row.__dict__, "audio_features": {"presence_score": 0.11, "enhanced_cosine": 0.22, "mixture_cosine": 0.33, "max_cosine": 0.44, "latency_ms": 55.0, "cmd_duration_sec": 6.6, "cmd_rms": 0.77}, "r3_text": "甲1", "primary_text": "乙22", "tse_text": "丙333"})
+    joined = join_pvad_e0_rows(rows, labels, groups, cache, manifest)
+    full = dict(zip(GATE_FEATURE_SCHEMA, build_gate_feature_matrix([rows[0]])[0].tolist()))
+    assert joined[0].e0 == {name: full[name] for name in E0_FITTING_FEATURE_SCHEMA}
+
+
 def test_reject_all_is_markerized_everywhere_and_is_json_safe() -> None:
     rows, labels, groups, cache, manifest = _fixture()
     for index, row in enumerate(rows):
@@ -228,10 +262,41 @@ def test_round2_distinct_r10_source_digests_and_legitimate_runtime_metadata_pass
     rows, labels, groups, cache, manifest = _fixture()
     for index, row in enumerate(rows):
         rows[index] = CandidateRow(**{**row.__dict__, "source_digest": hashlib.sha256(row.id.encode()).hexdigest()})
-    manifest["runtime_config"] = {"frame_samples": 160, "sample_rate": 16000}
-    manifest["model"]["onnx"] = {"frame_samples": 160, "spkemb_shape": [1, 192]}
-    manifest["model"]["identity_sha256"] = _digest({"onnx": manifest["model"]["onnx"]})
     assert len(join_pvad_e0_rows(rows, labels, groups, cache, manifest)) == len(rows)
+
+
+@pytest.mark.parametrize("mutation", ["runtime_digest", "runtime_config", "provider", "coverage", "reuse", "parity", "limit", "timing", "minimal_source", "minimal_model", "plural_private", "nested_private", "extra_top_level"])
+def test_complete_task4_manifest_contract_rejects_forged_domains(mutation: str) -> None:
+    rows, labels, groups, cache, manifest = _fixture()
+    if mutation == "runtime_digest":
+        manifest["runtime_config_sha256"] = "not-a-sha"
+    elif mutation == "runtime_config":
+        manifest["runtime_config"]["sample_rate"] = 123
+        manifest["runtime_config_sha256"] = pvad_cache._digest(manifest["runtime_config"])
+    elif mutation == "provider":
+        manifest["provider"] = "CUDAExecutionProvider"
+    elif mutation == "coverage":
+        manifest["coverage"]["source"]["ids"] = manifest["coverage"]["source"]["ids"][:-1]
+    elif mutation == "reuse":
+        manifest["reuse"] = {"reused": 99, "new": 0}
+    elif mutation == "parity":
+        manifest["parity"] = {"status": "passed", "passed": True, "max_abs_feature_delta": 1.0}
+    elif mutation == "limit":
+        manifest["limit"] = {"value": None, "canonical": "yes", "reason": None}
+    elif mutation == "timing":
+        manifest["timing"]["rtf"] = {"count": len(cache), "p50": None, "p95": None, "max": None}
+    elif mutation == "minimal_source":
+        manifest["source"] = {"projection_sha256": manifest["source"]["projection_sha256"]}
+    elif mutation == "minimal_model":
+        manifest["model"] = {"identity_sha256": manifest["model"]["identity_sha256"]}
+    elif mutation == "plural_private":
+        manifest["labels"] = ["SECRET"]
+    elif mutation == "nested_private":
+        manifest["environment"]["reference_transcript"] = "SECRET"
+    else:
+        manifest["unexpected"] = True
+    with pytest.raises(ValueError):
+        join_pvad_e0_rows(rows, labels, groups, cache, manifest)
 
 
 @pytest.mark.parametrize("mutation", ["inactive_run", "run_gt_span", "too_many_transitions"])

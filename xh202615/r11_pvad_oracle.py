@@ -11,7 +11,7 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -48,6 +48,30 @@ _TASK4_MANIFEST_KEYS = {
     "runtime_config_sha256", "provider", "device", "environment", "reuse",
     "timing", "parity", "limit", "records_sha256", "per_id_record_sha256",
     "joined_state_sha256",
+}
+_TASK4_DIGEST_ALGORITHMS = {
+    "feature_schema_sha256": "sha256(UTF-8 ordered schema names joined and terminated by literal backslash-n bytes)",
+    "records_sha256": "sha256(UTF-8 canonical JSONL bytes)",
+    "per_id_record_sha256": "sha256(UTF-8 canonical JSON record bytes)",
+    "joined_state_sha256": "sha256(UTF-8 canonical JSON)",
+    "source_audio_sha256": "sha256(raw wake/command audio bytes)",
+    "source_projection_sha256": "sha256(UTF-8 canonical JSON source projection)",
+    "model_sha256": "sha256(UTF-8 canonical JSON verified model identity)",
+}
+_TASK4_NESTED_KEYS = {
+    "coverage": {"selected", "source"},
+    "coverage.selected": {"count", "ids", "id_sha256"},
+    "coverage.source": {"count", "ids", "id_sha256"},
+    "source": {"jsonl_sha256", "per_id_audio_sha256", "projection_sha256"},
+    "source.jsonl_sha256": {"pos", "neg"},
+    "source.per_id_audio_sha256": None,
+    "model": {"manifest_sha256", "aggregate_sha256", "raw_sha256", "upstream", "onnx", "required_dependency_versions", "identity_sha256"},
+    "runtime_config": {"sample_rate", "frame_samples", "enrollment_cap_seconds", "minimum_audio_seconds", "ema_alpha", "onnx_provider", "ecapa_device"},
+    "environment": {"python", "platform", "observed_dependencies"},
+    "reuse": {"reused", "new"},
+    "parity": {"status", "passed", "max_abs_feature_delta"},
+    "limit": {"value", "canonical", "reason"},
+    "timing": {"cold_elapsed_seconds", "warm_elapsed_seconds", "rtf", "peak_rss_delta_bytes", "cuda_peak_bytes"},
 }
 
 
@@ -140,6 +164,86 @@ def _validate_features(value: object) -> dict[str, float]:
     return result
 
 
+def _validate_task4_manifest(manifest: Mapping[str, object], ids: list[str]) -> None:
+    """Apply Task 4's complete manifest-domain contract at the in-memory join."""
+    if set(manifest) != _TASK4_MANIFEST_KEYS and set(manifest) != _TASK4_MANIFEST_KEYS | {"cuda"}:
+        raise ValueError("pVAD cache manifest has an invalid exact top-level schema")
+    for name, keys in _TASK4_NESTED_KEYS.items():
+        value: object = manifest
+        for part in name.split("."):
+            if not isinstance(value, Mapping) or part not in value:
+                raise ValueError(f"pVAD cache manifest is missing {name}")
+            value = value[part]
+        if keys is not None and (not isinstance(value, Mapping) or set(value) != keys):
+            raise ValueError(f"pVAD cache manifest has an invalid {name} schema")
+    if manifest["digest_algorithms"] != _TASK4_DIGEST_ALGORITHMS:
+        raise ValueError("pVAD cache manifest digest algorithms disagree")
+    source = manifest["source"]
+    assert isinstance(source, Mapping)
+    audio = source["per_id_audio_sha256"]
+    if not isinstance(audio, Mapping) or set(audio) != set(ids):
+        raise ValueError("pVAD source audio coverage disagrees")
+    for item in audio.values():
+        if not isinstance(item, Mapping) or set(item) != {"wake_sha256", "command_sha256"}:
+            raise ValueError("pVAD source audio schema disagrees")
+    source_projection = {"jsonl_sha256": source["jsonl_sha256"], "per_id_audio_sha256": audio}
+    if source["projection_sha256"] != _digest(source_projection):
+        raise ValueError("pVAD source projection digest disagrees")
+    from . import pvad_cache
+    config_value = manifest["runtime_config"]
+    if not isinstance(config_value, Mapping) or set(config_value) != {"sample_rate", "frame_samples", "enrollment_cap_seconds", "minimum_audio_seconds", "ema_alpha", "onnx_provider", "ecapa_device"}:
+        raise ValueError("pVAD runtime config is invalid")
+    try:
+        config = dict(config_value)
+        from .firered_pvad import PvadRuntimeConfig
+        config = asdict(PvadRuntimeConfig(**config))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("pVAD runtime config is invalid") from exc
+    if config["onnx_provider"] != "CPUExecutionProvider" and not config["onnx_provider"].endswith("ExecutionProvider"):
+        raise ValueError("pVAD runtime provider is invalid")
+    if manifest["runtime_config_sha256"] != _digest(config) or manifest["provider"] != config["onnx_provider"] or manifest["device"] != config["ecapa_device"]:
+        raise ValueError("pVAD runtime config identity disagrees")
+    try:
+        pvad_cache._validate_model_identity(manifest["model"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("pVAD model identity is invalid") from exc
+    environment = manifest["environment"]
+    if not isinstance(environment["python"], str) or not environment["python"] or not isinstance(environment["platform"], str) or not environment["platform"] or set(environment["observed_dependencies"]) != set(pvad_cache._observed_dependencies()) or any(value is not None and not isinstance(value, str) for value in environment["observed_dependencies"].values()):
+        raise ValueError("pVAD environment domain is invalid")
+    try:
+        # Task 4 owns the complete domain contract, including CUDA manifests.
+        pvad_cache._validate_manifest_domains(manifest, ids)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("pVAD cache manifest domains are invalid") from exc
+    reuse = manifest["reuse"]
+    if any(type(value) is not int or value < 0 for value in reuse.values()) or sum(reuse.values()) != len(ids):
+        raise ValueError("pVAD reuse domain is invalid")
+    parity = manifest["parity"]
+    if parity not in ({"status": "not-run", "passed": None, "max_abs_feature_delta": None},) and not (parity["status"] == "passed" and parity["passed"] is True and type(parity["max_abs_feature_delta"]) in (int, float) and math.isfinite(parity["max_abs_feature_delta"]) and 0 <= parity["max_abs_feature_delta"] <= 1e-4):
+        raise ValueError("pVAD parity domain is invalid")
+    limit = manifest["limit"]
+    source_ids = manifest["coverage"]["source"]["ids"]
+    if set(limit) != {"value", "canonical", "reason"} or not ((limit["value"] is None and limit["canonical"] is True and limit["reason"] is None and ids == source_ids) or (type(limit["value"]) is int and limit["value"] > 0 and limit["canonical"] is False and limit["reason"] == "explicit noncanonical partial cache" and ids == source_ids[:min(limit["value"], len(source_ids))])):
+        raise ValueError("pVAD limit domain is invalid")
+    timing = manifest["timing"]
+    cuda_expected = config["ecapa_device"].startswith("cuda")
+    for name, percentile in timing.items():
+        count = percentile["count"]
+        expected = len(ids) if name in {"rtf", "peak_rss_delta_bytes"} or (name == "cuda_peak_bytes" and cuda_expected) else 0 if name == "cuda_peak_bytes" else None
+        if type(count) is not int or count < 0 or (expected is not None and count != expected) or (count == 0 and any(percentile[key] is not None for key in ("p50", "p95", "max"))) or (count > 0 and any(type(percentile[key]) not in (int, float) or not math.isfinite(percentile[key]) or percentile[key] < 0 for key in ("p50", "p95", "max"))) or (count > 0 and not percentile["p50"] <= percentile["p95"] <= percentile["max"]):
+            raise ValueError("pVAD timing domain is invalid")
+    if timing["cold_elapsed_seconds"]["count"] + timing["warm_elapsed_seconds"]["count"] != len(ids):
+        raise ValueError("pVAD timing coverage disagrees")
+    if manifest["joined_state_sha256"] != _digest({sample_id: pvad_cache._resume_expected(sample_id, audio[sample_id], manifest["model"], config) for sample_id in ids}):
+        raise ValueError("pVAD joined-state identity disagrees")
+    selected = manifest["coverage"]["selected"]
+    source_coverage = manifest["coverage"]["source"]
+    if selected["ids"] != ids or selected["count"] != len(ids) or selected["id_sha256"] != _digest(ids) or not set(ids) <= set(source_coverage["ids"]):
+        raise ValueError("pVAD cache coverage disagrees with joined IDs")
+    if source_coverage["count"] != len(source_coverage["ids"]) or source_coverage["id_sha256"] != _digest(source_coverage["ids"]):
+        raise ValueError("pVAD source coverage digest disagrees")
+
+
 @dataclass(frozen=True)
 class JoinedPvadRow:
     id: str
@@ -175,9 +279,10 @@ def join_pvad_e0_rows(
         raise ValueError("pVAD cache ID coverage has missing or extra IDs")
     if not isinstance(cache_manifest, Mapping):
         raise ValueError("pVAD cache manifest is required")
-    if not _TASK4_MANIFEST_KEYS <= set(cache_manifest) or cache_manifest.get("artifact_kind") != "r11_e2_firered_cache" or cache_manifest.get("schema_version") != "v1":
+    if cache_manifest.get("artifact_kind") != "r11_e2_firered_cache" or cache_manifest.get("schema_version") != "v1":
         raise ValueError("pVAD cache manifest is not the Task 4 identity contract")
     _reject_private(cache_manifest)
+    _validate_task4_manifest(cache_manifest, [row.id for row in rows])
     if cache_manifest.get("feature_schema") != list(PVAD_GATE_FEATURE_SCHEMA):
         raise ValueError("pVAD cache feature schema disagrees")
     expected_schema_digest = hashlib.sha256((r"\n".join(PVAD_GATE_FEATURE_SCHEMA) + r"\n").encode("utf-8")).hexdigest()
@@ -197,16 +302,10 @@ def join_pvad_e0_rows(
     if not isinstance(ids, list) or ids != [row.id for row in rows] or selected.get("count") != len(ids) or selected.get("id_sha256") != _digest(ids):
         raise ValueError("pVAD cache manifest coverage/order/digest disagrees")
     _sha(cache_manifest.get("joined_state_sha256"), "pVAD cache joined-state identity")
-    source = cache_manifest.get("source")
-    model = cache_manifest.get("model")
-    if not isinstance(source, Mapping) or not isinstance(model, Mapping):
-        raise ValueError("pVAD cache source/model identity is invalid")
-    source_digest = _sha(source.get("projection_sha256"), "pVAD source projection")
-    model_digest = _sha(model.get("identity_sha256"), "pVAD model identity")
-    if {"jsonl_sha256", "per_id_audio_sha256"} <= set(source) and source_digest != _digest({"jsonl_sha256": source["jsonl_sha256"], "per_id_audio_sha256": source["per_id_audio_sha256"]}):
-        raise ValueError("pVAD source projection digest disagrees")
-    if len(model) > 1 and model_digest != _digest({key: value for key, value in model.items() if key != "identity_sha256"}):
-        raise ValueError("pVAD model identity digest disagrees")
+    source = cache_manifest["source"]
+    model = cache_manifest["model"]
+    source_digest = _sha(source["projection_sha256"], "pVAD source projection")
+    model_digest = _sha(model["identity_sha256"], "pVAD model identity")
     joined: list[JoinedPvadRow] = []
     for row in rows:
         group = groups[row.id]
@@ -214,7 +313,8 @@ def join_pvad_e0_rows(
             raise ValueError("wake_component group must be a nonempty string")
         # R10 candidate-text identity and pVAD audio/source identity are separate domains.
         _sha(row.source_digest, "canonical row source digest")
-        e0 = dict(zip(E0_FITTING_FEATURE_SCHEMA, build_gate_feature_matrix([row])[0].tolist()))
+        full_e0 = dict(zip(GATE_FEATURE_SCHEMA, build_gate_feature_matrix([row])[0].tolist()))
+        e0 = {name: full_e0[name] for name in E0_FITTING_FEATURE_SCHEMA}
         joined.append(JoinedPvadRow(row.id, group, int(labels[row.id] is not None), cache[row.id], e0, row.source_digest))
     return joined
 
