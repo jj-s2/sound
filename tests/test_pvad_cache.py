@@ -611,3 +611,64 @@ def test_context_rejects_forged_model_and_swapped_staging_is_preserved(tmp_path:
         pvad_cache._create_namespace(resume, target_name, clean_identity)
     assert (staging / "evidence").read_bytes() == foreign
     assert (moved / "context_identity.json").is_file()
+
+
+@pytest.mark.parametrize("mutation", ["ema", "limit", "environment", "duplicate-output", "empty-driver"])
+def test_package_rejects_noncanonical_nested_domains(tmp_path: Path, mutation: str) -> None:
+    from xh202615 import pvad_cache
+
+    root, model = bundle(tmp_path), fake_model(tmp_path)
+    package = call(root, model, tmp_path)
+    manifest = json.loads(package["manifest"].read_text(encoding="utf-8"))
+    if mutation == "ema":
+        manifest["runtime_config"]["ema_alpha"] = 0.7
+        manifest["runtime_config_sha256"] = pvad_cache._digest(manifest["runtime_config"])
+        manifest["joined_state_sha256"] = pvad_cache._digest({sample_id: pvad_cache._resume_expected(sample_id, manifest["source"]["per_id_audio_sha256"][sample_id], manifest["model"], manifest["runtime_config"]) for sample_id in manifest["coverage"]["selected"]["ids"]})
+    elif mutation == "limit":
+        manifest["limit"] = {"value": 1, "canonical": False, "reason": "explicit noncanonical partial cache"}
+    elif mutation == "environment":
+        manifest["environment"]["observed_dependencies"]["label"] = "secret"
+    elif mutation == "duplicate-output":
+        manifest["model"]["onnx"]["outputs"][0]["name"] = manifest["model"]["onnx"]["outputs"][1]["name"]
+        manifest["model"]["identity_sha256"] = pvad_cache._digest({key: value for key, value in manifest["model"].items() if key != "identity_sha256"})
+        manifest["joined_state_sha256"] = pvad_cache._digest({sample_id: pvad_cache._resume_expected(sample_id, manifest["source"]["per_id_audio_sha256"][sample_id], manifest["model"], manifest["runtime_config"]) for sample_id in manifest["coverage"]["selected"]["ids"]})
+    else:
+        cpu = call(root, model, tmp_path / "cpu")
+        manifest = json.loads(cpu["manifest"].read_text(encoding="utf-8"))
+        manifest["runtime_config"]["ecapa_device"] = "cuda"
+        manifest["runtime_config_sha256"] = pvad_cache._digest(manifest["runtime_config"])
+        manifest["device"] = "cuda"
+        manifest["parity"] = {"status": "passed", "passed": True, "max_abs_feature_delta": 0.0}
+        manifest["timing"]["cuda_peak_bytes"] = {"count": 2, "p50": 1, "p95": 1, "max": 1}
+        manifest["cuda"] = {"cuda_device_name": "fake", "cuda_runtime_version": "fake", "cuda_driver": {"status": "available", "value": ""}, "peak_bytes": manifest["timing"]["cuda_peak_bytes"]}
+        manifest["joined_state_sha256"] = pvad_cache._digest({sample_id: pvad_cache._resume_expected(sample_id, manifest["source"]["per_id_audio_sha256"][sample_id], manifest["model"], manifest["runtime_config"]) for sample_id in manifest["coverage"]["selected"]["ids"]})
+        package = cpu
+    _rewrite_manifest(package["manifest"], manifest)
+    with pytest.raises(ValueError):
+        pvad_cache._validate_package(package["features"].parent)
+
+
+def test_cpu_parity_package_is_recognized_and_staging_content_mutation_is_preserved(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from xh202615 import pvad_cache
+
+    root, model = bundle(tmp_path), fake_model(tmp_path)
+    reference = call(root, model, tmp_path / "reference")
+    package = call(root, model, tmp_path, parity_reference=reference["features"])
+    pvad_cache._validate_package(package["features"].parent)
+
+    identity = json.loads(next((tmp_path / "resume").glob("context-*/context_identity.json")).read_text(encoding="utf-8"))
+    target = "context-" + "f" * 64
+    staging = tmp_path / "resume" / f".{target}.staging.owned"
+    original = pvad_cache._rename_no_replace
+
+    def mutate_then_fail(source: Path, destination: Path) -> None:
+        if source == staging:
+            (staging / "foreign").write_bytes(b"preserve")
+            raise FileExistsError(destination)
+        original(source, destination)
+
+    monkeypatch.setattr(pvad_cache.secrets, "token_hex", lambda _size: "owned")
+    monkeypatch.setattr(pvad_cache, "_rename_no_replace", mutate_then_fail)
+    with pytest.raises(RuntimeError, match="cleanup"):
+        pvad_cache._create_namespace(tmp_path / "resume", target, identity)
+    assert (staging / "foreign").read_bytes() == b"preserve"

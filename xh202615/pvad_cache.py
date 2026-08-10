@@ -17,7 +17,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Mapping
 
-from .artifact_publish import ArtifactContract, _cleanup_owned_directory, _create_unique_staging, _rename_no_replace, publish_text_package
+from .artifact_publish import ArtifactContract, _create_unique_staging, _directory_identity, _lexists, _rename_no_replace, _rename_no_replace_native, publish_text_package
 from .data import FIELD_ALIASES, load_split
 from .firered_model_assets import _RAW_SNAPSHOT_FILES, _REQUIRED_DEPENDENCY_VERSIONS, _UPSTREAM_IDENTITY, FireRedModelPaths, download_and_verify_model
 from .firered_pvad import PVAD_GATE_FEATURE_SCHEMA, FireRedPvadRuntime, PvadRuntimeConfig
@@ -227,6 +227,8 @@ def _validate_model_identity(model: object) -> dict[str, object]:
     for output in onnx["outputs"]:
         if not isinstance(output, Mapping) or set(output) != {"name", "type", "shape"} or not isinstance(output["name"], str) or not output["name"] or not isinstance(output["type"], str) or not output["type"] or not isinstance(output["shape"], list) or any(type(item) is not int for item in output["shape"]):
             raise ValueError("model ONNX output domain is invalid")
+    if len({output["name"] for output in onnx["outputs"]}) != len(onnx["outputs"]):
+        raise ValueError("model ONNX output names must be unique")
     if [(onnx["outputs"][index]["type"], onnx["outputs"][index]["shape"]) for index in (1, 2, 3)] != [("tensor(float)", [1, 1]), ("tensor(float)", [1, 80, 15]), ("tensor(float)", [2, 1, 256])]:
         raise ValueError("model ONNX output contract is invalid")
     result = dict(model)
@@ -304,7 +306,7 @@ def _validate_package(root: Path, selected: list[str] | None = None, *, cpu_only
         _sha256_value(model["manifest_sha256"])
         _sha256_value(model["aggregate_sha256"])
         model = _validate_model_identity(model)
-        if not isinstance(environment["python"], str) or not environment["python"] or not isinstance(environment["platform"], str) or not environment["platform"] or any(not isinstance(key, str) or not key or value is not None and not isinstance(value, str) for key, value in environment["observed_dependencies"].items()):
+        if not isinstance(environment["python"], str) or not environment["python"] or not isinstance(environment["platform"], str) or not environment["platform"] or set(environment["observed_dependencies"]) != set(_observed_dependencies()) or any(value is not None and not isinstance(value, str) for value in environment["observed_dependencies"].values()):
             raise ValueError("environment domain is invalid")
         config = _runtime_config(manifest.get("runtime_config"))
     except (AttributeError, ValueError):
@@ -336,11 +338,14 @@ def _validate_manifest_domains(manifest: Mapping[str, object], ids: list[str]) -
     reuse, parity, limit, timing = manifest["reuse"], manifest["parity"], manifest["limit"], manifest["timing"]
     config = _runtime_config(manifest["runtime_config"])
     cuda = config["ecapa_device"].startswith("cuda")
-    expected_parity = {"status": "passed", "passed": True} if cuda else {"status": "not-run", "passed": None}
-    if not isinstance(reuse, Mapping) or set(reuse) != {"reused", "new"} or any(type(value) is not int or value < 0 for value in reuse.values()) or sum(reuse.values()) != len(ids) or not isinstance(parity, Mapping) or set(parity) != {"status", "passed", "max_abs_feature_delta"} or {key: parity[key] for key in ("status", "passed")} != expected_parity or (cuda and type(parity["max_abs_feature_delta"]) not in (int, float)) or (not cuda and parity["max_abs_feature_delta"] is not None) or not isinstance(limit, Mapping) or set(limit) != {"value", "canonical", "reason"} or type(limit["canonical"]) is not bool or (limit["value"] is None and (not limit["canonical"] or limit["reason"] is not None)) or (limit["value"] is not None and (limit["canonical"] or type(limit["value"]) is not int or limit["value"] <= 0 or limit["reason"] != "explicit noncanonical partial cache")) or not isinstance(timing, Mapping) or set(timing) != {"cold_elapsed_seconds", "warm_elapsed_seconds", "rtf", "peak_rss_delta_bytes", "cuda_peak_bytes"}:
+    canonical_config = asdict(_config(config["ecapa_device"]))
+    valid_parity = isinstance(parity, Mapping) and (parity == {"status": "not-run", "passed": None, "max_abs_feature_delta": None} or (parity.get("status") == "passed" and parity.get("passed") is True and type(parity.get("max_abs_feature_delta")) in (int, float) and math.isfinite(parity["max_abs_feature_delta"]) and 0 <= parity["max_abs_feature_delta"] <= 1e-4))
+    coverage = manifest["coverage"]
+    source_ids = coverage["source"]["ids"]
+    expected_ids = source_ids if isinstance(limit, Mapping) and limit.get("value") is None else source_ids[: min(limit["value"], len(source_ids))] if isinstance(limit, Mapping) and type(limit.get("value")) is int else None
+    valid_limit = isinstance(limit, Mapping) and set(limit) == {"value", "canonical", "reason"} and ((limit["value"] is None and limit["canonical"] is True and limit["reason"] is None and ids == source_ids) or (type(limit["value"]) is int and limit["value"] > 0 and limit["canonical"] is False and limit["reason"] == "explicit noncanonical partial cache" and ids == expected_ids))
+    if config != canonical_config or not isinstance(reuse, Mapping) or set(reuse) != {"reused", "new"} or any(type(value) is not int or value < 0 for value in reuse.values()) or sum(reuse.values()) != len(ids) or not isinstance(parity, Mapping) or set(parity) != {"status", "passed", "max_abs_feature_delta"} or not valid_parity or (cuda and parity["status"] != "passed") or not valid_limit or not isinstance(timing, Mapping) or set(timing) != {"cold_elapsed_seconds", "warm_elapsed_seconds", "rtf", "peak_rss_delta_bytes", "cuda_peak_bytes"}:
         raise ValueError("parity/output root manifest domain is invalid")
-    if cuda and (not math.isfinite(parity["max_abs_feature_delta"]) or parity["max_abs_feature_delta"] < 0 or parity["max_abs_feature_delta"] > 1e-4):
-        raise ValueError("parity/output root CUDA parity domain is invalid")
     for name, percentile in timing.items():
         expected_count = len(ids) if name in {"rtf", "peak_rss_delta_bytes"} or (name == "cuda_peak_bytes" and cuda) else None
         if not isinstance(percentile, Mapping) or set(percentile) != {"count", "p50", "p95", "max"} or type(percentile["count"]) is not int or percentile["count"] < 0 or (expected_count is not None and percentile["count"] != expected_count) or (name == "cuda_peak_bytes" and not cuda and percentile["count"] != 0) or (percentile["count"] == 0 and any(percentile[key] is not None for key in ("p50", "p95", "max"))) or (percentile["count"] > 0 and any(type(percentile[key]) not in (int, float) or not math.isfinite(percentile[key]) or percentile[key] < 0 for key in ("p50", "p95", "max"))) or (percentile["count"] > 0 and not percentile["p50"] <= percentile["p95"] <= percentile["max"]):
@@ -351,7 +356,7 @@ def _validate_manifest_domains(manifest: Mapping[str, object], ids: list[str]) -
         raise ValueError("parity/output root CUDA evidence is invalid")
     if cuda:
         evidence = manifest["cuda"]
-        if not isinstance(evidence, Mapping) or set(evidence) != {"cuda_device_name", "cuda_driver", "cuda_runtime_version", "peak_bytes"} or not isinstance(evidence["cuda_device_name"], str) or not evidence["cuda_device_name"] or not isinstance(evidence["cuda_runtime_version"], str) or not evidence["cuda_runtime_version"] or not isinstance(evidence["cuda_driver"], Mapping) or set(evidence["cuda_driver"]) != {"status", "value"} or evidence["cuda_driver"].get("status") not in {"available", "unavailable"} or (evidence["cuda_driver"]["status"] == "available" and not isinstance(evidence["cuda_driver"]["value"], str)) or (evidence["cuda_driver"]["status"] == "unavailable" and evidence["cuda_driver"]["value"] is not None) or evidence["peak_bytes"] != timing["cuda_peak_bytes"]:
+        if not isinstance(evidence, Mapping) or set(evidence) != {"cuda_device_name", "cuda_driver", "cuda_runtime_version", "peak_bytes"} or not isinstance(evidence["cuda_device_name"], str) or not evidence["cuda_device_name"] or not isinstance(evidence["cuda_runtime_version"], str) or not evidence["cuda_runtime_version"] or not isinstance(evidence["cuda_driver"], Mapping) or set(evidence["cuda_driver"]) != {"status", "value"} or evidence["cuda_driver"].get("status") not in {"available", "unavailable"} or (evidence["cuda_driver"]["status"] == "available" and (not isinstance(evidence["cuda_driver"]["value"], str) or not evidence["cuda_driver"]["value"])) or (evidence["cuda_driver"]["status"] == "unavailable" and evidence["cuda_driver"]["value"] is not None) or evidence["peak_bytes"] != timing["cuda_peak_bytes"]:
             raise ValueError("parity/output root CUDA evidence is invalid")
 
 
@@ -429,9 +434,10 @@ def _create_namespace(root: Path, name: str, identity: Mapping[str, object]) -> 
         _validate_context(namespace, identity["model"], identity["runtime_config"])
         return namespace
     staging, staging_identity = _create_unique_staging(root, f".{name}.staging")
+    staging_bytes = (_canonical(identity) + "\n").encode("utf-8")
     try:
         with (staging / _CONTEXT_IDENTITY).open("x", encoding="utf-8", newline="\n") as handle:
-            handle.write(_canonical(identity) + "\n")
+            handle.write(staging_bytes.decode("utf-8"))
             handle.flush()
             os.fsync(handle.fileno())
         _rename_no_replace(staging, namespace)
@@ -441,11 +447,42 @@ def _create_namespace(root: Path, name: str, identity: Mapping[str, object]) -> 
         _validate_context(namespace, identity["model"], identity["runtime_config"])
     finally:
         if _regular_directory(staging):
-            cleanup_error = _cleanup_owned_directory(staging, staging_identity)
+            cleanup_error = _cleanup_namespace_staging(staging, staging_identity, staging_bytes)
             if cleanup_error is not None:
                 raise RuntimeError("resume namespace staging cleanup failed: " + cleanup_error)
     _validate_context(namespace, identity["model"], identity["runtime_config"])
     return namespace
+
+
+def _cleanup_namespace_staging(path: Path, identity: tuple[int, int], expected_bytes: bytes) -> str | None:
+    """Quarantine then remove only the exact identity file created by this call."""
+    if not _lexists(path):
+        return f"owned directory disappeared before cleanup: {path}"
+    quarantine = path.parent / f"{path.name}.cleanup.{secrets.token_hex(8)}"
+    try:
+        _rename_no_replace_native(path, quarantine)
+    except OSError as exc:
+        return f"could not quarantine owned directory {path}: {exc}"
+    identity_file = quarantine / _CONTEXT_IDENTITY
+    exact = _directory_identity(quarantine) == identity
+    try:
+        exact = exact and {child.name for child in quarantine.iterdir()} == {_CONTEXT_IDENTITY} and identity_file.is_file() and not identity_file.is_symlink() and identity_file.read_bytes() == expected_bytes
+    except OSError:
+        exact = False
+    if not exact:
+        if not _lexists(path):
+            try:
+                _rename_no_replace(quarantine, path)
+                return f"unexpected directory was preserved at {path}"
+            except OSError:
+                pass
+        return f"unexpected directory was preserved at {quarantine}"
+    try:
+        identity_file.unlink()
+        quarantine.rmdir()
+    except OSError as exc:
+        return f"could not remove owned directory {quarantine}: {exc}"
+    return None
 
 
 def _validate_context_record(path: Path, identity: Mapping[str, object], expected_name: str) -> None:
@@ -700,6 +737,7 @@ def build_pvad_cache(dataset_root: Path, model_paths: FireRedModelPaths, output_
         manifest: dict[str, Any] = {"artifact_kind": _ARTIFACT_KIND, "schema_version": _SCHEMA_VERSION, "feature_schema": list(PVAD_GATE_FEATURE_SCHEMA), "feature_schema_sha256": _schema_digest(), "digest_algorithms": {"feature_schema_sha256": "sha256(UTF-8 ordered schema names joined and terminated by literal backslash-n bytes)", "records_sha256": "sha256(UTF-8 canonical JSONL bytes)", "per_id_record_sha256": "sha256(UTF-8 canonical JSON record bytes)", "joined_state_sha256": "sha256(UTF-8 canonical JSON)", "source_audio_sha256": "sha256(raw wake/command audio bytes)", "source_projection_sha256": "sha256(UTF-8 canonical JSON source projection)", "model_sha256": "sha256(UTF-8 canonical JSON verified model identity)"}, "coverage": current_provenance["coverage"], "source": source, "model": model, "runtime_config": config_state, "runtime_config_sha256": config_digest, "provider": config.onnx_provider, "device": config.ecapa_device, "environment": {"python": sys.version.split()[0], "platform": platform.platform(), "observed_dependencies": _observed_dependencies()}, "reuse": {"reused": len(existing), "new": new_count}, "timing": {"cold_elapsed_seconds": _percentiles(cold), "warm_elapsed_seconds": _percentiles(warm), "rtf": _percentiles([float(a["rtf"]) for a in audits]), "peak_rss_delta_bytes": _percentiles([float(a["peak_rss_delta_bytes"]) for a in audits]), "cuda_peak_bytes": _percentiles(cuda_peaks)}, "parity": parity, "limit": {"value": limit, "canonical": limit is None, "reason": None if limit is None else "explicit noncanonical partial cache"}, "records_sha256": _sha256(feature_text.encode()), "per_id_record_sha256": {sample_id: _sha256(line.encode()) for sample_id, line in zip(selected, lines)}, "joined_state_sha256": _digest({sample_id: {**expected[sample_id], "model": model} for sample_id in selected})}
         if cuda:
             manifest["cuda"] = {**cuda.evidence(), "peak_bytes": _percentiles(cuda_peaks)}
+        _validate_manifest_domains(manifest, selected)
         report = _report(manifest)
         return {"features": path for name, path in publish_text_package(output_root, _CONTRACT, {_FEATURES: feature_text, _MANIFEST: _canonical(manifest) + "\n", _REPORT: report}).items() if name == _FEATURES} | {"manifest": output_root / _MANIFEST, "report": output_root / _REPORT}
     finally:
