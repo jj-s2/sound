@@ -634,9 +634,11 @@ def _cuda_audit_adapter(device: str) -> object:
     index = 0 if device == "cuda" else int(device.split(":", 1)[1])
     class Adapter:
         def reset_peak(self) -> None:
-            torch.cuda.reset_peak_memory_stats(index)
+            with torch.cuda.device(index):
+                torch.cuda.reset_peak_memory_stats()
         def peak_bytes(self) -> int:
-            return int(torch.cuda.max_memory_allocated(index))
+            with torch.cuda.device(index):
+                return int(torch.cuda.max_memory_allocated())
         def evidence(self) -> dict[str, object]:
             driver: str | None = None
             try:
@@ -645,7 +647,9 @@ def _cuda_audit_adapter(device: str) -> object:
                 driver = str(pynvml.nvmlSystemGetDriverVersion())
             except Exception:
                 pass
-            return {"cuda_device_name": str(torch.cuda.get_device_name(index)), "cuda_driver": {"status": "available", "value": driver} if driver else {"status": "unavailable", "value": None}, "cuda_runtime_version": str(getattr(torch.version, "cuda", "unknown"))}
+            with torch.cuda.device(index):
+                name = str(torch.cuda.get_device_name(index))
+            return {"cuda_device_name": name, "cuda_driver": {"status": "available", "value": driver} if driver else {"status": "unavailable", "value": None}, "cuda_runtime_version": str(getattr(torch.version, "cuda", "unknown"))}
     return Adapter()
 
 

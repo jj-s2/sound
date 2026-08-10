@@ -7,6 +7,7 @@ import importlib.util
 import json
 import math
 import os
+import sys
 from collections import OrderedDict
 from pathlib import Path
 
@@ -799,6 +800,67 @@ def test_cuda_reused_memory_counter_must_be_integral_and_is_preserved(tmp_path: 
     with pytest.raises(ValueError, match="resume"):
         build_pvad_cache(root, model, tmp_path / "cuda" / "next", resume_root=tmp_path / "cuda" / "resume", ecapa_device="cuda", parity_reference=cpu["features"])
     assert record_path.read_text(encoding="utf-8") == payload
+
+
+def test_cuda_audit_uses_selected_device_context_for_memory_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    from xh202615 import pvad_cache
+
+    contexts: list[tuple[str, int]] = []
+
+    class FakeDevice:
+        def __init__(self, index: int) -> None:
+            self.index = index
+
+        def __enter__(self) -> None:
+            contexts.append(("enter", self.index))
+
+        def __exit__(self, *_args: object) -> None:
+            contexts.append(("exit", self.index))
+
+    class FakeCuda:
+        def device(self, index: int) -> FakeDevice:
+            return FakeDevice(index)
+
+        def reset_peak_memory_stats(self, *args: object) -> None:
+            assert not args
+
+        def max_memory_allocated(self, *args: object) -> int:
+            assert not args
+            return 123
+
+        def get_device_name(self, index: int) -> str:
+            assert index == 2
+            return "fake-device-2"
+
+    class FakeTorch:
+        cuda = FakeCuda()
+        version = type("Version", (), {"cuda": "fake-runtime"})()
+
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    adapter = pvad_cache._cuda_audit_adapter("cuda:2")
+
+    adapter.reset_peak()
+    assert adapter.peak_bytes() == 123
+    assert adapter.evidence()["cuda_device_name"] == "fake-device-2"
+    assert contexts == [("enter", 2), ("exit", 2), ("enter", 2), ("exit", 2), ("enter", 2), ("exit", 2)]
+
+
+def test_cuda_audit_does_not_hide_device_selection_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    from xh202615 import pvad_cache
+
+    class FakeCuda:
+        def device(self, index: int) -> object:
+            assert index == 1
+            raise RuntimeError("invalid device")
+
+    class FakeTorch:
+        cuda = FakeCuda()
+
+    monkeypatch.setitem(sys.modules, "torch", FakeTorch())
+    adapter = pvad_cache._cuda_audit_adapter("cuda:1")
+
+    with pytest.raises(RuntimeError, match="invalid device"):
+        adapter.reset_peak()
 
 
 def test_nonregular_staging_replacement_fails_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
