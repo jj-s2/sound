@@ -34,11 +34,16 @@ class FakeSession:
         *,
         mel: object | None = None,
         gru: object | None = None,
+        providers: object = ("CPUExecutionProvider",),
     ) -> None:
         self.probabilities = list(probabilities)
         self.mel = mel
         self.gru = gru
+        self.providers = providers
         self.calls: list[dict[str, np.ndarray]] = []
+
+    def get_providers(self) -> object:
+        return self.providers
 
     def run(self, _outputs: object, inputs: dict[str, np.ndarray]) -> list[np.ndarray]:
         self.calls.append({name: value.copy() for name, value in inputs.items()})
@@ -212,6 +217,24 @@ def test_fixed_aggregate_literal_and_schema_order(paths, audio, tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    "ema,expected",
+    [
+        ([0.9, 0.9, 0.9], 0),
+        ([0.9, 0.9, 0.1], 1),
+        ([0.9, 0.1, 0.9, 0.1], 3),
+        ([0.9], 0),
+    ],
+    ids=("all-active", "active-to-inactive", "alternating", "one-frame"),
+)
+def test_threshold_transitions_count_adjacent_state_flips_only(paths, ema, expected):
+    subject = runtime(paths, FakeEncoder(), FakeSession())
+    values = subject._aggregate(
+        np.asarray(ema), np.asarray(ema), len(ema) * 160, 0, 160, 1.0, 1.0
+    )
+    assert values["ema_transitions_ge_0_3"] == expected
+
+
 def test_inactive_ema_thresholds_use_explicit_sentinels(paths, audio, tmp_path):
     wake = put(audio, tmp_path, "wake.wav", np.zeros((4000, 1)))
     command = put(audio, tmp_path, "command.wav", np.zeros((320, 1)))
@@ -236,7 +259,130 @@ def test_audit_only_timing_memory_and_label_mutation_independence(paths, audio, 
     canonical_a = json.dumps(dict(first.values), separators=(",", ":"), sort_keys=False)
     canonical_b = json.dumps(dict(second.values), separators=(",", ":"), sort_keys=False)
     assert metadata_a == metadata_b and canonical_a == canonical_b
-    assert {"elapsed_seconds", "audio_seconds", "rtf", "rss_delta_bytes", "cuda_peak_bytes"} <= set(first.audit)
-    assert not ({"elapsed_seconds", "audio_seconds", "rtf", "rss_delta_bytes", "cuda_peak_bytes"} & set(PVAD_GATE_FEATURE_SCHEMA))
+    assert {"elapsed_seconds", "audio_seconds", "rtf", "peak_rss_delta_bytes", "cuda_peak_bytes"} <= set(first.audit)
+    assert not ({"elapsed_seconds", "audio_seconds", "rtf", "peak_rss_delta_bytes", "cuda_peak_bytes"} & set(PVAD_GATE_FEATURE_SCHEMA))
     forbidden = " ".join((*first.values, *first.audit)).lower()
     assert "label" not in forbidden and "text" not in forbidden and "raw_frame" not in forbidden
+
+
+def test_audit_marks_successful_cold_then_warm_and_retains_transient_rss_peak(paths, audio, tmp_path):
+    wake = put(audio, tmp_path, "wake.wav", np.zeros((4000, 1)))
+    command = put(audio, tmp_path, "command.wav", np.zeros((160, 1)))
+    ticks = iter((10.0, 10.5, 11.0, 11.5))
+    rss_values = iter((100, 130, 190, 140, 120, 100, 110, 120, 115, 105))
+    subject = runtime(
+        paths,
+        FakeEncoder(),
+        FakeSession([0.1]),
+        clock=lambda: next(ticks),
+        rss_bytes=lambda: next(rss_values),
+    )
+
+    cold = subject.extract("cold", wake, command)
+    warm = subject.extract("warm", wake, command)
+
+    assert cold.audit["extraction_phase"] == "cold"
+    assert warm.audit["extraction_phase"] == "warm"
+    assert cold.audit["peak_rss_delta_bytes"] == 90
+    assert warm.audit["peak_rss_delta_bytes"] == 20
+    assert all(
+        isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+        for result in (cold, warm)
+        for value in result.audit.values()
+        if isinstance(value, (int, float))
+    )
+
+
+def test_failed_extraction_does_not_consume_cold_phase(paths, audio, tmp_path):
+    wake = put(audio, tmp_path, "wake.wav", np.zeros((4000, 1)))
+    command = put(audio, tmp_path, "command.wav", np.zeros((160, 1)))
+    subject = runtime(paths, FakeEncoder([0.0] * 192), FakeSession([0.1]))
+
+    with pytest.raises(ValueError, match="nonzero"):
+        subject.extract("failed", wake, command)
+
+    subject._ecapa_encoder = FakeEncoder()
+    assert subject.extract("successful", wake, command).audit["extraction_phase"] == "cold"
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"sample_rate": True},
+        {"sample_rate": 16000.0},
+        {"frame_samples": False},
+        {"frame_samples": 160.5},
+        {"enrollment_cap_seconds": math.nan},
+        {"minimum_audio_seconds": math.inf},
+        {"minimum_audio_seconds": 0.0},
+        {"ema_alpha": math.nan},
+        {"ema_alpha": -0.1},
+        {"ema_alpha": 1.1},
+        {"onnx_provider": " "},
+        {"onnx_provider": "CPU Provider"},
+        {"ecapa_device": ""},
+        {"ecapa_device": "cuda:-1"},
+    ],
+)
+def test_runtime_config_rejects_nonfinite_type_confused_and_invalid_values(kwargs):
+    with pytest.raises(ValueError):
+        PvadRuntimeConfig(**kwargs)
+
+
+def test_runtime_config_preserves_approved_defaults():
+    assert PvadRuntimeConfig() == PvadRuntimeConfig(
+        sample_rate=16000,
+        frame_samples=160,
+        enrollment_cap_seconds=5.0,
+        minimum_audio_seconds=0.25,
+        ema_alpha=0.8,
+        onnx_provider="CPUExecutionProvider",
+        ecapa_device="cpu",
+    )
+
+
+def test_session_provider_must_be_explicit_and_match_requested_provider(paths, audio, tmp_path):
+    wake = put(audio, tmp_path, "wake.wav", np.zeros((4000, 1)))
+    command = put(audio, tmp_path, "command.wav", np.zeros((160, 1)))
+    config = PvadRuntimeConfig(minimum_audio_seconds=0.01, onnx_provider="CUDAExecutionProvider")
+
+    with pytest.raises(ValueError, match="requested ONNX provider"):
+        runtime(paths, FakeEncoder(), FakeSession([0.1], providers=("CPUExecutionProvider",)), config=config).extract("x", wake, command)
+
+    class MissingProviderContract:
+        run = FakeSession().run
+
+    with pytest.raises(TypeError, match="get_providers"):
+        runtime(paths, FakeEncoder(), MissingProviderContract()).extract("x", wake, command)
+
+
+def test_default_session_factory_is_verified_before_onnx_inference(paths, audio, tmp_path, monkeypatch):
+    from xh202615 import firered_pvad
+
+    wake = put(audio, tmp_path, "wake.wav", np.zeros((4000, 1)))
+    command = put(audio, tmp_path, "command.wav", np.zeros((160, 1)))
+    config = PvadRuntimeConfig(minimum_audio_seconds=0.01, onnx_provider="CUDAExecutionProvider")
+    monkeypatch.setattr(
+        firered_pvad,
+        "_default_onnx_session",
+        lambda _paths, _config: FakeSession([0.1], providers=("CPUExecutionProvider",)),
+    )
+
+    with pytest.raises(ValueError, match="requested ONNX provider"):
+        FireRedPvadRuntime(paths, config=config, ecapa_encoder=FakeEncoder()).extract("x", wake, command)
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        ({"clock": lambda: math.nan}, "clock"),
+        ({"rss_bytes": lambda: -1}, "RSS"),
+        ({"cuda_peak_bytes": lambda: True}, "RSS"),
+    ],
+)
+def test_invalid_audit_callback_values_fail_closed(paths, audio, tmp_path, kwargs, match):
+    wake = put(audio, tmp_path, "wake.wav", np.zeros((4000, 1)))
+    command = put(audio, tmp_path, "command.wav", np.zeros((160, 1)))
+
+    with pytest.raises(ValueError, match=match):
+        runtime(paths, FakeEncoder(), FakeSession([0.1]), **kwargs).extract("x", wake, command)

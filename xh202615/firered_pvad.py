@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -72,6 +73,22 @@ class PvadRuntimeConfig:
     onnx_provider: str = "CPUExecutionProvider"
     ecapa_device: str = "cpu"
 
+    def __post_init__(self) -> None:
+        for name in ("sample_rate", "frame_samples"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        for name in ("enrollment_cap_seconds", "minimum_audio_seconds"):
+            value = getattr(self, name)
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0.0:
+                raise ValueError(f"{name} must be a finite positive number")
+        if type(self.ema_alpha) not in (int, float) or not math.isfinite(self.ema_alpha) or not 0.0 <= self.ema_alpha <= 1.0:
+            raise ValueError("ema_alpha must be a finite number in [0, 1]")
+        if not isinstance(self.onnx_provider, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*ExecutionProvider", self.onnx_provider):
+            raise ValueError("onnx_provider must be a valid ONNX Runtime provider name")
+        if not isinstance(self.ecapa_device, str) or not re.fullmatch(r"(?:cpu|cuda(?::[0-9]+)?)", self.ecapa_device):
+            raise ValueError("ecapa_device must be cpu, cuda, or cuda:<nonnegative index>")
+
 
 @dataclass(frozen=True)
 class PvadUtteranceFeatures:
@@ -120,12 +137,6 @@ class FireRedPvadRuntime:
         rss_bytes: Callable[[], int] = _default_rss_bytes,
         cuda_peak_bytes: Callable[[], int] | None = None,
     ) -> None:
-        if config.sample_rate <= 0 or config.frame_samples <= 0:
-            raise ValueError("sample rate and frame samples must be positive")
-        if config.enrollment_cap_seconds <= 0 or config.minimum_audio_seconds <= 0:
-            raise ValueError("audio duration limits must be positive")
-        if not 0.0 <= config.ema_alpha <= 1.0:
-            raise ValueError("ema_alpha must be in [0, 1]")
         self.model_paths = model_paths
         self.config = config
         self._ecapa_encoder = ecapa_encoder
@@ -133,6 +144,7 @@ class FireRedPvadRuntime:
         self._clock = clock
         self._rss_bytes = rss_bytes
         self._cuda_peak_bytes = cuda_peak_bytes
+        self._has_successful_extraction = False
 
     def _encoder(self) -> object:
         if self._ecapa_encoder is None:
@@ -142,6 +154,16 @@ class FireRedPvadRuntime:
     def _session(self) -> object:
         if self._onnx_session is None:
             self._onnx_session = _default_onnx_session(self.model_paths, self.config)
+        providers = getattr(self._onnx_session, "get_providers", None)
+        if not callable(providers):
+            raise TypeError("ONNX session must expose get_providers()")
+        active = providers()
+        if not isinstance(active, (list, tuple)) or not active or any(not isinstance(provider, str) for provider in active):
+            raise TypeError("ONNX session get_providers() must return nonempty provider names")
+        if active[0] != self.config.onnx_provider:
+            raise ValueError(
+                f"requested ONNX provider {self.config.onnx_provider!r} is not the active preferred provider: {active!r}"
+            )
         return self._onnx_session
 
     def _read_audio(self, path: Path, kind: str) -> np.ndarray:
@@ -245,33 +267,64 @@ class FireRedPvadRuntime:
 
         if not isinstance(sample_id, str) or not sample_id:
             raise ValueError("sample_id must be a nonempty string")
-        started = float(self._clock())
-        rss_before = int(self._rss_bytes())
+        started = self._audit_float(self._clock(), "clock")
+        rss_before = self._audit_rss()
+        rss_checkpoints = [rss_before]
         wake = self._read_audio(Path(wake_path), "wake")
         command = self._read_audio(Path(command_path), "command")
+        rss_checkpoints.append(self._audit_rss())
         cap = int(self.config.enrollment_cap_seconds * self.config.sample_rate)
         enrollment = wake[:cap]
         embedding, norm_before, norm_after = self._embedding(enrollment)
+        rss_checkpoints.append(self._audit_rss())
         raw, tail = self._probabilities(command, embedding)
+        rss_checkpoints.append(self._audit_rss())
         ema = np.empty_like(raw)
         ema[0] = raw[0]
         for index in range(1, len(raw)):
             ema[index] = self.config.ema_alpha * ema[index - 1] + (1.0 - self.config.ema_alpha) * raw[index]
         values = self._aggregate(raw, ema, len(command), tail, len(enrollment), norm_before, norm_after)
-        elapsed = float(self._clock()) - started
+        rss_checkpoints.append(self._audit_rss())
+        elapsed = self._audit_float(self._clock(), "clock") - started
         audio_seconds = (len(wake) + len(command)) / self.config.sample_rate
+        if elapsed < 0.0:
+            raise ValueError("clock must not move backwards")
+        phase = "warm" if self._has_successful_extraction else "cold"
         audit: dict[str, float | int | str] = {
             "elapsed_seconds": elapsed,
             "audio_seconds": audio_seconds,
             "rtf": elapsed / audio_seconds if audio_seconds else 0.0,
-            "rss_delta_bytes": int(self._rss_bytes()) - rss_before,
+            "peak_rss_delta_bytes": max(rss_checkpoints) - rss_before,
             "dropped_tail_samples": tail,
             "onnx_provider": self.config.onnx_provider,
             "ecapa_device": self.config.ecapa_device,
+            "extraction_phase": phase,
         }
         if self._cuda_peak_bytes is not None:
-            audit["cuda_peak_bytes"] = int(self._cuda_peak_bytes())
+            audit["cuda_peak_bytes"] = self._audit_rss(self._cuda_peak_bytes)
+        self._validate_audit(audit)
+        self._has_successful_extraction = True
         return PvadUtteranceFeatures(sample_id, values, audit)
+
+    @staticmethod
+    def _audit_float(value: object, label: str) -> float:
+        if type(value) not in (int, float) or not math.isfinite(value):
+            raise ValueError(f"{label} must return a finite number")
+        return float(value)
+
+    def _audit_rss(self, source: Callable[[], int] | None = None) -> int:
+        value = (self._rss_bytes if source is None else source)()
+        if type(value) is not int or value < 0:
+            raise ValueError("RSS callbacks must return nonnegative integers")
+        return value
+
+    @staticmethod
+    def _validate_audit(audit: Mapping[str, float | int | str]) -> None:
+        for name, value in audit.items():
+            if isinstance(value, bool):
+                raise ValueError(f"audit {name} must not be boolean")
+            if isinstance(value, (int, float)) and (not math.isfinite(value) or value < 0):
+                raise ValueError(f"audit {name} must be finite and nonnegative")
 
     def _aggregate(self, raw: np.ndarray, ema: np.ndarray, command_samples: int, tail: int, enrollment_samples: int, norm_before: float, norm_after: float) -> Mapping[str, float | int]:
         frame_seconds = self.config.frame_samples / self.config.sample_rate
@@ -293,14 +346,10 @@ class FireRedPvadRuntime:
             active = ema >= threshold
             indices = np.flatnonzero(active)
             longest = current = 0
-            transitions = 0
-            previous = False
+            transitions = int(np.count_nonzero(active[1:] != active[:-1]))
             for flag in active:
                 current = current + 1 if flag else 0
                 longest = max(longest, current)
-                if bool(flag) != previous:
-                    transitions += 1
-                previous = bool(flag)
             if indices.size:
                 first, last = int(indices[0]) + 1, int(indices[-1]) + 1
                 span = last - first + 1
