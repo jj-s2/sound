@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import math
@@ -12,7 +13,12 @@ import pytest
 
 from tests.test_r11_pvad_oracle import _fixture, _full_cpu_manifest
 from xh202615.r11_gate_oracle import GateModelSpec
-from xh202615.r11_pvad_oracle import E0_FITTING_FEATURE_SCHEMA, JoinedPvadRow, join_pvad_e0_rows
+from xh202615.r11_pvad_oracle import (
+    E0_FITTING_FEATURE_SCHEMA,
+    PVAD_FITTING_FEATURE_SCHEMA,
+    JoinedPvadRow,
+    join_pvad_e0_rows,
+)
 
 
 SEED = 20260812
@@ -84,7 +90,8 @@ class TestPublicInterface:
 
 
 class TestTrainCalibration:
-    def test_train_object_has_exact_base_specs_and_calibrators(self, split_fixture):
+    def test_train_object_has_exact_base_specs_and_single_calibrator(self, split_fixture):
+        from sklearn.linear_model import LogisticRegression
         from xh202615.r12_calibrated_gate import fit_train_calibrated_gate
 
         joined_train, _, _, _ = split_fixture
@@ -95,12 +102,9 @@ class TestTrainCalibration:
         )
         assert all(isinstance(spec, GateModelSpec) for spec in trained.base_specs)
         assert {spec.name for spec in trained.base_specs} == set(trained.base_model_names)
-        assert set(trained.calibrators) == set(trained.base_model_names)
-        assert all(
-            hasattr(trained.calibrators[name], "coef_")
-            and hasattr(trained.calibrators[name], "intercept_")
-            for name in trained.base_model_names
-        )
+        assert isinstance(trained.calibrator, LogisticRegression)
+        assert trained.calibrator.coef_.shape == (1, 2)
+        assert trained.calibrator.intercept_.shape == (1,)
 
     def test_oof_scores_are_once_only_group_disjoint_and_finite(self, split_fixture):
         from xh202615.r12_calibrated_gate import fit_train_calibrated_gate
@@ -126,18 +130,18 @@ class TestTrainCalibration:
             train_groups = set(groups[fold_assignments != fold_index])
             assert not (test_groups & train_groups)
 
-    def test_calibration_uses_only_train_oof_scores(self, split_fixture):
-        from xh202615.r12_calibrated_gate import fit_train_calibrated_gate
+    def test_calibration_uses_fused_two_column_oof_in_base_order(self, split_fixture):
+        from xh202615.r12_calibrated_gate import BASE_MODELS, fit_train_calibrated_gate
 
         joined_train, joined_val, _, _ = split_fixture
         trained = fit_train_calibrated_gate(joined_train, seed=SEED)
         n_train = len(joined_train)
         target = np.array([row.target_present for row in joined_train], dtype=np.int64)
 
-        for name in trained.base_model_names:
-            assert trained.calibration_inputs[name].shape == (n_train, 1)
-            assert len(trained.calibrators[name].coef_.ravel()) == 1
-            assert np.array_equal(trained.calibration_targets[name], target)
+        assert trained.calibration_input.shape == (n_train, 2)
+        assert np.allclose(trained.calibration_input[:, 0], trained.oof_scores[BASE_MODELS[0]])
+        assert np.allclose(trained.calibration_input[:, 1], trained.oof_scores[BASE_MODELS[1]])
+        assert np.array_equal(trained.calibration_targets, target)
 
         val_ids = {row.id for row in joined_val}
         assert not any(row.id in val_ids for row in trained.calibration_rows)
@@ -152,17 +156,38 @@ class TestTrainCalibration:
             model = trained.base_models[name]
             assert hasattr(model, "predict_proba")
 
-    def test_feature_schema_is_frozen_r11_e0(self, split_fixture):
-        from xh202615.r11_gate_oracle import GATE_FEATURE_SCHEMA
+    def test_feature_schema_is_fused_pvad_e0(self, split_fixture):
         from xh202615.r12_calibrated_gate import fit_train_calibrated_gate
 
         joined_train, _, _, _ = split_fixture
         trained = fit_train_calibrated_gate(joined_train, seed=SEED)
-        assert trained.feature_schema == E0_FITTING_FEATURE_SCHEMA
-        assert all(name in GATE_FEATURE_SCHEMA for name in trained.feature_schema)
+        expected_schema = (*PVAD_FITTING_FEATURE_SCHEMA, *E0_FITTING_FEATURE_SCHEMA)
+        assert trained.feature_schema == expected_schema
+        expected_digest = hashlib.sha256(
+            (r"\n".join(expected_schema) + r"\n").encode("utf-8")
+        ).hexdigest()
+        assert trained.feature_schema_digest == expected_digest
         assert "latency_ms" not in trained.feature_schema
-        assert trained.feature_schema_digest is not None
         assert len(trained.feature_schema_digest) == 64
+
+    def test_pvad_feature_changes_fused_fitting_matrix(self, split_fixture):
+        from xh202615.r12_calibrated_gate import _build_matrix, fit_train_calibrated_gate
+
+        joined_train, _, _, _ = split_fixture
+        trained = fit_train_calibrated_gate(joined_train, seed=SEED)
+        base_matrix = _build_matrix(joined_train, trained.feature_schema)
+
+        mutated = []
+        for i, row in enumerate(joined_train):
+            pvad = dict(row.pvad)
+            if i == 0:
+                pvad[PVAD_FITTING_FEATURE_SCHEMA[0]] = 1.0 - pvad[PVAD_FITTING_FEATURE_SCHEMA[0]]
+            mutated.append(
+                JoinedPvadRow(row.id, row.group, row.target_present, pvad, row.e0, row.source_digest)
+            )
+        mutated_matrix = _build_matrix(mutated, trained.feature_schema)
+        assert mutated_matrix.shape == base_matrix.shape
+        assert not np.allclose(mutated_matrix, base_matrix)
 
     def test_fit_rejects_empty_train(self):
         from xh202615.r12_calibrated_gate import fit_train_calibrated_gate
@@ -211,8 +236,8 @@ class TestTrainCalibration:
         assert np.array_equal(a.fold_assignments, b.fold_assignments)
         for name in a.base_model_names:
             assert np.allclose(a.oof_scores[name], b.oof_scores[name])
-            assert np.allclose(a.calibrators[name].coef_, b.calibrators[name].coef_)
-            assert np.isclose(a.calibrators[name].intercept_, b.calibrators[name].intercept_)
+        assert np.allclose(a.calibrator.coef_, b.calibrator.coef_)
+        assert np.isclose(a.calibrator.intercept_, b.calibrator.intercept_)
 
 
 class TestValidationSelection:
@@ -349,3 +374,18 @@ class TestSerializationPrivacy:
         assert "validation_raw_metrics" in serial
         assert "validation_bootstrapped_metrics" in serial
         assert "provenance" in serial
+
+    def test_serial_form_calibrator_has_two_coefficients_and_intercept(self, split_fixture):
+        from xh202615.r12_calibrated_gate import fit_train_calibrated_gate, select_on_validation
+
+        joined_train, joined_val, val_rows, val_labels = split_fixture
+        trained = fit_train_calibrated_gate(joined_train, seed=SEED)
+        selection = select_on_validation(
+            trained, joined_val, val_rows, val_labels, n_boot=50, seed=SEED
+        )
+        assert len(selection.calibrator_coefficients) == 2
+        assert all(isinstance(c, float) for c in selection.calibrator_coefficients)
+        assert isinstance(selection.calibrator_intercept, float)
+        serial = selection.to_dict()
+        assert serial["calibrator"]["coefficients"] == list(selection.calibrator_coefficients)
+        assert serial["calibrator"]["intercept"] == selection.calibrator_intercept

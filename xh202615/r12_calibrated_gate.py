@@ -19,7 +19,12 @@ from .r11_gate_oracle import (
     cross_fit_gate_models,
     gate_oracle_frontier,
 )
-from .r11_pvad_oracle import E0_FITTING_FEATURE_SCHEMA, JoinedPvadRow, canonical_json
+from .r11_pvad_oracle import (
+    E0_FITTING_FEATURE_SCHEMA,
+    PVAD_FITTING_FEATURE_SCHEMA,
+    JoinedPvadRow,
+    canonical_json,
+)
 
 
 BASE_MODELS = (
@@ -71,8 +76,17 @@ def _parameters_digest(specs: Sequence[GateModelSpec]) -> str:
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+_PVAD_FEATURE_SET = set(PVAD_FITTING_FEATURE_SCHEMA)
+
+
 def _build_matrix(rows: Sequence[JoinedPvadRow], schema: Sequence[str]) -> np.ndarray:
-    return np.asarray([[row.e0[name] for name in schema] for row in rows], dtype=np.float64)
+    return np.asarray(
+        [
+            [row.pvad[name] if name in _PVAD_FEATURE_SET else row.e0[name] for name in schema]
+            for row in rows
+        ],
+        dtype=np.float64,
+    )
 
 
 def _bootstrap_point_stats(
@@ -156,7 +170,7 @@ def _safe_threshold(value: float) -> float | str:
 
 @dataclass(frozen=True)
 class TrainCalibratedGate:
-    """Train-side artifact: refit base models, calibrators, and OOF bank."""
+    """Train-side artifact: refit base models, single calibrator, and OOF bank."""
 
     base_specs: tuple[GateModelSpec, ...]
     base_model_names: tuple[str, ...]
@@ -164,10 +178,10 @@ class TrainCalibratedGate:
     feature_schema_digest: str
     base_parameters_digest: str
     base_models: Mapping[str, Pipeline]
-    calibrators: Mapping[str, LogisticRegression]
+    calibrator: LogisticRegression
     oof_scores: Mapping[str, np.ndarray]
-    calibration_inputs: Mapping[str, np.ndarray]
-    calibration_targets: Mapping[str, np.ndarray]
+    calibration_input: np.ndarray
+    calibration_targets: np.ndarray
     calibration_rows: tuple[JoinedPvadRow, ...]
     fold_assignments: np.ndarray
     fold_metadata: tuple[dict[str, object], ...]
@@ -182,7 +196,8 @@ class FrozenGateSelection:
     base_model_names: tuple[str, ...]
     base_parameters_digest: str
     feature_schema_digest: str
-    calibrators: tuple[tuple[str, float, float], ...]
+    calibrator_coefficients: tuple[float, float]
+    calibrator_intercept: float
     blend_definition: dict[str, object]
     selected_model_name: str
     selected_blend_weight: float
@@ -196,10 +211,10 @@ class FrozenGateSelection:
             "base_model_names": list(self.base_model_names),
             "base_parameters_digest": self.base_parameters_digest,
             "feature_schema_digest": self.feature_schema_digest,
-            "calibrator": [
-                {"model": name, "coefficient": float(coef), "intercept": float(intercept)}
-                for name, coef, intercept in self.calibrators
-            ],
+            "calibrator": {
+                "coefficients": [float(c) for c in self.calibrator_coefficients],
+                "intercept": float(self.calibrator_intercept),
+            },
             "blend_definition": self.blend_definition,
             "selected_model_name": self.selected_model_name,
             "selected_blend_weight": self.selected_blend_weight,
@@ -218,7 +233,7 @@ def fit_train_calibrated_gate(
     if len(joined_train) == 0:
         raise ValueError("at least one joined training row is required")
 
-    feature_schema = E0_FITTING_FEATURE_SCHEMA
+    feature_schema = (*PVAD_FITTING_FEATURE_SCHEMA, *E0_FITTING_FEATURE_SCHEMA)
     X_train = _build_matrix(joined_train, feature_schema)
     target = np.asarray([row.target_present for row in joined_train], dtype=np.int64)
     groups = [row.group for row in joined_train]
@@ -241,30 +256,24 @@ def fit_train_calibrated_gate(
     )
 
     oof_scores: dict[str, np.ndarray] = {}
-    calibration_inputs: dict[str, np.ndarray] = {}
-    calibration_targets: dict[str, np.ndarray] = {}
-    calibrators: dict[str, LogisticRegression] = {}
     base_models: dict[str, Pipeline] = {}
 
     for spec in specs:
         name = spec.name
         scores = np.asarray(cross_fit.scores_by_model[name], dtype=np.float64)
         oof_scores[name] = scores
-
-        calibrator_X = scores.reshape(-1, 1)
-        calibration_inputs[name] = calibrator_X
-        calibration_targets[name] = target.copy()
-
-        calibrator = LogisticRegression(
-            class_weight="balanced",
-            max_iter=2000,
-            solver="lbfgs",
-            random_state=seed,
-        )
-        calibrator.fit(calibrator_X, target)
-        calibrators[name] = calibrator
-
         base_models[name] = _fit_gate_pipeline(spec, X_train, target, seed)
+
+    calibration_input = np.column_stack([oof_scores[name] for name in BASE_MODELS])
+    calibration_targets = target.copy()
+
+    calibrator = LogisticRegression(
+        class_weight="balanced",
+        max_iter=2000,
+        solver="lbfgs",
+        random_state=seed,
+    )
+    calibrator.fit(calibration_input, calibration_targets)
 
     return TrainCalibratedGate(
         base_specs=specs,
@@ -273,9 +282,9 @@ def fit_train_calibrated_gate(
         feature_schema_digest=_schema_digest(feature_schema),
         base_parameters_digest=_parameters_digest(specs),
         base_models=base_models,
-        calibrators=calibrators,
+        calibrator=calibrator,
         oof_scores=oof_scores,
-        calibration_inputs=calibration_inputs,
+        calibration_input=calibration_input,
         calibration_targets=calibration_targets,
         calibration_rows=tuple(joined_train),
         fold_assignments=cross_fit.fold_assignments,
@@ -297,14 +306,15 @@ def _validation_base_scores(
 def _validation_calibrated_scores(
     trained: TrainCalibratedGate, base_scores: Mapping[str, np.ndarray]
 ) -> dict[str, np.ndarray]:
+    """Return marginal calibrated scores from the single two-column calibrator."""
+
+    s7 = np.asarray(base_scores[BASE_MODELS[0]], dtype=np.float64)
+    s15 = np.asarray(base_scores[BASE_MODELS[1]], dtype=np.float64)
+    n = len(s7)
+    zeros = np.zeros(n, dtype=np.float64)
     return {
-        name: np.asarray(
-            trained.calibrators[name].predict_proba(
-                np.asarray(base_scores[name], dtype=np.float64).reshape(-1, 1)
-            )[:, 1],
-            dtype=np.float64,
-        )
-        for name in trained.base_model_names
+        BASE_MODELS[0]: trained.calibrator.predict_proba(np.column_stack([s7, zeros]))[:, 1],
+        BASE_MODELS[1]: trained.calibrator.predict_proba(np.column_stack([zeros, s15]))[:, 1],
     }
 
 
@@ -402,20 +412,15 @@ def select_on_validation(
 
     best = min(feasible, key=sort_key)
 
-    calibrator_records = tuple(
-        (
-            name,
-            float(trained.calibrators[name].coef_.ravel()[0]),
-            float(trained.calibrators[name].intercept_.ravel()[0]),
-        )
-        for name in trained.base_model_names
-    )
+    coefficients = tuple(float(c) for c in trained.calibrator.coef_.ravel())
+    intercept = float(trained.calibrator.intercept_.ravel()[0])
 
     return FrozenGateSelection(
         base_model_names=trained.base_model_names,
         base_parameters_digest=trained.base_parameters_digest,
         feature_schema_digest=trained.feature_schema_digest,
-        calibrators=calibrator_records,
+        calibrator_coefficients=coefficients,
+        calibrator_intercept=intercept,
         blend_definition={
             "weights": list(BLEND_WEIGHTS),
             "description": "weight is leaf15; blend = (1-w)*leaf7 + w*leaf15",
