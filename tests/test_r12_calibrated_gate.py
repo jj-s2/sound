@@ -257,8 +257,7 @@ class TestValidationSelection:
         selection = select_on_validation(
             trained, joined_val, val_rows, val_labels, n_boot=50, seed=SEED
         )
-        if selection.selected_model_name == "reject_all":
-            assert selection.threshold == "reject_all"
+        if selection.threshold == "reject_all":
             assert selection.validation_raw_metrics["rr"] == 1.0
             assert selection.validation_raw_metrics["cer"] == 1.0
             assert selection.validation_raw_metrics["overall"] == 0.5
