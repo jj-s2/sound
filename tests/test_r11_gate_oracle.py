@@ -141,7 +141,7 @@ class GateCrossFitTests(unittest.TestCase):
 
     def test_default_model_specs_match_frozen_grid(self):
         specs = default_model_specs()
-        self.assertEqual(len(specs), 6)
+        self.assertEqual(len(specs), 7)
         self.assertEqual(
             [(spec.family, dict(spec.parameters)) for spec in specs],
             [
@@ -162,6 +162,15 @@ class GateCrossFitTests(unittest.TestCase):
                     "hist_gradient_boosting",
                     {
                         "max_leaf_nodes": 7,
+                        "learning_rate": 0.05,
+                        "max_iter": 150,
+                        "l2_regularization": 1.0,
+                    },
+                ),
+                (
+                    "hist_gradient_boosting",
+                    {
+                        "max_leaf_nodes": 15,
                         "learning_rate": 0.05,
                         "max_iter": 150,
                         "l2_regularization": 1.0,

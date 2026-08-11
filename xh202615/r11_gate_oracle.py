@@ -166,7 +166,7 @@ def default_model_specs() -> tuple[GateModelSpec, ...]:
                 ("l2_regularization", 1.0),
             ),
         )
-        for max_leaf_nodes in (3, 7)
+        for max_leaf_nodes in (3, 7, 15)
     )
     return logistic + hist
 
