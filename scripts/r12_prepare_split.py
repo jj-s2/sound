@@ -1,8 +1,9 @@
 """Build the frozen R12 60/20/20 stratified group split manifest.
 
-This CLI reuses the R11 canonical label-free JSONL loader (``xh202615.data.read_jsonl``)
-to read the ordered sample IDs, then loads the private label and group mappings from
-separate JSON files. It validates exact ID-set equality across the three inputs before
+This CLI reuses the R11 canonical label-free JSONL loader
+(``scripts.r11_pvad_oracle_oof.load_canonical_rows``) to read the ordered sample
+IDs, then loads the private label and group mappings from separate JSON files.
+It validates exact ID-set equality and value types across the three inputs before
 creating the manifest, so the split is never constructed from mismatched sources.
 """
 
@@ -19,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from xh202615.data import read_jsonl
+from scripts.r11_pvad_oracle_oof import load_canonical_rows
 from xh202615.r12_split import build_r12_split, load_r12_split, write_r12_split
 
 
@@ -29,38 +30,43 @@ def _sha256_hex(data: bytes) -> str:
 
 def _load_ids(path: Path) -> list[str]:
     """Return ordered unique IDs from a canonical label-free JSONL file."""
+    rows = load_canonical_rows(path)
+    return [row.id for row in rows]
 
+
+def _reject_duplicate_keys(path: Path, pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     seen: set[str] = set()
-    ids: list[str] = []
-    for row in read_jsonl(path):
-        sid = str(row.get("id", ""))
-        if not sid:
-            raise ValueError(f"{path} contains a row without an id")
-        if sid in seen:
-            raise ValueError(f"duplicate id {sid!r} in {path}")
-        seen.add(sid)
-        ids.append(sid)
-    return ids
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in seen:
+            raise ValueError(f"duplicate key {key!r} in {path}")
+        seen.add(key)
+        result[key] = value
+    return result
 
 
 def _load_json_mapping(path: Path) -> dict[str, Any]:
     """Load a JSON object mapping and reject duplicate keys."""
-
-    def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        seen: set[str] = set()
-        result: dict[str, Any] = {}
-        for key, value in pairs:
-            if key in seen:
-                raise ValueError(f"duplicate key {key!r} in {path}")
-            seen.add(key)
-            result[key] = value
-        return result
-
     with path.open("r", encoding="utf-8-sig") as handle:
-        data = json.load(handle, object_pairs_hook=_reject_duplicate_keys)
+        data = json.load(
+            handle,
+            object_pairs_hook=lambda pairs: _reject_duplicate_keys(path, pairs),
+        )
     if not isinstance(data, dict):
         raise ValueError(f"{path} must contain a JSON object")
     return data
+
+
+def _validate_label_value(sid: str, value: object) -> str | None:
+    if value is None or isinstance(value, str):
+        return value
+    raise ValueError(f"label for id {sid!r} must be str or None")
+
+
+def _validate_group_value(sid: str, value: object) -> str:
+    if isinstance(value, str) and value:
+        return value
+    raise ValueError(f"group for id {sid!r} must be a nonempty string")
 
 
 def prepare_r12_split(
@@ -81,22 +87,26 @@ def prepare_r12_split(
     output_path = Path(output).expanduser().resolve(strict=False)
 
     ids_in_order = _load_ids(canonical_input_jsonl)
+    ids_set = set(ids_in_order)
     labels_raw = _load_json_mapping(labels_path)
     groups_raw = _load_json_mapping(groups_path)
 
-    labels = {sid: labels_raw.get(sid) for sid in ids_in_order}
-    if set(labels_raw) != set(ids_in_order):
+    if set(labels_raw) != ids_set:
         raise ValueError(
             f"labels IDs do not match canonical JSONL IDs: "
             f"jsonl={len(ids_in_order)} labels={len(labels_raw)}"
         )
-
-    groups = {sid: str(groups_raw.get(sid, "")) for sid in ids_in_order}
-    if set(groups_raw) != set(ids_in_order):
+    if set(groups_raw) != ids_set:
         raise ValueError(
             f"groups IDs do not match canonical JSONL IDs: "
             f"jsonl={len(ids_in_order)} groups={len(groups_raw)}"
         )
+
+    labels = {}
+    groups = {}
+    for sid in ids_in_order:
+        labels[sid] = _validate_label_value(sid, labels_raw[sid])
+        groups[sid] = _validate_group_value(sid, groups_raw[sid])
 
     manifest = build_r12_split(ids_in_order, labels, groups)
     write_r12_split(output_path, manifest)

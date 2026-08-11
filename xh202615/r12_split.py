@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Mapping, Sequence
@@ -45,6 +46,8 @@ _ALLOWED_SERIAL_KEYS = frozenset(
 _PRIVATE_FIELD_HINTS = frozenset(
     {"label", "reference", "target", "text", "recognition_text", "wakeup_text"}
 )
+_SOURCE_DIGEST_KEYS = frozenset({"ids", "annotations", "groups"})
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _sha256_hex(data: bytes) -> str:
@@ -147,10 +150,13 @@ def _build_roles_by_id(
         raise ValueError(f"expected {_N_SPLITS} folds, got {len(folds)}")
 
     fold_assignments = np.full(n_samples, -1, dtype=np.int64)
-    for fold_index, (_, test_indices) in enumerate(folds):
+    for fold_index, (train_indices, test_indices) in enumerate(folds):
         test_indices = np.asarray(test_indices)
+        train_indices = np.asarray(train_indices)
         if np.unique(y[test_indices]).size != 2:
             raise ValueError(f"fold {fold_index} test set lacks both classes")
+        if np.unique(y[train_indices]).size != 2:
+            raise ValueError(f"fold {fold_index} train set lacks both classes")
         if np.any(fold_assignments[test_indices] != -1):
             raise ValueError("sample assigned to multiple folds")
         fold_assignments[test_indices] = fold_index
@@ -161,6 +167,12 @@ def _build_roles_by_id(
     roles_by_id: dict[str, Literal["train", "validation", "held_out_test"]] = {}
     for sid, fold_index in zip(ids_in_order, fold_assignments.tolist()):
         roles_by_id[sid] = _FOLD_TO_ROLE[fold_index]
+
+    for role in _ROLES:
+        role_ids = [sid for sid, r in roles_by_id.items() if r == role]
+        role_classes = {labels[sid] is not None for sid in role_ids}
+        if role_classes != {True, False}:
+            raise ValueError(f"role {role} lacks both classes")
 
     role_groups: dict[str, set[str]] = {role: set() for role in _ROLES}
     for sid, role in roles_by_id.items():
@@ -192,6 +204,9 @@ def _validate_inputs(
         raise ValueError("groups keys do not match IDs exactly")
 
     for sid in ids_in_order:
+        label = labels[sid]
+        if label is not None and not isinstance(label, str):
+            raise ValueError(f"label for id {sid!r} must be str or None")
         group = groups[sid]
         if not isinstance(group, str) or group == "":
             raise ValueError(f"empty or invalid group for id {sid!r}")
@@ -305,6 +320,13 @@ def load_r12_split(path: Path, expected_ids: Sequence[str]) -> R12SplitManifest:
         extra = loaded_ids - expected_set
         raise ValueError(f"ID mismatch: missing={sorted(missing)}, extra={sorted(extra)}")
 
+    if set(groups_by_id) != expected_set:
+        missing = expected_set - set(groups_by_id)
+        extra = set(groups_by_id) - expected_set
+        raise ValueError(
+            f"group ID mismatch: missing={sorted(missing)}, extra={sorted(extra)}"
+        )
+
     for sid in expected_ids:
         role = roles_by_id[sid]
         if role not in _ROLES:
@@ -320,9 +342,34 @@ def load_r12_split(path: Path, expected_ids: Sequence[str]) -> R12SplitManifest:
     if leaked:
         raise ValueError(f"groups span multiple roles: {sorted(leaked)[:5]}")
 
+    role_counts = data.get("role_counts")
+    if not isinstance(role_counts, dict):
+        raise ValueError("role_counts must be a mapping")
+    expected_role_counts = _role_counts(expected_ids, roles_by_id)
+    if role_counts != expected_role_counts:
+        raise ValueError(
+            f"role_counts mismatch: stored={role_counts}, expected={expected_role_counts}"
+        )
+
+    group_counts = data.get("group_counts")
+    if not isinstance(group_counts, dict):
+        raise ValueError("group_counts must be a mapping")
+    expected_group_counts = _group_counts(groups_by_id)
+    if group_counts != expected_group_counts:
+        raise ValueError(
+            f"group_counts mismatch: stored={group_counts}, expected={expected_group_counts}"
+        )
+
     source_digests = data.get("source_digests")
     if not isinstance(source_digests, dict):
         raise ValueError("source_digests must be a mapping")
+    if set(source_digests) != _SOURCE_DIGEST_KEYS:
+        raise ValueError(
+            f"source_digests must contain exactly {_SOURCE_DIGEST_KEYS}, got {set(source_digests)}"
+        )
+    for key, digest in source_digests.items():
+        if not isinstance(digest, str) or not _HEX64_RE.match(digest):
+            raise ValueError(f"source_digests[{key!r}] is not a 64-char lowercase hex SHA-256")
 
     manifest_sha256 = data.get("manifest_sha256")
     if not isinstance(manifest_sha256, str):

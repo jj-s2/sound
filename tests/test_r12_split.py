@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import pytest
 
@@ -34,6 +33,29 @@ def _sha256_hex(data: bytes) -> str:
 
 def _canonical_json(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, ensure_ascii=False).encode("utf-8")
+
+
+def _recompute_manifest_sha256(data: dict[str, Any]) -> str:
+    payload = {k: v for k, v in data.items() if k != "manifest_sha256"}
+    return _sha256_hex(_canonical_json(payload))
+
+
+def _write_canonical_jsonl(path: Path, ids_in_order: Sequence[str]) -> None:
+    required = {"id", "split", "r3_text", "primary_text", "energy_text", "tse_text", "audio_features", "source_digest"}
+    with path.open("w", encoding="utf-8", newline="\n") as handle:
+        for sid in ids_in_order:
+            row = {
+                "id": sid,
+                "split": "train",
+                "r3_text": "",
+                "primary_text": "",
+                "energy_text": "",
+                "tse_text": "",
+                "audio_features": {},
+                "source_digest": "a" * 64,
+            }
+            assert set(row) == required
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
 
 
 @pytest.fixture
@@ -139,6 +161,31 @@ class TestBuildR12Split:
         for role in manifest.roles_by_id.values():
             assert role in ("train", "validation", "held_out_test")
 
+    def test_label_values_must_be_str_or_none(self, sample_data):
+        from xh202615.r12_split import build_r12_split
+
+        ids_in_order, labels, groups = sample_data
+        labels_bad = dict(labels)
+        labels_bad[ids_in_order[0]] = 123
+        with pytest.raises(ValueError, match="label"):
+            build_r12_split(ids_in_order, labels_bad, groups)
+
+    def test_groups_must_be_nonempty_strings(self, sample_data):
+        from xh202615.r12_split import build_r12_split
+
+        ids_in_order, labels, groups = sample_data
+        groups_bad = dict(groups)
+        groups_bad[ids_in_order[0]] = 123
+        with pytest.raises(ValueError, match="group"):
+            build_r12_split(ids_in_order, labels, groups_bad)
+
+    def test_five_feasible_folds_required(self):
+        from xh202615.r12_split import build_r12_split
+
+        ids_in_order, labels, groups = _make_balanced_data(2)
+        with pytest.raises(ValueError):
+            build_r12_split(ids_in_order, labels, groups)
+
 
 class TestWriteAndLoadR12Split:
     def test_round_trip(self, sample_data, tmp_path: Path):
@@ -215,16 +262,27 @@ class TestWriteAndLoadR12Split:
         with pytest.raises(ValueError, match="ID"):
             load_r12_split(path, expected_ids=[*ids_in_order, "extra"])
 
-    def _write_tampered_manifest(
-        self, path: Path, base_data: dict[str, Any], tamper: dict[str, Any]
-    ) -> None:
-        from xh202615.r12_split import _manifest_payload as manifest_payload
+    def test_loader_rejects_duplicate_nested_keys(self, sample_data, tmp_path: Path):
+        from xh202615.r12_split import build_r12_split, load_r12_split
 
-        data = dict(base_data)
-        data.update(tamper)
-        payload = manifest_payload(data)
-        data["manifest_sha256"] = _sha256_hex(_canonical_json(payload))
-        path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        ids_in_order, labels, groups = sample_data
+        manifest = build_r12_split(ids_in_order, labels, groups)
+        base = json.loads(_canonical_json(manifest.__dict__))
+        base["manifest_sha256"] = _recompute_manifest_sha256(base)
+        sid = ids_in_order[0]
+        role = base["roles_by_id"][sid]
+        original_roles = json.dumps(base["roles_by_id"], sort_keys=True)
+        duplicate_roles = (
+            "{"
+            + f"{json.dumps(sid)}: {json.dumps(role)}, "
+            + f"{json.dumps(sid)}: {json.dumps(role)}"
+            + "}"
+        )
+        text = json.dumps(base, sort_keys=True).replace(original_roles, duplicate_roles, 1)
+        path = tmp_path / "dup.json"
+        path.write_text(text, encoding="utf-8")
+        with pytest.raises(ValueError, match="duplicate"):
+            load_r12_split(path, expected_ids=ids_in_order)
 
     def test_loader_rejects_invalid_role_name(self, sample_data, tmp_path: Path):
         from xh202615.r12_split import build_r12_split, load_r12_split, write_r12_split
@@ -233,10 +291,10 @@ class TestWriteAndLoadR12Split:
         manifest = build_r12_split(ids_in_order, labels, groups)
         path = tmp_path / "manifest.json"
         write_r12_split(path, manifest)
-        base_data = json.loads(path.read_text(encoding="utf-8"))
-        self._write_tampered_manifest(
-            path, base_data, {"roles_by_id": {**base_data["roles_by_id"], ids_in_order[0]: "evil"}}
-        )
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["roles_by_id"] = {**data["roles_by_id"], ids_in_order[0]: "evil"}
+        data["manifest_sha256"] = _recompute_manifest_sha256(data)
+        path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
         with pytest.raises(ValueError, match="role"):
             load_r12_split(path, expected_ids=ids_in_order)
 
@@ -247,13 +305,96 @@ class TestWriteAndLoadR12Split:
         manifest = build_r12_split(ids_in_order, labels, groups)
         path = tmp_path / "manifest.json"
         write_r12_split(path, manifest)
-        base_data = json.loads(path.read_text(encoding="utf-8"))
-        self._write_tampered_manifest(
-            path,
-            base_data,
-            {"roles_by_id": {**base_data["roles_by_id"], ids_in_order[1]: "validation"}},
-        )
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["roles_by_id"] = {**data["roles_by_id"], ids_in_order[1]: "validation"}
+        data["manifest_sha256"] = _recompute_manifest_sha256(data)
+        path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
         with pytest.raises(ValueError, match="group"):
+            load_r12_split(path, expected_ids=ids_in_order)
+
+    def test_loader_rejects_extra_groups(self, sample_data, tmp_path: Path):
+        from xh202615.r12_split import build_r12_split, load_r12_split, write_r12_split
+
+        ids_in_order, labels, groups = sample_data
+        manifest = build_r12_split(ids_in_order, labels, groups)
+        path = tmp_path / "manifest.json"
+        write_r12_split(path, manifest)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["groups_by_id"]["extra"] = "group_extra"
+        data["manifest_sha256"] = _recompute_manifest_sha256(data)
+        path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        with pytest.raises(ValueError, match="group|ID"):
+            load_r12_split(path, expected_ids=ids_in_order)
+
+    def test_loader_rejects_missing_groups(self, sample_data, tmp_path: Path):
+        from xh202615.r12_split import build_r12_split, load_r12_split, write_r12_split
+
+        ids_in_order, labels, groups = sample_data
+        manifest = build_r12_split(ids_in_order, labels, groups)
+        path = tmp_path / "manifest.json"
+        write_r12_split(path, manifest)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        del data["groups_by_id"][ids_in_order[0]]
+        data["manifest_sha256"] = _recompute_manifest_sha256(data)
+        path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        with pytest.raises(ValueError, match="group|ID"):
+            load_r12_split(path, expected_ids=ids_in_order)
+
+    def test_loader_rejects_bad_role_counts(self, sample_data, tmp_path: Path):
+        from xh202615.r12_split import build_r12_split, load_r12_split, write_r12_split
+
+        ids_in_order, labels, groups = sample_data
+        manifest = build_r12_split(ids_in_order, labels, groups)
+        path = tmp_path / "manifest.json"
+        write_r12_split(path, manifest)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["role_counts"]["train"] += 1
+        data["manifest_sha256"] = _recompute_manifest_sha256(data)
+        path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        with pytest.raises(ValueError, match="role_counts"):
+            load_r12_split(path, expected_ids=ids_in_order)
+
+    def test_loader_rejects_bad_group_counts(self, sample_data, tmp_path: Path):
+        from xh202615.r12_split import build_r12_split, load_r12_split, write_r12_split
+
+        ids_in_order, labels, groups = sample_data
+        manifest = build_r12_split(ids_in_order, labels, groups)
+        path = tmp_path / "manifest.json"
+        write_r12_split(path, manifest)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        first_group = next(iter(data["group_counts"]))
+        data["group_counts"][first_group] += 1
+        data["manifest_sha256"] = _recompute_manifest_sha256(data)
+        path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        with pytest.raises(ValueError, match="group_counts"):
+            load_r12_split(path, expected_ids=ids_in_order)
+
+    def test_loader_rejects_bad_source_digests_schema(self, sample_data, tmp_path: Path):
+        from xh202615.r12_split import build_r12_split, load_r12_split, write_r12_split
+
+        ids_in_order, labels, groups = sample_data
+        manifest = build_r12_split(ids_in_order, labels, groups)
+        path = tmp_path / "manifest.json"
+        write_r12_split(path, manifest)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["source_digests"]["evil"] = "a" * 64
+        data["manifest_sha256"] = _recompute_manifest_sha256(data)
+        path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        with pytest.raises(ValueError, match="source_digests"):
+            load_r12_split(path, expected_ids=ids_in_order)
+
+    def test_loader_rejects_invalid_source_digest_hex(self, sample_data, tmp_path: Path):
+        from xh202615.r12_split import build_r12_split, load_r12_split, write_r12_split
+
+        ids_in_order, labels, groups = sample_data
+        manifest = build_r12_split(ids_in_order, labels, groups)
+        path = tmp_path / "manifest.json"
+        write_r12_split(path, manifest)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["source_digests"]["ids"] = "G" * 64
+        data["manifest_sha256"] = _recompute_manifest_sha256(data)
+        path.write_text(json.dumps(data, sort_keys=True), encoding="utf-8")
+        with pytest.raises(ValueError, match="source_digests|hex"):
             load_r12_split(path, expected_ids=ids_in_order)
 
     def test_loader_rejects_bad_manifest_sha256(self, sample_data, tmp_path: Path):
@@ -299,9 +440,7 @@ class TestPrepareSplitCLI:
         groups_path = tmp_path / "groups.json"
         output_path = tmp_path / "manifest.json"
 
-        with jsonl_path.open("w", encoding="utf-8", newline="\n") as f:
-            for sid in ids_in_order:
-                f.write(json.dumps({"id": sid}, sort_keys=True) + "\n")
+        _write_canonical_jsonl(jsonl_path, ids_in_order)
         labels_path.write_text(
             json.dumps(labels, sort_keys=True, ensure_ascii=False),
             encoding="utf-8",
@@ -322,6 +461,106 @@ class TestPrepareSplitCLI:
         assert output_path.exists()
         assert summary["row_count"] == len(ids_in_order)
 
+    def test_cli_requires_exact_canonical_schema(self, tmp_path: Path):
+        import scripts.r12_prepare_split as cli
+
+        ids_in_order, labels, groups = _make_balanced_data(10)
+        jsonl_path = tmp_path / "input.jsonl"
+        labels_path = tmp_path / "labels.json"
+        groups_path = tmp_path / "groups.json"
+        output_path = tmp_path / "manifest.json"
+
+        with jsonl_path.open("w", encoding="utf-8", newline="\n") as handle:
+            for sid in ids_in_order:
+                handle.write(json.dumps({"id": sid, "label": "secret"}, sort_keys=True) + "\n")
+        labels_path.write_text(json.dumps(labels, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+        groups_path.write_text(json.dumps(groups, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="label-free|exact"):
+            cli.main(
+                [
+                    "--canonical-input-jsonl", str(jsonl_path),
+                    "--labels", str(labels_path),
+                    "--groups", str(groups_path),
+                    "--output", str(output_path),
+                ]
+            )
+
+    def test_cli_rejects_invalid_label_value(self, tmp_path: Path):
+        import scripts.r12_prepare_split as cli
+
+        ids_in_order, labels, groups = _make_balanced_data(10)
+        jsonl_path = tmp_path / "input.jsonl"
+        labels_path = tmp_path / "labels.json"
+        groups_path = tmp_path / "groups.json"
+        output_path = tmp_path / "manifest.json"
+
+        _write_canonical_jsonl(jsonl_path, ids_in_order)
+        labels_bad = dict(labels)
+        labels_bad[ids_in_order[0]] = 123
+        labels_path.write_text(json.dumps(labels_bad, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+        groups_path.write_text(json.dumps(groups, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="label"):
+            cli.main(
+                [
+                    "--canonical-input-jsonl", str(jsonl_path),
+                    "--labels", str(labels_path),
+                    "--groups", str(groups_path),
+                    "--output", str(output_path),
+                ]
+            )
+
+    def test_cli_rejects_invalid_group_value_empty(self, tmp_path: Path):
+        import scripts.r12_prepare_split as cli
+
+        ids_in_order, labels, groups = _make_balanced_data(10)
+        jsonl_path = tmp_path / "input.jsonl"
+        labels_path = tmp_path / "labels.json"
+        groups_path = tmp_path / "groups.json"
+        output_path = tmp_path / "manifest.json"
+
+        _write_canonical_jsonl(jsonl_path, ids_in_order)
+        labels_path.write_text(json.dumps(labels, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+        groups_bad = dict(groups)
+        groups_bad[ids_in_order[0]] = ""
+        groups_path.write_text(json.dumps(groups_bad, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="group"):
+            cli.main(
+                [
+                    "--canonical-input-jsonl", str(jsonl_path),
+                    "--labels", str(labels_path),
+                    "--groups", str(groups_path),
+                    "--output", str(output_path),
+                ]
+            )
+
+    def test_cli_rejects_invalid_group_value_int(self, tmp_path: Path):
+        import scripts.r12_prepare_split as cli
+
+        ids_in_order, labels, groups = _make_balanced_data(10)
+        jsonl_path = tmp_path / "input.jsonl"
+        labels_path = tmp_path / "labels.json"
+        groups_path = tmp_path / "groups.json"
+        output_path = tmp_path / "manifest.json"
+
+        _write_canonical_jsonl(jsonl_path, ids_in_order)
+        labels_path.write_text(json.dumps(labels, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+        groups_bad = dict(groups)
+        groups_bad[ids_in_order[0]] = 123
+        groups_path.write_text(json.dumps(groups_bad, sort_keys=True, ensure_ascii=False), encoding="utf-8")
+
+        with pytest.raises(ValueError, match="group"):
+            cli.main(
+                [
+                    "--canonical-input-jsonl", str(jsonl_path),
+                    "--labels", str(labels_path),
+                    "--groups", str(groups_path),
+                    "--output", str(output_path),
+                ]
+            )
+
     def test_cli_rejects_mismatched_ids(self, tmp_path: Path):
         import scripts.r12_prepare_split as cli
 
@@ -331,9 +570,7 @@ class TestPrepareSplitCLI:
         groups_path = tmp_path / "groups.json"
         output_path = tmp_path / "manifest.json"
 
-        with jsonl_path.open("w", encoding="utf-8", newline="\n") as f:
-            for sid in ids_in_order:
-                f.write(json.dumps({"id": sid}, sort_keys=True) + "\n")
+        _write_canonical_jsonl(jsonl_path, ids_in_order)
         labels_path.write_text(
             json.dumps({**labels, "extra": None}, sort_keys=True, ensure_ascii=False),
             encoding="utf-8",
