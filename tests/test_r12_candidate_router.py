@@ -61,3 +61,12 @@ def test_router_fit_uses_only_positive_train_rows() -> None:
     positive_count = sum(label is not None for label in train_labels.values())
     assert router.fit_row_count == positive_count * 4
     assert router.fit_group_count == 4
+
+
+def test_router_report_marks_existing_held_out_contaminated() -> None:
+    from pathlib import Path
+
+    report = Path("docs/r12/router-development-report.md")
+    text = report.read_text(encoding="utf-8")
+    assert "contaminated" in text
+    assert "not used for selection" in text
