@@ -157,6 +157,53 @@ def test_select_creates_frozen_selection_without_held_out_labels(tmp_path: Path)
     assert '"label"' not in json.dumps(data).lower()
 
 
+def test_select_serializes_router_without_labels_or_candidate_cer(tmp_path: Path) -> None:
+    from scripts.r12_strict_holdout import main
+
+    paths = _write_fixture(tmp_path)
+    selection = tmp_path / "selection.json"
+    assert main(_select_args(paths, selection)) == 0
+    router = json.loads(selection.read_text(encoding="utf-8"))["selection"]["router"]
+    assert router["action_order"] == ["primary", "r3", "tse", "energy"]
+    assert "label" not in json.dumps(router).lower()
+    assert "candidate_cer" not in json.dumps(router).lower()
+
+
+def test_evaluate_rejects_router_payload_drift(tmp_path: Path) -> None:
+    from scripts.r12_strict_holdout import main
+
+    paths = _write_fixture(tmp_path)
+    selection = tmp_path / "selection.json"
+    assert main(_select_args(paths, selection)) == 0
+    data = json.loads(selection.read_text(encoding="utf-8"))
+    data["selection"]["router"]["feature_schema_digest"] = "0" * 64
+    data["provenance"]["selection_payload_sha256"] = __import__("hashlib").sha256(
+        json.dumps(data["selection"], sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    data["provenance"]["provenance_payload_sha256"] = __import__("hashlib").sha256(
+        json.dumps(
+            {key: value for key, value in data["provenance"].items() if key != "provenance_payload_sha256"},
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    selection.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ValueError, match="router"):
+        main([
+            "evaluate",
+            "--canonical-input-jsonl", str(paths["canonical"]),
+            "--groups", str(paths["groups"]),
+            "--split-manifest", str(paths["split"]),
+            "--train-labels", str(paths["train_labels"]),
+            "--validation-labels", str(paths["validation_labels"]),
+            "--cache-root", str(paths["cache"]),
+            "--selection-input", str(selection),
+            "--held-out-labels", str(paths["held_out_labels"]),
+            "--evaluation-output", str(tmp_path / "evaluation"),
+        ] + _source_args(paths))
+
+
 def test_select_rejects_held_out_labels_flag(tmp_path: Path) -> None:
     from scripts.r12_strict_holdout import main
 
@@ -365,4 +412,3 @@ def test_held_out_labels_cannot_change_published_predictions(tmp_path: Path) -> 
     assert (first / "r12_held_out_predictions.jsonl").read_bytes() == (
         second / "r12_held_out_predictions.jsonl"
     ).read_bytes()
-

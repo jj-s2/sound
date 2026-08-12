@@ -29,6 +29,11 @@ from xh202615.r12_calibrated_gate import (
     predict_with_selection,
     select_on_validation,
 )
+from xh202615.r12_candidate_router import (
+    TrainCandidateRouter,
+    fit_train_candidate_router,
+    predict_router_actions,
+)
 from xh202615.r12_split import R12SplitManifest, load_r12_split
 
 
@@ -97,8 +102,13 @@ def _rows_by_role(rows: Sequence[CandidateRow], split: R12SplitManifest, role: s
     return [row for row in rows if split.roles_by_id[row.id] == role]
 
 
-def _selection_dict(selection: FrozenGateSelection, provenance: Mapping[str, object]) -> dict[str, object]:
+def _selection_dict(
+    selection: FrozenGateSelection,
+    provenance: Mapping[str, object],
+    router: TrainCandidateRouter,
+) -> dict[str, object]:
     payload = selection.to_dict()
+    payload["router"] = router.to_public_dict()
     frozen_provenance = {
         **dict(provenance),
         "selection_payload_sha256": _json_sha(payload),
@@ -130,6 +140,15 @@ def _selection_from_dict(data: Mapping[str, object]) -> FrozenGateSelection:
     nested = selection.get("provenance")
     if not isinstance(nested, Mapping):
         raise ValueError("selection has no validation provenance")
+    router = selection.get("router")
+    if not isinstance(router, Mapping):
+        raise ValueError("selection router is invalid")
+    if router.get("action_order") != ["primary", "r3", "tse", "energy"]:
+        raise ValueError("selection router action order is invalid")
+    for field in ("feature_schema_digest", "parameters_digest", "model_digest"):
+        value = router.get(field)
+        if not isinstance(value, str) or len(value) != 64:
+            raise ValueError("selection router digest is invalid")
     calibrator = selection.get("calibrator")
     if not isinstance(calibrator, Mapping):
         raise ValueError("selection must contain one two-column calibrator")
@@ -202,6 +221,16 @@ def _fit_from_train(
     return fit_train_calibrated_gate(train_joined, seed=20260807), train_joined, validation_joined
 
 
+def _fit_router_from_train(
+    rows: Sequence[CandidateRow],
+    split: R12SplitManifest,
+    train_joined: Sequence[JoinedPvadRow],
+    train_labels: Mapping[str, str | None],
+) -> TrainCandidateRouter:
+    train_rows = _rows_by_role(rows, split, "train")
+    return fit_train_candidate_router(train_rows, train_joined, train_labels, seed=20260807)
+
+
 def _validate_selection_against_trained(
     selection: FrozenGateSelection, trained: TrainCalibratedGate
 ) -> None:
@@ -256,14 +285,16 @@ def _select(args: argparse.Namespace) -> int:
     validation_ids = [row.id for row in validation_rows]
     train_labels = _validate_role_labels(_load_mapping(args.train_labels), train_ids, "train")
     validation_labels = _validate_role_labels(_load_mapping(args.validation_labels), validation_ids, "validation")
-    trained, _, validation_joined = _fit_from_train(
+    trained, train_joined, validation_joined = _fit_from_train(
         rows, groups, split, records, cache_manifest, train_labels, validation_labels
     )
+    router = _fit_router_from_train(rows, split, train_joined, train_labels)
+    validation_actions = predict_router_actions(router, validation_rows, validation_joined)
     selection = select_on_validation(
         trained, validation_joined, validation_rows,
         validation_labels,
         n_boot=args.bootstrap_count, seed=args.seed,
-        accepted_action="primary",
+        accepted_actions=validation_actions,
     )
     provenance = {
         "canonical_sha256": _sha(args.canonical_input_jsonl),
@@ -285,7 +316,7 @@ def _select(args: argparse.Namespace) -> int:
         },
     }
     Path(args.selection_output).write_text(
-        json.dumps(_selection_dict(selection, provenance), sort_keys=True, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(_selection_dict(selection, provenance, router), sort_keys=True, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     print(args.selection_output)
@@ -334,9 +365,12 @@ def _evaluate(args: argparse.Namespace) -> int:
         [row.id for row in validation_rows],
         "validation",
     )
-    trained, _, validation_joined = _fit_from_train(
+    trained, train_joined, validation_joined = _fit_from_train(
         rows, groups, split, records, cache_manifest, train_labels, validation_labels
     )
+    router = _fit_router_from_train(rows, split, train_joined, train_labels)
+    if selection_data["selection"].get("router") != router.to_public_dict():
+        raise ValueError("selection router does not match the train refit")
     _validate_selection_against_trained(selection, trained)
     expected_model_identity = {
         "module": "xh202615.r12_calibrated_gate",
@@ -346,15 +380,22 @@ def _evaluate(args: argparse.Namespace) -> int:
     }
     if outer_provenance.get("model_identity") != expected_model_identity:
         raise ValueError("selection model identity mismatch")
-    _recompute_and_verify_selection(
-        selection, trained, validation_joined, validation_rows, validation_labels
+    validation_actions = predict_router_actions(router, validation_rows, validation_joined)
+    expected = select_on_validation(
+        trained, validation_joined, validation_rows, validation_labels,
+        n_boot=selection.provenance["validation_n_boot"],
+        seed=selection.provenance["validation_seed"],
+        accepted_actions=validation_actions,
     )
+    if expected.to_dict() != selection.to_dict():
+        raise ValueError("frozen selection does not match validation recomputation")
     all_labels = {row.id: None for row in rows}
     all_labels.update(train_labels)
     joined = _load_joined(rows, groups, records, cache_manifest, all_labels)
     joined_by_id = {row.id: row for row in joined}
     held_out_joined = [joined_by_id[row.id] for row in held_out_rows]
     decisions = predict_with_selection(trained, selection, held_out_joined)
+    held_out_actions = predict_router_actions(router, held_out_rows, held_out_joined)
 
     held_out_labels = _validate_role_labels(
         _load_mapping(args.held_out_labels),
@@ -363,11 +404,11 @@ def _evaluate(args: argparse.Namespace) -> int:
     )
     official_predictions: list[dict[str, str]] = []
     prediction_lines: list[str] = []
-    for row, joined_row, decision in (
-        zip(held_out_rows, held_out_joined, decisions)
+    for row, joined_row, decision, router_action in (
+        zip(held_out_rows, held_out_joined, decisions, held_out_actions)
     ):
         accepted = bool(decision)
-        text = row.primary_text if accepted else ""
+        text = row.texts[router_action] if accepted else ""
         official_predictions.append({"id": row.id, "recognition_text": text})
         prediction_lines.append(json.dumps({
             "id": row.id,
@@ -375,6 +416,7 @@ def _evaluate(args: argparse.Namespace) -> int:
             "accepted": accepted,
             "threshold": selection.threshold,
             "action": "accept" if accepted else "reject",
+            "router_action": router_action,
             "recognition_text": text,
         }, ensure_ascii=False, sort_keys=True))
     samples = [
@@ -459,4 +501,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

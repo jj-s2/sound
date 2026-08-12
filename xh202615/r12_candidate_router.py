@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 import math
+import pickle
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -15,6 +18,11 @@ from .r11_pvad_oracle import JoinedPvadRow
 
 
 ROUTER_ACTIONS = ("primary", "r3", "tse", "energy")
+_ROUTER_PARAMETERS = {
+    "max_leaf_nodes": 7,
+    "l2_regularization": 1.0,
+    "loss": "squared_error",
+}
 
 
 @dataclass(frozen=True)
@@ -30,6 +38,23 @@ class TrainCandidateRouter:
     fit_row_count: int
     fit_group_count: int
     seed: int
+
+    def to_public_dict(self) -> dict[str, object]:
+        """Return a label-free, deterministic identity for the frozen router."""
+        parameters = {**_ROUTER_PARAMETERS, "random_state": self.seed}
+        return {
+            "action_order": list(ROUTER_ACTIONS),
+            "feature_schema": list(self.feature_schema),
+            "feature_schema_digest": _digest(self.feature_schema),
+            "parameters_digest": _digest(parameters),
+            "model_digest": hashlib.sha256(pickle.dumps(self.model, protocol=5)).hexdigest(),
+        }
+
+
+def _digest(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _finite(value: object) -> float:
@@ -116,7 +141,7 @@ def fit_train_candidate_router(
     if not np.isfinite(targets).all():
         raise ValueError("router targets must be finite")
     model = HistGradientBoostingRegressor(
-        max_leaf_nodes=7, l2_regularization=1.0, random_state=seed
+        **_ROUTER_PARAMETERS, random_state=seed
     ).fit(matrix, targets)
     return TrainCandidateRouter(schema, model, len(keys), len(groups), seed)
 
