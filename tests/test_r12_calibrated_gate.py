@@ -285,6 +285,23 @@ class TestTrainCalibration:
 
 
 class TestValidationSelection:
+    def test_selection_can_score_explicit_text_gate_fusion(self, split_fixture, feasible_finite):
+        from xh202615.r12_calibrated_gate import fit_train_calibrated_gate, select_on_validation
+
+        joined_train, joined_val, val_rows, val_labels = split_fixture
+        trained = fit_train_calibrated_gate(joined_train, seed=SEED)
+        selection = select_on_validation(
+            trained,
+            joined_val,
+            val_rows,
+            val_labels,
+            n_boot=10,
+            seed=SEED,
+            accepted_actions=("primary",) * len(val_rows),
+            text_scores=np.linspace(0.0, 1.0, len(val_rows)),
+        )
+        assert selection.provenance["text_fusion_weight"] == 0.5
+
     def test_selection_fails_closed_when_no_bootstrap_candidate_is_feasible(
         self, split_fixture, monkeypatch
     ):

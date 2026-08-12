@@ -34,7 +34,9 @@ BASE_MODELS = (
     "hist_gradient_boosting_leaf_15",
 )
 BLEND_WEIGHTS = (0.0, 0.25, 0.5, 0.75, 1.0)
+TEXT_FUSION_WEIGHT = 0.5
 _BLEND_MODEL_NAME = "blend"
+_TEXT_FUSION_MODEL_NAME = "text_gate_fusion"
 _REJECT_ALL_MODEL_NAME = "reject_all"
 _RAW_RR_FLOOR = 0.95
 _BOOTSTRAP_RR_FLOOR = 0.93
@@ -356,6 +358,7 @@ def select_on_validation(
     seed: int,
     accepted_action: str = "oracle",
     accepted_actions: Sequence[str] | None = None,
+    text_scores: Sequence[float] | None = None,
 ) -> FrozenGateSelection:
     """Select the best validation threshold/model/blend under RR floors."""
 
@@ -370,6 +373,16 @@ def select_on_validation(
     base_scores = _validation_base_scores(trained, X_val)
     calibrated_scores = _validation_calibrated_scores(trained, base_scores)
     variants = _score_variants(calibrated_scores)
+    if text_scores is not None:
+        text_array = np.asarray(text_scores, dtype=np.float64)
+        if text_array.shape != (len(validation_rows),) or not np.isfinite(text_array).all():
+            raise ValueError("text_scores must be finite and align with validation rows")
+        variants[_TEXT_FUSION_MODEL_NAME] = (
+            _TEXT_FUSION_MODEL_NAME,
+            TEXT_FUSION_WEIGHT,
+            (1.0 - TEXT_FUSION_WEIGHT) * calibrated_scores[BASE_MODELS[1]]
+            + TEXT_FUSION_WEIGHT * text_array,
+        )
 
     if accepted_actions is not None:
         if len(accepted_actions) != len(validation_rows) or any(
@@ -532,6 +545,7 @@ def select_on_validation(
             "n_eligible_raw": len(eligible),
             "n_feasible_bootstrap": len(feasible),
             "accepted_action": provenance_action,
+            "text_fusion_weight": TEXT_FUSION_WEIGHT if text_scores is not None else None,
         },
     )
 
@@ -540,6 +554,7 @@ def predict_with_selection(
     trained: TrainCalibratedGate,
     selection: FrozenGateSelection,
     joined_rows: Sequence[JoinedPvadRow],
+    text_scores: Sequence[float] | None = None,
 ) -> np.ndarray:
     """Return binary accept/reject predictions for ``joined_rows``."""
 
@@ -549,6 +564,14 @@ def predict_with_selection(
 
     if selection.selected_model_name == _REJECT_ALL_MODEL_NAME:
         score = np.full(len(joined_rows), -1.0, dtype=np.float64)
+    elif selection.selected_model_name == _TEXT_FUSION_MODEL_NAME:
+        text_array = np.asarray(text_scores, dtype=np.float64)
+        if text_array.shape != (len(joined_rows),) or not np.isfinite(text_array).all():
+            raise ValueError("text_scores must be finite and align with prediction rows")
+        score = (
+            (1.0 - TEXT_FUSION_WEIGHT) * calibrated_scores[BASE_MODELS[1]]
+            + TEXT_FUSION_WEIGHT * text_array
+        )
     elif selection.selected_model_name == _BLEND_MODEL_NAME:
         weight = selection.selected_blend_weight
         score = (

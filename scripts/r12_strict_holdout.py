@@ -34,6 +34,11 @@ from xh202615.r12_candidate_router import (
     fit_train_candidate_router,
     predict_router_actions,
 )
+from xh202615.r12_text_presence import (
+    TrainTextPresence,
+    fit_train_text_presence,
+    predict_text_presence,
+)
 from xh202615.r12_split import R12SplitManifest, load_r12_split
 
 
@@ -106,9 +111,11 @@ def _selection_dict(
     selection: FrozenGateSelection,
     provenance: Mapping[str, object],
     router: TrainCandidateRouter,
+    text_presence: TrainTextPresence,
 ) -> dict[str, object]:
     payload = selection.to_dict()
     payload["router"] = router.to_public_dict()
+    payload["text_presence"] = text_presence.to_public_dict()
     frozen_provenance = {
         **dict(provenance),
         "selection_payload_sha256": _json_sha(payload),
@@ -149,6 +156,15 @@ def _selection_from_dict(data: Mapping[str, object]) -> FrozenGateSelection:
         value = router.get(field)
         if not isinstance(value, str) or len(value) != 64:
             raise ValueError("selection router digest is invalid")
+    text_presence = selection.get("text_presence")
+    if not isinstance(text_presence, Mapping):
+        raise ValueError("selection text presence is invalid")
+    if text_presence.get("input_fields") != ["r3_text", "primary_text"]:
+        raise ValueError("selection text presence inputs are invalid")
+    for field in ("parameters_digest", "model_digest"):
+        value = text_presence.get(field)
+        if not isinstance(value, str) or len(value) != 64:
+            raise ValueError("selection text presence digest is invalid")
     calibrator = selection.get("calibrator")
     if not isinstance(calibrator, Mapping):
         raise ValueError("selection must contain one two-column calibrator")
@@ -167,7 +183,7 @@ def _selection_from_dict(data: Mapping[str, object]) -> FrozenGateSelection:
     if tuple(model_names or ()) != tuple(BASE_MODELS):
         raise ValueError("selection base models are invalid")
     selected_model_name = selection.get("selected_model_name")
-    if selected_model_name not in {*BASE_MODELS, "blend", "reject_all"}:
+    if selected_model_name not in {*BASE_MODELS, "blend", "text_gate_fusion", "reject_all"}:
         raise ValueError("selection model name is invalid")
     selected_weight = selection.get("selected_blend_weight")
     if type(selected_weight) not in (int, float) or float(selected_weight) not in BLEND_WEIGHTS:
@@ -231,6 +247,12 @@ def _fit_router_from_train(
     return fit_train_candidate_router(train_rows, train_joined, train_labels, seed=20260807)
 
 
+def _fit_text_presence_from_train(
+    rows: Sequence[CandidateRow], split: R12SplitManifest, train_labels: Mapping[str, str | None]
+) -> TrainTextPresence:
+    return fit_train_text_presence(_rows_by_role(rows, split, "train"), train_labels, seed=20260807)
+
+
 def _validate_selection_against_trained(
     selection: FrozenGateSelection, trained: TrainCalibratedGate
 ) -> None:
@@ -289,12 +311,15 @@ def _select(args: argparse.Namespace) -> int:
         rows, groups, split, records, cache_manifest, train_labels, validation_labels
     )
     router = _fit_router_from_train(rows, split, train_joined, train_labels)
+    text_presence = _fit_text_presence_from_train(rows, split, train_labels)
     validation_actions = predict_router_actions(router, validation_rows, validation_joined)
+    validation_text_scores = predict_text_presence(text_presence, validation_rows)
     selection = select_on_validation(
         trained, validation_joined, validation_rows,
         validation_labels,
         n_boot=args.bootstrap_count, seed=args.seed,
         accepted_actions=validation_actions,
+        text_scores=validation_text_scores,
     )
     provenance = {
         "canonical_sha256": _sha(args.canonical_input_jsonl),
@@ -316,7 +341,7 @@ def _select(args: argparse.Namespace) -> int:
         },
     }
     Path(args.selection_output).write_text(
-        json.dumps(_selection_dict(selection, provenance, router), sort_keys=True, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(_selection_dict(selection, provenance, router, text_presence), sort_keys=True, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
     print(args.selection_output)
@@ -369,8 +394,11 @@ def _evaluate(args: argparse.Namespace) -> int:
         rows, groups, split, records, cache_manifest, train_labels, validation_labels
     )
     router = _fit_router_from_train(rows, split, train_joined, train_labels)
+    text_presence = _fit_text_presence_from_train(rows, split, train_labels)
     if selection_data["selection"].get("router") != router.to_public_dict():
         raise ValueError("selection router does not match the train refit")
+    if selection_data["selection"].get("text_presence") != text_presence.to_public_dict():
+        raise ValueError("selection text presence does not match the train refit")
     _validate_selection_against_trained(selection, trained)
     expected_model_identity = {
         "module": "xh202615.r12_calibrated_gate",
@@ -381,11 +409,13 @@ def _evaluate(args: argparse.Namespace) -> int:
     if outer_provenance.get("model_identity") != expected_model_identity:
         raise ValueError("selection model identity mismatch")
     validation_actions = predict_router_actions(router, validation_rows, validation_joined)
+    validation_text_scores = predict_text_presence(text_presence, validation_rows)
     expected = select_on_validation(
         trained, validation_joined, validation_rows, validation_labels,
         n_boot=selection.provenance["validation_n_boot"],
         seed=selection.provenance["validation_seed"],
         accepted_actions=validation_actions,
+        text_scores=validation_text_scores,
     )
     if expected.to_dict() != selection.to_dict():
         raise ValueError("frozen selection does not match validation recomputation")
@@ -394,8 +424,11 @@ def _evaluate(args: argparse.Namespace) -> int:
     joined = _load_joined(rows, groups, records, cache_manifest, all_labels)
     joined_by_id = {row.id: row for row in joined}
     held_out_joined = [joined_by_id[row.id] for row in held_out_rows]
-    decisions = predict_with_selection(trained, selection, held_out_joined)
     held_out_actions = predict_router_actions(router, held_out_rows, held_out_joined)
+    held_out_text_scores = predict_text_presence(text_presence, held_out_rows)
+    decisions = predict_with_selection(
+        trained, selection, held_out_joined, text_scores=held_out_text_scores
+    )
 
     held_out_labels = _validate_role_labels(
         _load_mapping(args.held_out_labels),

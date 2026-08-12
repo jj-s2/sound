@@ -169,6 +169,41 @@ def test_select_serializes_router_without_labels_or_candidate_cer(tmp_path: Path
     assert "candidate_cer" not in json.dumps(router).lower()
 
 
+def test_select_serializes_text_presence_without_training_text_or_labels(tmp_path: Path) -> None:
+    from scripts.r12_strict_holdout import main
+
+    paths = _write_fixture(tmp_path)
+    selection = tmp_path / "selection.json"
+    assert main(_select_args(paths, selection)) == 0
+    text_presence = json.loads(selection.read_text(encoding="utf-8"))["selection"]["text_presence"]
+    assert text_presence["input_fields"] == ["r3_text", "primary_text"]
+    assert "label" not in json.dumps(text_presence).lower()
+    assert "training" not in json.dumps(text_presence).lower()
+
+
+def test_selection_loader_accepts_frozen_text_gate_fusion(tmp_path: Path) -> None:
+    from scripts.r12_strict_holdout import _selection_from_dict, main
+
+    paths = _write_fixture(tmp_path)
+    selection = tmp_path / "selection.json"
+    assert main(_select_args(paths, selection)) == 0
+    data = json.loads(selection.read_text(encoding="utf-8"))
+    data["selection"]["selected_model_name"] = "text_gate_fusion"
+    data["selection"]["selected_blend_weight"] = 0.5
+    data["provenance"]["selection_payload_sha256"] = __import__("hashlib").sha256(
+        json.dumps(data["selection"], sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    data["provenance"]["provenance_payload_sha256"] = __import__("hashlib").sha256(
+        json.dumps(
+            {key: value for key, value in data["provenance"].items() if key != "provenance_payload_sha256"},
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert _selection_from_dict(data).selected_model_name == "text_gate_fusion"
+
+
 def test_evaluate_rejects_router_payload_drift(tmp_path: Path) -> None:
     from scripts.r12_strict_holdout import main
 
