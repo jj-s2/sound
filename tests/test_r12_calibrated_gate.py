@@ -391,6 +391,39 @@ class TestValidationSelection:
         )
         assert selection.provenance["accepted_action"] == "primary"
 
+    def test_selection_scores_fixed_router_actions_not_primary(self, split_fixture, feasible_finite):
+        from xh202615.r12_calibrated_gate import fit_train_calibrated_gate, select_on_validation
+
+        joined_train, joined_val, val_rows, val_labels = split_fixture
+        trained = fit_train_calibrated_gate(joined_train, seed=SEED)
+        actions = tuple("tse" if index % 2 else "primary" for index in range(len(val_rows)))
+        selection = select_on_validation(
+            trained,
+            joined_val,
+            val_rows,
+            val_labels,
+            n_boot=10,
+            seed=SEED,
+            accepted_actions=actions,
+        )
+        assert selection.provenance["accepted_action"] == "router"
+
+    def test_selection_rejects_misaligned_router_actions(self, split_fixture, feasible_finite):
+        from xh202615.r12_calibrated_gate import fit_train_calibrated_gate, select_on_validation
+
+        joined_train, joined_val, val_rows, val_labels = split_fixture
+        trained = fit_train_calibrated_gate(joined_train, seed=SEED)
+        with pytest.raises(ValueError, match="actions"):
+            select_on_validation(
+                trained,
+                joined_val,
+                val_rows,
+                val_labels,
+                n_boot=10,
+                seed=SEED,
+                accepted_actions=("primary",),
+            )
+
     def test_eligible_point_has_raw_rr_at_least_floor(self, split_fixture, feasible_finite):
         from xh202615.r12_calibrated_gate import fit_train_calibrated_gate, select_on_validation
 
@@ -521,4 +554,3 @@ class TestSerializationPrivacy:
         serial = selection.to_dict()
         assert serial["calibrator"]["coefficients"] == list(selection.calibrator_coefficients)
         assert serial["calibrator"]["intercept"] == selection.calibrator_intercept
-

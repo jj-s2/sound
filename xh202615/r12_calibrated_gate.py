@@ -355,6 +355,7 @@ def select_on_validation(
     n_boot: int,
     seed: int,
     accepted_action: str = "oracle",
+    accepted_actions: Sequence[str] | None = None,
 ) -> FrozenGateSelection:
     """Select the best validation threshold/model/blend under RR floors."""
 
@@ -370,8 +371,41 @@ def select_on_validation(
     calibrated_scores = _validation_calibrated_scores(trained, base_scores)
     variants = _score_variants(calibrated_scores)
 
-    if accepted_action == "oracle":
+    if accepted_actions is not None:
+        if len(accepted_actions) != len(validation_rows) or any(
+            action not in CANDIDATE_ACTIONS for action in accepted_actions
+        ):
+            raise ValueError("accepted_actions must align with validation rows")
+        substitutions = np.zeros(len(validation_rows), dtype=np.int64)
+        insertions = np.zeros(len(validation_rows), dtype=np.int64)
+        deletions = np.zeros(len(validation_rows), dtype=np.int64)
+        ref_chars = np.zeros(len(validation_rows), dtype=np.int64)
+        is_positive = np.zeros(len(validation_rows), dtype=np.bool_)
+        chosen_actions: list[str] = []
+        for index, (row, action) in enumerate(zip(validation_rows, accepted_actions)):
+            label = validation_labels[row.id]
+            if label is None:
+                chosen_actions.append("reject")
+                continue
+            is_positive[index] = True
+            stats = cer_stats(label, row.texts[action])
+            substitutions[index] = stats.substitutions
+            insertions[index] = stats.insertions
+            deletions[index] = stats.deletions
+            ref_chars[index] = stats.ref_chars
+            chosen_actions.append(action)
+        contributions = OracleContributions(
+            substitutions=substitutions,
+            insertions=insertions,
+            deletions=deletions,
+            ref_chars=ref_chars,
+            is_positive=is_positive,
+            chosen_actions=tuple(chosen_actions),
+        )
+        provenance_action = "router"
+    elif accepted_action == "oracle":
         contributions = build_oracle_contributions(validation_rows, validation_labels)
+        provenance_action = "oracle"
     elif accepted_action in CANDIDATE_ACTIONS:
         substitutions = np.zeros(len(validation_rows), dtype=np.int64)
         insertions = np.zeros(len(validation_rows), dtype=np.int64)
@@ -399,6 +433,7 @@ def select_on_validation(
             is_positive=is_positive,
             chosen_actions=tuple(chosen_actions),
         )
+        provenance_action = accepted_action
     else:
         raise ValueError(f"unsupported accepted transcript action: {accepted_action}")
     groups = [row.group for row in joined_validation]
@@ -496,7 +531,7 @@ def select_on_validation(
             "n_candidates_evaluated": len(candidates),
             "n_eligible_raw": len(eligible),
             "n_feasible_bootstrap": len(feasible),
-            "accepted_action": accepted_action,
+            "accepted_action": provenance_action,
         },
     )
 
@@ -531,4 +566,3 @@ def predict_with_selection(
             return np.zeros(len(joined_rows), dtype=np.int64)
         raise ValueError(f"invalid threshold marker: {threshold}")
     return (score >= threshold).astype(np.int64)
-
