@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import sys
 from pathlib import Path
 from typing import Any, Iterable
@@ -21,6 +22,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.r11_pvad_oracle_oof import load_canonical_rows
+from xh202615.r10_selector import _finite_or_nan, _load_text_by_id, _read_jsonl, _wav_duration_sec
 from xh202615.r12_split import build_r12_split, load_r12_split, write_r12_split
 
 
@@ -134,6 +136,100 @@ def prepare_r12_split(
     }
 
 
+def build_canonical_input(
+    candidate_fusion: str | Path,
+    tse_asr: str | Path,
+    audio_map: str | Path,
+    r3_predictions: str | Path,
+    group_manifest: str | Path,
+    output: str | Path,
+) -> dict:
+    """Project the four existing R10 candidate sources into label-free JSONL.
+
+    The group manifest is consumed only to establish the exact ID order and
+    source coverage; labels are never written to the canonical output.
+    """
+
+    source_paths = {
+        "candidate_fusion": Path(candidate_fusion).expanduser().resolve(strict=True),
+        "tse_asr": Path(tse_asr).expanduser().resolve(strict=True),
+        "audio_map": Path(audio_map).expanduser().resolve(strict=True),
+        "r3_predictions": Path(r3_predictions).expanduser().resolve(strict=True),
+        "group_manifest": Path(group_manifest).expanduser().resolve(strict=True),
+    }
+    manifest = json.loads(source_paths["group_manifest"].read_text(encoding="utf-8-sig"))
+    manifest_rows = manifest.get("rows") if isinstance(manifest, dict) else None
+    if not isinstance(manifest_rows, list) or not manifest_rows:
+        raise ValueError("group manifest must contain nonempty rows")
+    ids: list[str] = []
+    groups: dict[str, str] = {}
+    for item in manifest_rows:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+            raise ValueError("group manifest row has invalid id")
+        sid = item["id"]
+        if sid in groups:
+            raise ValueError(f"duplicate group manifest id {sid}")
+        group = item.get("wake_component")
+        if not isinstance(group, str) or not group:
+            raise ValueError(f"group manifest row has invalid group for {sid}")
+        ids.append(sid)
+        groups[sid] = group
+    ids = sorted(ids, key=lambda value: int(value) if value.isdigit() else value)
+
+    fusion_by_id = {str(item.get("id")): item for item in _read_jsonl(source_paths["candidate_fusion"])}
+    audio_by_id = {str(item.get("id")): item for item in _read_jsonl(source_paths["audio_map"])}
+    tse_by_id = _load_text_by_id(source_paths["tse_asr"], "text", "recognition_text")
+    r3_by_id = _load_text_by_id(source_paths["r3_predictions"], "recognition_text", "text")
+    if set(fusion_by_id) != set(ids) or set(audio_by_id) != set(ids) or set(tse_by_id) != set(ids) or set(r3_by_id) != set(ids):
+        raise ValueError("R10 candidate sources do not exactly cover group manifest IDs")
+    rows: list[dict[str, object]] = []
+    for sid in ids:
+        fusion = fusion_by_id[sid]
+        candidates = fusion.get("candidate_texts", {})
+        r3_text = r3_by_id[sid]
+        primary_text = str(candidates.get("primary", ""))
+        energy_text = str(candidates.get("energy", ""))
+        tse_text = tse_by_id[sid]
+        audio = audio_by_id[sid]
+        original_audio = audio.get("original_command_audio")
+        duration = _wav_duration_sec(original_audio) if original_audio else math.nan
+        audio_features = {
+            "presence_score": _finite_or_nan(audio.get("presence_score")),
+            "enhanced_cosine": _finite_or_nan(audio.get("enhanced_cosine")),
+            "mixture_cosine": _finite_or_nan(audio.get("mixture_cosine")),
+            "max_cosine": _finite_or_nan(audio.get("max_cosine")),
+            "latency_ms": _finite_or_nan(audio.get("latency_ms")),
+            "cmd_duration_sec": duration,
+            "cmd_rms": math.nan,
+        }
+        source_digest = hashlib.sha256(json.dumps(
+            [sid, r3_text, primary_text, energy_text, tse_text],
+            ensure_ascii=False, sort_keys=True,
+        ).encode("utf-8")).hexdigest()
+        rows.append({
+            "id": sid,
+            "split": "unknown",
+            "r3_text": r3_text,
+            "primary_text": primary_text,
+            "energy_text": energy_text,
+            "tse_text": tse_text,
+            "audio_features": audio_features,
+            "source_digest": source_digest,
+        })
+    output_path = Path(output).expanduser().resolve(strict=False)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="\n") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False, allow_nan=True, separators=(",", ":")) + "\n")
+    return {
+        "output": str(output_path),
+        "row_count": len(rows),
+        "source_paths": {name: str(path) for name, path in source_paths.items()},
+        "source_digests": {name: _sha256_hex(path.read_bytes()) for name, path in source_paths.items()},
+        "output_sha256": _sha256_hex(output_path.read_bytes()),
+    }
+
+
 def parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--canonical-input-jsonl", required=True, type=Path)
@@ -157,3 +253,4 @@ def main(argv: Iterable[str] | None = None) -> dict:
 
 if __name__ == "__main__":
     main()
+

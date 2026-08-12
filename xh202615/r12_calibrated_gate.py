@@ -11,14 +11,16 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 
-from .r10_selector import CandidateRow
+from .r10_selector import CANDIDATE_ACTIONS, CandidateRow
 from .r11_gate_oracle import (
     GateModelSpec,
+    OracleContributions,
     _fit_gate_pipeline,
     build_oracle_contributions,
     cross_fit_gate_models,
     gate_oracle_frontier,
 )
+from .metrics import cer_stats
 from .r11_pvad_oracle import (
     E0_FITTING_FEATURE_SCHEMA,
     PVAD_FITTING_FEATURE_SCHEMA,
@@ -37,6 +39,12 @@ _REJECT_ALL_MODEL_NAME = "reject_all"
 _RAW_RR_FLOOR = 0.95
 _BOOTSTRAP_RR_FLOOR = 0.93
 _N_SPLITS = 3
+
+FITTING_FEATURE_SCHEMA = (*PVAD_FITTING_FEATURE_SCHEMA, *E0_FITTING_FEATURE_SCHEMA)
+
+
+class BootstrapFeasibilityError(ValueError):
+    """Raised when no validation candidate satisfies both RR floors."""
 
 
 def _base_specs() -> tuple[GateModelSpec, ...]:
@@ -166,6 +174,11 @@ def _bootstrap_point_stats(
 
 def _safe_threshold(value: float) -> float | str:
     return _REJECT_ALL_MODEL_NAME if math.isinf(value) else float(value)
+
+
+def _threshold_sort_value(value: float) -> float:
+    """Sort finite thresholds before the reject-all (+inf) boundary."""
+    return float("inf") if math.isinf(value) else float(value)
 
 
 @dataclass(frozen=True)
@@ -341,6 +354,7 @@ def select_on_validation(
     *,
     n_boot: int,
     seed: int,
+    accepted_action: str = "oracle",
 ) -> FrozenGateSelection:
     """Select the best validation threshold/model/blend under RR floors."""
 
@@ -356,19 +370,52 @@ def select_on_validation(
     calibrated_scores = _validation_calibrated_scores(trained, base_scores)
     variants = _score_variants(calibrated_scores)
 
-    contributions = build_oracle_contributions(validation_rows, validation_labels)
+    if accepted_action == "oracle":
+        contributions = build_oracle_contributions(validation_rows, validation_labels)
+    elif accepted_action in CANDIDATE_ACTIONS:
+        substitutions = np.zeros(len(validation_rows), dtype=np.int64)
+        insertions = np.zeros(len(validation_rows), dtype=np.int64)
+        deletions = np.zeros(len(validation_rows), dtype=np.int64)
+        ref_chars = np.zeros(len(validation_rows), dtype=np.int64)
+        is_positive = np.zeros(len(validation_rows), dtype=np.bool_)
+        chosen_actions: list[str] = []
+        for index, row in enumerate(validation_rows):
+            label = validation_labels[row.id]
+            if label is None:
+                chosen_actions.append("reject")
+                continue
+            is_positive[index] = True
+            stats = cer_stats(label, row.texts[accepted_action])
+            substitutions[index] = stats.substitutions
+            insertions[index] = stats.insertions
+            deletions[index] = stats.deletions
+            ref_chars[index] = stats.ref_chars
+            chosen_actions.append(accepted_action)
+        contributions = OracleContributions(
+            substitutions=substitutions,
+            insertions=insertions,
+            deletions=deletions,
+            ref_chars=ref_chars,
+            is_positive=is_positive,
+            chosen_actions=tuple(chosen_actions),
+        )
+    else:
+        raise ValueError(f"unsupported accepted transcript action: {accepted_action}")
     groups = [row.group for row in joined_validation]
 
     candidates: list[dict[str, object]] = []
     for candidate_name, (model_name, blend_weight, scores) in variants.items():
         frontier = gate_oracle_frontier(scores, contributions)
         for point in frontier:
+            threshold = float(point["threshold"])
+            if math.isinf(threshold):
+                continue
             candidates.append(
                 {
                     "candidate_name": candidate_name,
                     "model_name": model_name,
                     "blend_weight": blend_weight,
-                    "threshold": float(point["threshold"]),
+                    "threshold": threshold,
                     "raw_cer": float(point["cer"]),
                     "raw_rr": float(point["rr"]),
                     "raw_overall": float(point["overall"]),
@@ -377,8 +424,9 @@ def select_on_validation(
 
     eligible = [c for c in candidates if c["raw_rr"] >= _RAW_RR_FLOOR]
     if not eligible:
-        reject_all = next(c for c in candidates if math.isinf(c["threshold"]))
-        eligible = [reject_all]
+        raise BootstrapFeasibilityError(
+            "no validation candidate satisfies raw and bootstrap RR floors"
+        )
 
     bootstrapped: list[dict[str, object]] = []
     for candidate in eligible:
@@ -395,9 +443,10 @@ def select_on_validation(
 
     feasible = [c for c in bootstrapped if c["rr_p05"] >= _BOOTSTRAP_RR_FLOOR]
     if not feasible:
-        feasible = [c for c in bootstrapped if math.isinf(c["threshold"])]
-        if not feasible:
-            feasible = bootstrapped
+        raise BootstrapFeasibilityError(
+            "no validation candidate satisfies raw and bootstrap RR floors"
+        )
+
 
     def sort_key(c: dict[str, object]) -> tuple:
         threshold = c["threshold"]
@@ -405,7 +454,7 @@ def select_on_validation(
             -float(c["overall_median"]),
             -float(c["raw_rr"]),
             float(c["raw_cer"]),
-            0.0 if math.isinf(threshold) else float(threshold),
+            float("inf") if math.isinf(threshold) else float(threshold),
             str(c["model_name"]),
             float(c["blend_weight"]),
         )
@@ -447,6 +496,7 @@ def select_on_validation(
             "n_candidates_evaluated": len(candidates),
             "n_eligible_raw": len(eligible),
             "n_feasible_bootstrap": len(feasible),
+            "accepted_action": accepted_action,
         },
     )
 
@@ -481,3 +531,4 @@ def predict_with_selection(
             return np.zeros(len(joined_rows), dtype=np.int64)
         raise ValueError(f"invalid threshold marker: {threshold}")
     return (score >= threshold).astype(np.int64)
+

@@ -58,9 +58,53 @@ def _joined_with_targets(joined: list[JoinedPvadRow], targets: list[int]) -> lis
     ]
 
 
+def _patch_feasible_finite(module, monkeypatch, *, raw_rr: float = 0.95, rr_p05: float = 0.93):
+    """Patch frontier/bootstrap so at least one finite threshold meets both RR floors."""
+
+    def feasible_frontier(scores, contributions):
+        cer = 1.0 - raw_rr
+        return [
+            {
+                "threshold": float("inf"),
+                "cer": 1.0,
+                "rr": 1.0,
+                "overall": 0.5,
+                "accepted_positives": 0.0,
+                "accepted_negatives": 0.0,
+            },
+            {
+                "threshold": 0.5,
+                "cer": cer,
+                "rr": raw_rr,
+                "overall": (1.0 - cer + raw_rr) / 2.0,
+                "accepted_positives": 1.0,
+                "accepted_negatives": 0.0,
+            },
+        ]
+
+    def feasible_bootstrap(*args, **kwargs):
+        return {
+            "overall_median": 0.95,
+            "rr_p05": rr_p05,
+            "n_boot": kwargs["n_boot"],
+            "attempted_replicates": kwargs["n_boot"],
+            "rejected_replicates": 0,
+        }
+
+    monkeypatch.setattr(module, "gate_oracle_frontier", feasible_frontier)
+    monkeypatch.setattr(module, "_bootstrap_point_stats", feasible_bootstrap)
+
+
 @pytest.fixture
 def split_fixture():
     return _split_fixture()
+
+
+@pytest.fixture
+def feasible_finite(monkeypatch):
+    import xh202615.r12_calibrated_gate as module
+
+    _patch_feasible_finite(module, monkeypatch)
 
 
 class TestPublicInterface:
@@ -241,7 +285,84 @@ class TestTrainCalibration:
 
 
 class TestValidationSelection:
-    def test_selection_returns_frozen_gate_selection(self, split_fixture):
+    def test_selection_fails_closed_when_no_bootstrap_candidate_is_feasible(
+        self, split_fixture, monkeypatch
+    ):
+        import xh202615.r12_calibrated_gate as module
+
+        joined_train, joined_val, val_rows, val_labels = split_fixture
+        trained = module.fit_train_calibrated_gate(joined_train, seed=SEED)
+
+        def infeasible_bootstrap(*args, **kwargs):
+            return {
+                "overall_median": 0.5,
+                "rr_p05": 0.92,
+                "n_boot": kwargs["n_boot"],
+                "attempted_replicates": kwargs["n_boot"],
+                "rejected_replicates": 0,
+            }
+
+        monkeypatch.setattr(module, "_bootstrap_point_stats", infeasible_bootstrap)
+        with pytest.raises(
+            module.BootstrapFeasibilityError, match="no validation candidate satisfies"
+        ):
+            module.select_on_validation(
+                trained, joined_val, val_rows, val_labels, n_boot=10, seed=SEED
+            )
+
+    def test_reject_all_is_never_selected_as_fallback(self, split_fixture, monkeypatch):
+        import xh202615.r12_calibrated_gate as module
+
+        joined_train, joined_val, val_rows, val_labels = split_fixture
+        trained = module.fit_train_calibrated_gate(joined_train, seed=SEED)
+
+        def finite_infeasible_reject_all_feasible(*args, **kwargs):
+            threshold = kwargs["threshold"]
+            if math.isinf(threshold):
+                return {
+                    "overall_median": 0.5,
+                    "rr_p05": 0.93,
+                    "n_boot": kwargs["n_boot"],
+                    "attempted_replicates": kwargs["n_boot"],
+                    "rejected_replicates": 0,
+                }
+            return {
+                "overall_median": 0.5,
+                "rr_p05": 0.92,
+                "n_boot": kwargs["n_boot"],
+                "attempted_replicates": kwargs["n_boot"],
+                "rejected_replicates": 0,
+            }
+
+        monkeypatch.setattr(
+            module, "_bootstrap_point_stats", finite_infeasible_reject_all_feasible
+        )
+        with pytest.raises(
+            module.BootstrapFeasibilityError, match="no validation candidate satisfies"
+        ):
+            module.select_on_validation(
+                trained, joined_val, val_rows, val_labels, n_boot=10, seed=SEED
+            )
+
+    def test_finite_lower_threshold_wins_tie_against_reject_all(
+        self, split_fixture, feasible_finite
+    ):
+        import xh202615.r12_calibrated_gate as module
+
+        joined_train, joined_val, val_rows, val_labels = split_fixture
+        trained = module.fit_train_calibrated_gate(joined_train, seed=SEED)
+        selection = module.select_on_validation(
+            trained, joined_val, val_rows, val_labels, n_boot=10, seed=SEED
+        )
+        assert isinstance(selection.threshold, float)
+        assert math.isfinite(selection.threshold)
+
+    def test_infinite_threshold_sorts_after_finite_threshold(self):
+        import xh202615.r12_calibrated_gate as module
+
+        assert module._threshold_sort_value(float("0.5")) < module._threshold_sort_value(float("inf"))
+
+    def test_selection_returns_frozen_gate_selection(self, split_fixture, feasible_finite):
         from xh202615.r12_calibrated_gate import fit_train_calibrated_gate, select_on_validation
 
         joined_train, joined_val, val_rows, val_labels = split_fixture
@@ -254,7 +375,23 @@ class TestValidationSelection:
         assert isinstance(selection.validation_raw_metrics, dict)
         assert isinstance(selection.validation_bootstrapped_metrics, dict)
 
-    def test_eligible_point_has_raw_rr_at_least_floor(self, split_fixture):
+    def test_selection_can_freeze_a_deployable_transcript_action(self, split_fixture, feasible_finite):
+        from xh202615.r12_calibrated_gate import fit_train_calibrated_gate, select_on_validation
+
+        joined_train, joined_val, val_rows, val_labels = split_fixture
+        trained = fit_train_calibrated_gate(joined_train, seed=SEED)
+        selection = select_on_validation(
+            trained,
+            joined_val,
+            val_rows,
+            val_labels,
+            n_boot=10,
+            seed=SEED,
+            accepted_action="primary",
+        )
+        assert selection.provenance["accepted_action"] == "primary"
+
+    def test_eligible_point_has_raw_rr_at_least_floor(self, split_fixture, feasible_finite):
         from xh202615.r12_calibrated_gate import fit_train_calibrated_gate, select_on_validation
 
         joined_train, joined_val, val_rows, val_labels = split_fixture
@@ -264,7 +401,7 @@ class TestValidationSelection:
         )
         assert selection.validation_raw_metrics["rr"] >= 0.95
 
-    def test_eligible_point_has_bootstrap_rr_5th_percentile_at_least_floor(self, split_fixture):
+    def test_eligible_point_has_bootstrap_rr_5th_percentile_at_least_floor(self, split_fixture, feasible_finite):
         from xh202615.r12_calibrated_gate import fit_train_calibrated_gate, select_on_validation
 
         joined_train, joined_val, val_rows, val_labels = split_fixture
@@ -274,7 +411,7 @@ class TestValidationSelection:
         )
         assert selection.validation_bootstrapped_metrics["rr_p05"] >= 0.93
 
-    def test_selection_handles_reject_all(self, split_fixture):
+    def test_selection_never_returns_reject_all(self, split_fixture, feasible_finite):
         from xh202615.r12_calibrated_gate import fit_train_calibrated_gate, select_on_validation
 
         joined_train, joined_val, val_rows, val_labels = split_fixture
@@ -282,15 +419,10 @@ class TestValidationSelection:
         selection = select_on_validation(
             trained, joined_val, val_rows, val_labels, n_boot=50, seed=SEED
         )
-        if selection.threshold == "reject_all":
-            assert selection.validation_raw_metrics["rr"] == 1.0
-            assert selection.validation_raw_metrics["cer"] == 1.0
-            assert selection.validation_raw_metrics["overall"] == 0.5
-        else:
-            assert isinstance(selection.threshold, float)
-            assert math.isfinite(selection.threshold)
+        assert isinstance(selection.threshold, float)
+        assert math.isfinite(selection.threshold)
 
-    def test_selection_is_deterministic(self, split_fixture):
+    def test_selection_is_deterministic(self, split_fixture, feasible_finite):
         from xh202615.r12_calibrated_gate import fit_train_calibrated_gate, select_on_validation
 
         joined_train, joined_val, val_rows, val_labels = split_fixture
@@ -306,7 +438,7 @@ class TestValidationSelection:
 
 
 class TestPrediction:
-    def test_predict_matches_selected_threshold(self, split_fixture):
+    def test_predict_matches_selected_threshold(self, split_fixture, feasible_finite):
         from xh202615.r12_calibrated_gate import fit_train_calibrated_gate, predict_with_selection, select_on_validation
 
         joined_train, joined_val, val_rows, val_labels = split_fixture
@@ -318,7 +450,7 @@ class TestPrediction:
         assert preds.shape == (len(joined_val),)
         assert set(np.unique(preds).tolist()) <= {0, 1}
 
-    def test_predict_is_deterministic(self, split_fixture):
+    def test_predict_is_deterministic(self, split_fixture, feasible_finite):
         from xh202615.r12_calibrated_gate import fit_train_calibrated_gate, predict_with_selection, select_on_validation
 
         joined_train, joined_val, val_rows, val_labels = split_fixture
@@ -332,7 +464,7 @@ class TestPrediction:
 
 
 class TestSerializationPrivacy:
-    def test_serial_form_excludes_private_fields(self, split_fixture):
+    def test_serial_form_excludes_private_fields(self, split_fixture, feasible_finite):
         from xh202615.r12_calibrated_gate import fit_train_calibrated_gate, select_on_validation
 
         joined_train, joined_val, val_rows, val_labels = split_fixture
@@ -356,7 +488,7 @@ class TestSerializationPrivacy:
         for token in forbidden:
             assert token not in text, f"serial form leaks {token!r}"
 
-    def test_serial_form_includes_required_fields(self, split_fixture):
+    def test_serial_form_includes_required_fields(self, split_fixture, feasible_finite):
         from xh202615.r12_calibrated_gate import fit_train_calibrated_gate, select_on_validation
 
         joined_train, joined_val, val_rows, val_labels = split_fixture
@@ -375,7 +507,7 @@ class TestSerializationPrivacy:
         assert "validation_bootstrapped_metrics" in serial
         assert "provenance" in serial
 
-    def test_serial_form_calibrator_has_two_coefficients_and_intercept(self, split_fixture):
+    def test_serial_form_calibrator_has_two_coefficients_and_intercept(self, split_fixture, feasible_finite):
         from xh202615.r12_calibrated_gate import fit_train_calibrated_gate, select_on_validation
 
         joined_train, joined_val, val_rows, val_labels = split_fixture
@@ -389,3 +521,4 @@ class TestSerializationPrivacy:
         serial = selection.to_dict()
         assert serial["calibrator"]["coefficients"] == list(selection.calibrator_coefficients)
         assert serial["calibrator"]["intercept"] == selection.calibrator_intercept
+
