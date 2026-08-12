@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -202,6 +203,38 @@ def test_selection_loader_accepts_frozen_text_gate_fusion(tmp_path: Path) -> Non
         ).encode("utf-8")
     ).hexdigest()
     assert _selection_from_dict(data).selected_model_name == "text_gate_fusion"
+
+
+def test_evaluate_rebuilds_text_scores_for_frozen_text_gate_fusion(tmp_path: Path, monkeypatch) -> None:
+    import scripts.r12_strict_holdout as strict
+
+    original_select = strict.select_on_validation
+
+    def select_text_fusion(*args, **kwargs):
+        selection = original_select(*args, **kwargs)
+        return replace(
+            selection,
+            selected_model_name="text_gate_fusion",
+            selected_blend_weight=0.5,
+            threshold=0.0,
+        )
+
+    monkeypatch.setattr(strict, "select_on_validation", select_text_fusion)
+    paths = _write_fixture(tmp_path)
+    selection = tmp_path / "selection.json"
+    assert strict.main(_select_args(paths, selection)) == 0
+    assert strict.main([
+        "evaluate",
+        "--canonical-input-jsonl", str(paths["canonical"]),
+        "--groups", str(paths["groups"]),
+        "--split-manifest", str(paths["split"]),
+        "--train-labels", str(paths["train_labels"]),
+        "--validation-labels", str(paths["validation_labels"]),
+        "--cache-root", str(paths["cache"]),
+        "--selection-input", str(selection),
+        "--held-out-labels", str(paths["held_out_labels"]),
+        "--evaluation-output", str(tmp_path / "evaluation"),
+    ] + _source_args(paths)) == 0
 
 
 def test_evaluate_rejects_router_payload_drift(tmp_path: Path) -> None:
