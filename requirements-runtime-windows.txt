@@ -28,3 +28,12 @@ silero-vad==6.2.1
 umap-learn==0.5.6
 psutil==7.2.2
 wheel==0.47.0
+speechbrain==1.0.3
+hyperpyyaml==1.2.3
+joblib==1.5.3
+packaging==24.2
+PyYAML==6.0.3
+ruamel.yaml==0.18.16
+ruamel.yaml.clib==0.2.15
+sentencepiece==0.2.2
+tqdm==4.65.2

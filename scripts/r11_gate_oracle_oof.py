@@ -12,9 +12,6 @@ import argparse
 import hashlib
 import json
 import math
-import os
-import secrets
-import shutil
 import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -25,6 +22,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from xh202615.artifact_publish import ArtifactContract, publish_text_package
 from xh202615.data import Sample, load_dataset, load_split
 from xh202615.evaluation import evaluate_rows
 from xh202615.r10_selector import CandidateRow, load_candidate_bundle
@@ -53,6 +51,15 @@ _ARTIFACT_NAMES = {
     "frontier": "e0_frontier.jsonl",
     "report": "e0_report.md",
 }
+_ARTIFACT_CONTRACT = ArtifactContract(
+    artifact_kind=_ARTIFACT_KIND,
+    schema_version=_SCHEMA_VERSION,
+    required_names=tuple(_ARTIFACT_NAMES.values()),
+    identity_json_names=(
+        _ARTIFACT_NAMES["manifest"],
+        _ARTIFACT_NAMES["summary"],
+    ),
+)
 
 _FIXED_DECISION_GATES = {
     "overall_high_water": 0.81,
@@ -638,41 +645,6 @@ def _build_fold_metadata_evidence(result: dict[str, Any]) -> list[dict[str, Any]
     return evidence
 
 
-def _is_recognized_output(path: Path) -> bool:
-    """True only if the directory contains exactly this CLI's five artifact files
-    with the approved identity/schema markers in manifest and summary."""
-    if not path.is_dir():
-        return False
-    expected_names = set(_ARTIFACT_NAMES.values())
-    if {p.name for p in path.iterdir()} != expected_names:
-        return False
-    for name in expected_names:
-        child = path / name
-        if not child.is_file():
-            return False
-
-    try:
-        manifest = json.loads((path / _ARTIFACT_NAMES["manifest"]).read_text(encoding="utf-8"))
-        summary = json.loads((path / _ARTIFACT_NAMES["summary"]).read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return False
-
-    for obj in (manifest, summary):
-        if obj.get("artifact_kind") != _ARTIFACT_KIND:
-            return False
-        if obj.get("schema_version") != _SCHEMA_VERSION:
-            return False
-    return True
-
-
-def _unique_sibling(parent: Path, prefix: str) -> Path:
-    """Return a non-existent path under ``parent`` with the given prefix."""
-    while True:
-        candidate = parent / f"{prefix}.{secrets.token_hex(8)}"
-        if not candidate.exists():
-            return candidate
-
-
 def write_e0_artifacts(
     result: dict[str, Any],
     rows: Sequence[CandidateRow],
@@ -885,70 +857,14 @@ def write_e0_artifacts(
     ])
     report_text = "\n".join(report_lines)
 
-    # Serialize all staging, replacement, rollback, and cleanup for this root.
-    parent = output_root.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    lock = output_root.with_name(output_root.name + ".publish.lock")
-    owner_metadata = _canonical_json({"pid": os.getpid(), "token": secrets.token_hex(16)})
-    try:
-        lock.mkdir()
-    except FileExistsError as exc:
-        raise RuntimeError(
-            f"publication lock already exists for {output_root}: {lock}; refusing to modify it"
-        ) from exc
-    (lock / "owner.json").write_text(owner_metadata, encoding="utf-8")
-
-    staging = _unique_sibling(parent, output_root.name + ".staging")
-    backup: Path | None = None
-    publish_succeeded = False
-    restore_succeeded = False
-    try:
-        staging.mkdir()
-        (staging / _ARTIFACT_NAMES["manifest"]).write_text(manifest_json, encoding="utf-8")
-        (staging / _ARTIFACT_NAMES["summary"]).write_text(summary_json, encoding="utf-8")
-        with (staging / _ARTIFACT_NAMES["scores"]).open("w", encoding="utf-8") as handle:
-            for line in score_lines:
-                handle.write(line + "\n")
-        with (staging / _ARTIFACT_NAMES["frontier"]).open("w", encoding="utf-8") as handle:
-            for line in frontier_lines:
-                handle.write(line + "\n")
-        (staging / _ARTIFACT_NAMES["report"]).write_text(report_text, encoding="utf-8")
-
-        if output_root.exists():
-            if not _is_recognized_output(output_root):
-                raise ValueError(
-                    f"existing output root {output_root} is not a recognizable E0 artifact directory"
-                )
-            backup = _unique_sibling(parent, output_root.name + ".backup")
-            os.rename(output_root, backup)
-
-        os.rename(staging, output_root)
-        publish_succeeded = True
-    except Exception as publish_exc:
-        if backup is not None and backup.exists():
-            if output_root.exists():
-                raise RuntimeError(
-                    f"publish failed and unexpected output root was preserved at {output_root}; "
-                    f"recovery backup preserved at {backup}"
-                ) from publish_exc
-            try:
-                os.rename(backup, output_root)
-                restore_succeeded = True
-            except Exception as restore_exc:
-                raise RuntimeError(
-                    f"publish failed and restore failed; recovery backup at {backup}: {restore_exc}"
-                ) from publish_exc
-        raise
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging)
-        if backup is not None and backup.exists() and (publish_succeeded or restore_succeeded):
-            shutil.rmtree(backup)
-        owner = lock / "owner.json"
-        if owner.is_file() and owner.read_text(encoding="utf-8") == owner_metadata:
-            owner.unlink()
-            lock.rmdir()
-
+    contents = {
+        _ARTIFACT_NAMES["manifest"]: manifest_json,
+        _ARTIFACT_NAMES["summary"]: summary_json,
+        _ARTIFACT_NAMES["scores"]: "".join(line + "\n" for line in score_lines),
+        _ARTIFACT_NAMES["frontier"]: "".join(line + "\n" for line in frontier_lines),
+        _ARTIFACT_NAMES["report"]: report_text,
+    }
+    publish_text_package(output_root, _ARTIFACT_CONTRACT, contents)
     return final_paths
 
 

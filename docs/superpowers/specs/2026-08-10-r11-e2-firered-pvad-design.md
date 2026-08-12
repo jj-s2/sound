@@ -47,8 +47,8 @@ Its frozen runtime contract is:
 
 The project will not import the LiveKit async stack. It will implement a small
 offline adapter around the documented ONNX/ECAPA interface and retain upstream
-URLs, revision, license, raw file SHA-256 values, dependency versions, and ONNX
-input/output metadata in the cache manifest.
+URLs, revision, license, raw file SHA-256 values, required dependency versions,
+and ONNX input/output metadata in the cache manifest.
 
 ## Options considered
 

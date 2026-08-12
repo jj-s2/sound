@@ -141,7 +141,7 @@ class GateCrossFitTests(unittest.TestCase):
 
     def test_default_model_specs_match_frozen_grid(self):
         specs = default_model_specs()
-        self.assertEqual(len(specs), 6)
+        self.assertEqual(len(specs), 7)
         self.assertEqual(
             [(spec.family, dict(spec.parameters)) for spec in specs],
             [
@@ -162,6 +162,15 @@ class GateCrossFitTests(unittest.TestCase):
                     "hist_gradient_boosting",
                     {
                         "max_leaf_nodes": 7,
+                        "learning_rate": 0.05,
+                        "max_iter": 150,
+                        "l2_regularization": 1.0,
+                    },
+                ),
+                (
+                    "hist_gradient_boosting",
+                    {
+                        "max_leaf_nodes": 15,
                         "learning_rate": 0.05,
                         "max_iter": 150,
                         "l2_regularization": 1.0,
@@ -1427,9 +1436,9 @@ class ArtifactWriterTests(unittest.TestCase):
                 captured["dst"] = str(dst)
                 os_rename(src, dst)
 
-            from scripts import r11_gate_oracle_oof as oof_module
-            os_rename = oof_module.os.rename
-            with patch.object(oof_module.os, "rename", side_effect=fake_rename):
+            from xh202615 import artifact_publish
+            os_rename = artifact_publish.os.rename
+            with patch.object(artifact_publish.os, "rename", side_effect=fake_rename):
                 write_e0_artifacts(result, rows, groups, paths, out_root)
             self.assertTrue(out_root.is_dir())
             self.assertIn("staging", captured["src"])
@@ -1491,8 +1500,8 @@ class ArtifactWriterTests(unittest.TestCase):
             mutated[0] = replace(mutated[0], audio_features={**mutated[0].audio_features, "presence_score": 9.9})
             result2 = self._evaluate(mutated, labels, groups)
 
-            from scripts import r11_gate_oracle_oof as oof_module
-            original_rename = oof_module.os.rename
+            from xh202615 import artifact_publish
+            original_rename = artifact_publish.os.rename
             calls = {"count": 0}
 
             def failing_rename(src, dst):
@@ -1501,7 +1510,7 @@ class ArtifactWriterTests(unittest.TestCase):
                     raise OSError("forced rename failure")
                 return original_rename(src, dst)
 
-            with patch.object(oof_module.os, "rename", side_effect=failing_rename):
+            with patch.object(artifact_publish.os, "rename", side_effect=failing_rename):
                 with self.assertRaises(OSError):
                     write_e0_artifacts(result2, mutated, groups, paths, out_root)
 
@@ -1526,8 +1535,8 @@ class ArtifactWriterTests(unittest.TestCase):
             mutated[0] = replace(mutated[0], audio_features={**mutated[0].audio_features, "presence_score": 9.9})
             result2 = self._evaluate(mutated, labels, groups)
 
-            from scripts import r11_gate_oracle_oof as oof_module
-            original_rename = oof_module.os.rename
+            from xh202615 import artifact_publish
+            original_rename = artifact_publish.os.rename
             calls = {"count": 0}
 
             def failing_rename(src, dst):
@@ -1536,7 +1545,7 @@ class ArtifactWriterTests(unittest.TestCase):
                     return original_rename(src, dst)
                 raise OSError("forced rename failure")
 
-            with patch.object(oof_module.os, "rename", side_effect=failing_rename):
+            with patch.object(artifact_publish.os, "rename", side_effect=failing_rename):
                 with self.assertRaises(RuntimeError) as ctx:
                     write_e0_artifacts(result2, mutated, groups, paths, out_root)
                 self.assertIn("recovery backup", str(ctx.exception).lower())
@@ -1583,8 +1592,8 @@ class ArtifactWriterTests(unittest.TestCase):
             mutated[0] = replace(mutated[0], audio_features={**mutated[0].audio_features, "presence_score": 9.9})
             result2 = self._evaluate(mutated, labels, groups)
 
-            from scripts import r11_gate_oracle_oof as oof_module
-            original_rename = oof_module.os.rename
+            from xh202615 import artifact_publish
+            original_rename = artifact_publish.os.rename
             calls = {"count": 0}
 
             def competing_writer_rename(src, dst):
@@ -1595,7 +1604,7 @@ class ArtifactWriterTests(unittest.TestCase):
                     raise OSError("simulated competing publication")
                 return original_rename(src, dst)
 
-            with patch.object(oof_module.os, "rename", side_effect=competing_writer_rename):
+            with patch.object(artifact_publish.os, "rename", side_effect=competing_writer_rename):
                 with self.assertRaises(RuntimeError) as ctx:
                     write_e0_artifacts(result2, mutated, groups, paths, out_root)
 
