@@ -205,6 +205,31 @@ def test_selection_loader_accepts_frozen_text_gate_fusion(tmp_path: Path) -> Non
     assert _selection_from_dict(data).selected_model_name == "text_gate_fusion"
 
 
+def test_selection_loader_rejects_text_gate_fusion_weight_drift(tmp_path: Path) -> None:
+    from scripts.r12_strict_holdout import _selection_from_dict, main
+
+    paths = _write_fixture(tmp_path)
+    selection = tmp_path / "selection.json"
+    assert main(_select_args(paths, selection)) == 0
+    data = json.loads(selection.read_text(encoding="utf-8"))
+    data["selection"]["selected_model_name"] = "text_gate_fusion"
+    data["selection"]["selected_blend_weight"] = 0.25
+    data["selection"]["provenance"]["text_fusion_weight"] = 0.25
+    data["provenance"]["selection_payload_sha256"] = __import__("hashlib").sha256(
+        json.dumps(data["selection"], sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    data["provenance"]["provenance_payload_sha256"] = __import__("hashlib").sha256(
+        json.dumps(
+            {key: value for key, value in data["provenance"].items() if key != "provenance_payload_sha256"},
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    with pytest.raises(ValueError, match="text fusion"):
+        _selection_from_dict(data)
+
+
 def test_evaluate_rebuilds_text_scores_for_frozen_text_gate_fusion(tmp_path: Path, monkeypatch) -> None:
     import scripts.r12_strict_holdout as strict
 

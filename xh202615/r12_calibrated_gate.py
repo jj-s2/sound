@@ -523,7 +523,11 @@ def select_on_validation(
             "description": "weight is leaf15; blend = (1-w)*leaf7 + w*leaf15",
         },
         selected_model_name=str(best["model_name"]),
-        selected_blend_weight=float(best["blend_weight"]),
+        selected_blend_weight=(
+            TEXT_FUSION_WEIGHT
+            if best["model_name"] == _TEXT_FUSION_MODEL_NAME
+            else float(best["blend_weight"])
+        ),
         threshold=_safe_threshold(float(best["threshold"])),
         validation_raw_metrics={
             "overall": float(best["raw_overall"]),

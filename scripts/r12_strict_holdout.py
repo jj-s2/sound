@@ -28,6 +28,7 @@ from xh202615.r12_calibrated_gate import (
     fit_train_calibrated_gate,
     predict_with_selection,
     select_on_validation,
+    TEXT_FUSION_WEIGHT,
 )
 from xh202615.r12_candidate_router import (
     TrainCandidateRouter,
@@ -188,6 +189,11 @@ def _selection_from_dict(data: Mapping[str, object]) -> FrozenGateSelection:
     selected_weight = selection.get("selected_blend_weight")
     if type(selected_weight) not in (int, float) or float(selected_weight) not in BLEND_WEIGHTS:
         raise ValueError("selection blend weight is invalid")
+    if selected_model_name == "text_gate_fusion" and (
+        float(selected_weight) != TEXT_FUSION_WEIGHT
+        or nested.get("text_fusion_weight") != TEXT_FUSION_WEIGHT
+    ):
+        raise ValueError("selection text fusion weight is invalid")
     threshold = selection.get("threshold")
     if threshold != "reject_all" and (
         type(threshold) not in (int, float) or not math.isfinite(float(threshold))
