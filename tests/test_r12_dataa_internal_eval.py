@@ -141,3 +141,20 @@ def test_select_and_evaluate_enforce_staged_one_time_protocol(tmp_path: Path, mo
     assert "Dataset-A group-disjoint internal test" in (paths["result"] / "r12_report.md").read_text(encoding="utf-8")
     with pytest.raises(ValueError, match="one-time"):
         main(["evaluate", *common, "--selection-input", str(paths["selection"]), "--internal-test-labels", str(paths["test"]), "--evaluation-output", str(paths["result"])])
+
+
+def test_select_accepts_canonical_order_different_from_authenticated_pvad_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pVAD integrity is order-bound, while canonical rows may be role-ordered."""
+    import xh202615.r12_calibrated_gate as gate
+    from scripts.r12_dataa_internal_eval import main
+
+    monkeypatch.setattr(gate, "gate_oracle_frontier", lambda scores, contributions: [{"threshold": 0.5, "cer": 0.0, "rr": 0.95, "overall": 0.975, "accepted_positives": 1.0, "accepted_negatives": 0.0}])
+    monkeypatch.setattr(gate, "_bootstrap_point_stats", lambda *args, **kwargs: {"overall_median": 0.975, "rr_p05": 0.95, "n_boot": kwargs["n_boot"], "attempted_replicates": 1, "rejected_replicates": 0})
+    paths = _full_protocol_fixture(tmp_path)
+    canonical_rows = [line for line in paths["canonical"].read_text(encoding="utf-8").splitlines() if line]
+    paths["canonical"].write_text("\n".join(canonical_rows[::2] + canonical_rows[1::2]) + "\n", encoding="utf-8")
+    common = ["--canonical-input-jsonl", str(paths["canonical"]), "--lineage", str(paths["lineage"]), "--split-manifest", str(paths["split"]), "--cache-root", str(paths["cache"]), "--train-labels", str(paths["train"]), "--validation-labels", str(paths["validation"]), "--bootstrap-count", "5"]
+
+    assert main(["select", *common, "--selection-output", str(paths["selection"])]) == 0

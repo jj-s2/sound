@@ -112,7 +112,27 @@ def _common(args: argparse.Namespace):
 
 
 def _join(rows, group_by_id, records, cache_manifest, labels):
-    return join_pvad_e0_rows(rows, labels, group_by_id, records, cache_manifest)
+    """Join in the cache's authenticated order, then restore canonical order.
+
+    The pVAD cache manifest signs its selected-ID *sequence*.  Canonical R12
+    rows are independently ordered by evaluation role, so their equivalent ID
+    set need not share that sequence.  Keep the cache validation strict by
+    presenting its own signed order to the join, while returning rows in the
+    caller's canonical order for every downstream alignment.
+    """
+    selected = cache_manifest.get("coverage", {}).get("selected", {}).get("ids")
+    canonical_by_id = {row.id: row for row in rows}
+    if (
+        not isinstance(selected, list)
+        or not all(isinstance(sample_id, str) for sample_id in selected)
+        or len(selected) != len(set(selected))
+        or set(selected) != set(canonical_by_id)
+    ):
+        return join_pvad_e0_rows(rows, labels, group_by_id, records, cache_manifest)
+    authenticated_rows = [canonical_by_id[sample_id] for sample_id in selected]
+    joined = join_pvad_e0_rows(authenticated_rows, labels, group_by_id, records, cache_manifest)
+    joined_by_id = {row.id: row for row in joined}
+    return [joined_by_id[row.id] for row in rows]
 
 
 def _rows_for(rows, roles: Mapping[str, str], role: str):
