@@ -52,3 +52,20 @@ def test_missing_or_duplicate_candidate_ids_fail_closed(tmp_path: Path) -> None:
     candidate_path.write_text("\n".join([json.dumps({"id": "a", "recognition_text": "a"})] * 2) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="duplicate"):
         run_inference(input_path, candidate_path, threshold=0.5, probability_for=lambda row: 1.0)
+
+
+def test_inference_combines_two_label_free_manifests_without_duplicate_ids(tmp_path: Path) -> None:
+    from scripts.run_temporal_head_inference import run_inference_many
+
+    first, candidates = _inputs(tmp_path)
+    second = tmp_path / "second.jsonl"
+    command, wake = tmp_path / "cmd-c.wav", tmp_path / "wake-c.wav"
+    sf.write(command, [0.05] * 160, 16_000)
+    sf.write(wake, [0.0] * 160, 16_000)
+    second.write_text(json.dumps({"id": "c", "split": "neg", "wakeup_audio": str(wake), "command_audio": str(command)}) + "\n", encoding="utf-8")
+    with candidates.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"id": "c", "recognition_text": "文本-c"}, ensure_ascii=False) + "\n")
+
+    rows = run_inference_many([first, second], candidates, threshold=0.5, probability_for=lambda _row: 1.0)
+
+    assert [row["id"] for row in rows] == ["a", "b", "c"]

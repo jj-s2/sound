@@ -20,6 +20,77 @@ class CanonicalBuildSummary:
     rows: tuple[Mapping[str, object], ...]
 
 
+@dataclass(frozen=True)
+class SourceAttestationSummary:
+    output: Path
+    row_count: int
+    output_sha256: str
+
+
+def _sha_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _source_audio_path(row: Mapping[str, object]) -> Path:
+    """Return the original derived command source, never TSE-enhanced output."""
+    for key in ("original_command_audio", "command_audio", "audio"):
+        value = row.get(key)
+        if isinstance(value, str) and value:
+            return Path(value)
+    raise ValueError("source row has no original_command_audio or command_audio")
+
+
+def attest_source_command_audio(
+    lineage_path: Path, source_path: Path, output: Path
+) -> SourceAttestationSummary:
+    """Bind an inference JSONL to the exact command bytes in the lineage.
+
+    TSE ASR records preserve ``original_command_audio`` alongside their enhanced
+    waveform.  That field has priority, so the attestation proves candidate
+    provenance from the derived source audio rather than confusing it with an
+    intermediate enhanced file.
+    """
+    lineage = load_lineage(lineage_path)
+    source = _read_unique_without_digest(source_path)
+    if set(source) != set(lineage):
+        raise ValueError("source IDs must exactly cover lineage IDs")
+    rendered_rows: list[dict[str, object]] = []
+    for sample_id, lineage_row in lineage.items():
+        row = dict(source[sample_id])
+        audio_path = _source_audio_path(row)
+        if not audio_path.is_file():
+            raise ValueError(f"source audio is missing for {sample_id}")
+        if _sha_file(audio_path) != lineage_row.command_audio_sha256:
+            raise ValueError(f"source command audio does not match lineage for {sample_id}")
+        row["command_audio_sha256"] = lineage_row.command_audio_sha256
+        rendered_rows.append(row)
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    rendered = "".join(
+        json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
+        for row in rendered_rows
+    )
+    output.write_text(rendered, encoding="utf-8", newline="\n")
+    return SourceAttestationSummary(output, len(rendered_rows), _sha_file(output))
+
+
+def _read_unique_without_digest(path: Path) -> dict[str, dict[str, object]]:
+    result: dict[str, dict[str, object]] = {}
+    for number, line in enumerate(Path(path).read_text(encoding="utf-8-sig").splitlines(), 1):
+        raw = json.loads(line)
+        if not isinstance(raw, dict) or not isinstance(raw.get("id"), (str, int)):
+            raise ValueError(f"{path}:{number} has invalid ID")
+        sample_id = str(raw["id"])
+        if sample_id in result:
+            raise ValueError(f"duplicate ID {sample_id!r} in {path}")
+        result[sample_id] = raw
+    return result
+
+
 def _read_unique(path: Path) -> dict[str, dict[str, object]]:
     result: dict[str, dict[str, object]] = {}
     for number, line in enumerate(Path(path).read_text(encoding="utf-8-sig").splitlines(), 1):

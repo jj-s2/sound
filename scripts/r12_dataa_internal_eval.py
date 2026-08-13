@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.r11_pvad_oracle_oof import _cache, load_canonical_rows
+from xh202615.artifact_publish import ArtifactContract, publish_text_package
 from xh202615.data import Sample
 from xh202615.evaluation import evaluate_rows
 from xh202615.metrics import cer_stats
@@ -36,6 +37,19 @@ from xh202615.r12_candidate_router import fit_train_candidate_router, predict_ro
 from xh202615.r12_dataa_augmentation import load_lineage
 from xh202615.r12_dataa_augmented_split import load_augmented_internal_split
 from xh202615.r12_text_presence import fit_train_text_presence, predict_text_presence
+
+
+_EVALUATION_CONTRACT = ArtifactContract(
+    "r12_dataa_augmented_internal_test",
+    "v1",
+    (
+        "r12_manifest.json",
+        "r12_internal_predictions.jsonl",
+        "r12_summary.json",
+        "r12_report.md",
+    ),
+    ("r12_manifest.json", "r12_summary.json"),
+)
 
 
 def _sha(path: Path) -> str:
@@ -234,12 +248,43 @@ def evaluate(args: argparse.Namespace) -> int:
     metrics = dict(evaluate_rows(samples, predictions, missing_policy="empty").metrics)
     metrics["overall"] = ((1.0 - metrics["avg_cer"]) + metrics["avg_rr"]) / 2.0
     bootstrap = _bootstrap_point_stats(np.asarray(decisions, dtype=np.float64), _test_contributions(test_rows, test_labels, actions), [groups[row.id] for row in test_rows], 0.5, args.bootstrap_count, 20260812)
-    args.evaluation_output.mkdir(parents=True)
-    (args.evaluation_output / "r12_internal_predictions.jsonl").write_text("".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in predictions), encoding="utf-8")
-    summary = {"metrics": metrics, "bootstrap": bootstrap, "internal_test_label_read_count": 1, "scope": "Dataset-A group-disjoint internal test; not independent blind-test evidence"}
-    (args.evaluation_output / "r12_summary.json").write_text(json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-    manifest = {"selection_sha256": _sha(args.selection_input), "prediction_sha256": _sha(args.evaluation_output / "r12_internal_predictions.jsonl"), "summary_sha256": _sha(args.evaluation_output / "r12_summary.json"), "internal_test_label_read_count": 1}
-    (args.evaluation_output / "r12_manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+    predictions_text = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in predictions)
+    summary = {
+        "artifact_kind": _EVALUATION_CONTRACT.artifact_kind,
+        "schema_version": _EVALUATION_CONTRACT.schema_version,
+        "metrics": metrics,
+        "bootstrap": bootstrap,
+        "internal_test_label_read_count": 1,
+        "scope": "Dataset-A group-disjoint internal test; not independent blind-test evidence",
+    }
+    summary_text = json.dumps(summary, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    report_text = (
+        "# R12 Dataset-A Augmented Internal Test\n\n"
+        "- Scope: Dataset-A group-disjoint internal test; not independent blind-test evidence\n"
+        f"- Overall: {float(metrics['overall']):.6f}\n"
+        f"- RR: {float(metrics['avg_rr']):.6f}\n"
+        f"- CER: {float(metrics['avg_cer']):.6f}\n"
+        "- Internal-test label reads: 1\n"
+    )
+    output_digests = {
+        "r12_internal_predictions.jsonl": hashlib.sha256(predictions_text.encode("utf-8")).hexdigest(),
+        "r12_summary.json": hashlib.sha256(summary_text.encode("utf-8")).hexdigest(),
+        "r12_report.md": hashlib.sha256(report_text.encode("utf-8")).hexdigest(),
+    }
+    manifest = {
+        "artifact_kind": _EVALUATION_CONTRACT.artifact_kind,
+        "schema_version": _EVALUATION_CONTRACT.schema_version,
+        "selection_sha256": _sha(args.selection_input),
+        "output_digests": output_digests,
+        "internal_test_label_read_count": 1,
+    }
+    contents = {
+        "r12_manifest.json": json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        "r12_internal_predictions.jsonl": predictions_text,
+        "r12_summary.json": summary_text,
+        "r12_report.md": report_text,
+    }
+    publish_text_package(args.evaluation_output, _EVALUATION_CONTRACT, contents)
     return 0
 
 

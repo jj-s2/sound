@@ -11,7 +11,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.r11_pvad_oracle_oof import load_canonical_rows
 from xh202615.r12_dataa_augmented_split import build_augmented_internal_split, write_augmented_internal_split
 
 
@@ -22,14 +21,28 @@ def _mapping(path: Path, name: str) -> dict[str, object]:
     return {str(key): item for key, item in value.items()}
 
 
+def _raw_ids(dataset_root: Path) -> list[str]:
+    ids: list[str] = []
+    for split in ("pos", "neg"):
+        path = dataset_root / f"{split}.jsonl"
+        for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+            row = json.loads(line)
+            if not isinstance(row, dict) or not isinstance(row.get("id"), (str, int)):
+                raise ValueError(f"{path}:{number} has invalid id")
+            ids.append(str(row["id"]))
+    if len(ids) != len(set(ids)):
+        raise ValueError("raw Dataset-A has duplicate IDs")
+    return ids
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--canonical-input-jsonl", type=Path, required=True)
+    parser.add_argument("--dataset-root", type=Path, default=REPO_ROOT / "datasetA" / "datasetA")
     parser.add_argument("--labels", type=Path, required=True)
     parser.add_argument("--groups", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
-    ids = [row.id for row in load_canonical_rows(args.canonical_input_jsonl)]
+    ids = _raw_ids(args.dataset_root)
     labels = _mapping(args.labels, "labels")
     groups = _mapping(args.groups, "groups")
     manifest = build_augmented_internal_split(ids, labels, groups)  # type: ignore[arg-type]

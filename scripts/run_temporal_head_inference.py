@@ -7,7 +7,7 @@ import hashlib
 import json
 import sys
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Sequence
 
 import numpy as np
 
@@ -72,6 +72,40 @@ def run_inference(
     return output
 
 
+def run_inference_many(
+    input_jsonls: Sequence[Path],
+    candidate_asr: Path,
+    *,
+    threshold: float,
+    probability_for: Callable[[InputRow], float],
+) -> list[dict[str, object]]:
+    """Run label-free temporal inference across disjoint input manifests."""
+    if not input_jsonls:
+        raise ValueError("provide at least one input JSONL")
+    merged = [row for path in input_jsonls for row in read_input_jsonl(path)]
+    ids = [row.sample_id for row in merged]
+    if len(ids) != len(set(ids)):
+        raise ValueError("input JSONLs have duplicate IDs")
+    candidates = _candidate_map(candidate_asr)
+    if set(candidates) != set(ids):
+        raise ValueError("candidate IDs must exactly cover input IDs")
+    output: list[dict[str, object]] = []
+    for row in merged:
+        probability = float(probability_for(row))
+        if not np.isfinite(probability) or not 0.0 <= probability <= 1.0:
+            raise ValueError("temporal probability must be finite and in [0, 1]")
+        accepted = probability >= threshold
+        output.append({
+            "id": row.sample_id,
+            "recognition_text": candidates[row.sample_id] if accepted else "",
+            "temporal_probability": probability,
+            "accepted": accepted,
+            "route": "accepted_fusion" if accepted else "rejected",
+            "command_audio_sha256": _sha_file(row.command_audio),
+        })
+    return output
+
+
 def _model_probability_provider(checkpoint_path: Path, device: str) -> tuple[float, Callable[[InputRow], float]]:
     import torch
 
@@ -104,14 +138,14 @@ def _model_probability_provider(checkpoint_path: Path, device: str) -> tuple[flo
 
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-jsonl", type=Path, required=True)
+    parser.add_argument("--input-jsonl", type=Path, action="append", required=True)
     parser.add_argument("--candidate-asr", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args(argv)
     threshold, provider = _model_probability_provider(args.checkpoint, args.device)
-    rows = run_inference(args.input_jsonl, args.candidate_asr, threshold=threshold, probability_for=provider)
+    rows = run_inference_many(args.input_jsonl, args.candidate_asr, threshold=threshold, probability_for=provider)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8", newline="\n") as handle:
         for row in rows:

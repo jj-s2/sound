@@ -132,5 +132,12 @@ def test_select_and_evaluate_enforce_staged_one_time_protocol(tmp_path: Path, mo
     summary = json.loads((paths["result"] / "r12_summary.json").read_text(encoding="utf-8"))
     assert summary["internal_test_label_read_count"] == 1
     assert set(summary["metrics"]) >= {"avg_cer", "avg_rr", "overall"}
+    assert {path.name for path in paths["result"].iterdir()} == {
+        "r12_manifest.json", "r12_internal_predictions.jsonl", "r12_summary.json", "r12_report.md",
+    }
+    manifest = json.loads((paths["result"] / "r12_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["artifact_kind"] == "r12_dataa_augmented_internal_test"
+    assert manifest["internal_test_label_read_count"] == 1
+    assert "Dataset-A group-disjoint internal test" in (paths["result"] / "r12_report.md").read_text(encoding="utf-8")
     with pytest.raises(ValueError, match="one-time"):
         main(["evaluate", *common, "--selection-input", str(paths["selection"]), "--internal-test-labels", str(paths["test"]), "--evaluation-output", str(paths["result"])])
