@@ -7,6 +7,15 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from .data import FIELD_ALIASES
+
+
+def _first_present(row: dict[str, object], canonical: str) -> object | None:
+    for key in FIELD_ALIASES[canonical]:
+        if key in row:
+            return row[key]
+    return None
+
 
 @dataclass(frozen=True)
 class PrivateMapSummary:
@@ -28,7 +37,7 @@ def _raw_labels(dataset_root: Path) -> dict[str, str | None]:
             sample_id = str(row["id"])
             if sample_id in labels:
                 raise ValueError(f"raw Dataset-A has duplicate ID {sample_id!r}")
-            label = row.get("recognition_text", row.get("label"))
+            label = _first_present(row, "label")
             if label is not None and not isinstance(label, str):
                 raise ValueError(f"{path}:{number} label must be string or null")
             if split == "pos" and label is None:

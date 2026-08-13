@@ -39,6 +39,31 @@ def test_private_maps_follow_raw_labels_and_frozen_wake_groups(tmp_path: Path) -
     assert json.loads(groups.read_text(encoding="utf-8")) == {"n": "wake-2", "p": "wake-1"}
 
 
+def test_private_maps_accept_the_project_dataset_label_alias(tmp_path: Path) -> None:
+    from xh202615.data import FIELD_ALIASES
+    from xh202615.r12_dataa_private_maps import build_private_maps
+
+    raw = tmp_path / "datasetA"
+    raw.mkdir()
+    alias = FIELD_ALIASES["label"][2]
+    (raw / "pos.jsonl").write_text(json.dumps({
+        "id": "p", "wakeup_audio": "pos/wake-p.wav", "command_audio": "pos/cmd-p.wav",
+        alias: "打开空调",
+    }, ensure_ascii=False) + "\n", encoding="utf-8")
+    (raw / "neg.jsonl").write_text(json.dumps({
+        "id": "n", "wakeup_audio": "neg/wake-n.wav", "command_audio": "neg/cmd-n.wav",
+    }, ensure_ascii=False) + "\n", encoding="utf-8")
+    manifest = tmp_path / "groups.json"
+    manifest.write_text(json.dumps({"rows": [
+        {"id": "p", "label": "打开空调", "wake_component": "wake-1"},
+        {"id": "n", "label": None, "wake_component": "wake-2"},
+    ]}, ensure_ascii=False), encoding="utf-8")
+
+    build_private_maps(raw, manifest, tmp_path / "labels.json", tmp_path / "groups-output.json")
+
+    assert json.loads((tmp_path / "labels.json").read_text(encoding="utf-8")) == {"n": None, "p": "打开空调"}
+
+
 def test_private_maps_reject_group_manifest_label_mismatch_and_overwrite(tmp_path: Path) -> None:
     from xh202615.r12_dataa_private_maps import build_private_maps
 
