@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -132,6 +133,20 @@ def _raw_rows(root: Path) -> list[dict[str, str]]:
     return rows
 
 
+def _source_audio(root: Path, relative: str, label: str) -> Path:
+    candidate = Path(relative)
+    if candidate.is_absolute():
+        raise ValueError(f"{label} path must be relative to Dataset-A root")
+    path = root / candidate
+    try:
+        path.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{label} path escapes or is missing from Dataset-A root") from exc
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} must be a regular non-symlink file")
+    return path
+
+
 def _write_jsonl(path: Path, rows: list[dict[str, str]]) -> None:
     with path.open("w", encoding="utf-8", newline="\n") as handle:
         for row in rows:
@@ -187,8 +202,14 @@ def build_augmented_dataset(
     for raw in raw_rows:
         sample_id, source_split = raw["id"], raw["source_split"]
         role, group = split.roles_by_id[sample_id], split.groups_by_id[sample_id]
-        wake_path, command_path = dataset_root / raw["wakeup_audio"], dataset_root / raw["command_audio"]
+        wake_path = _source_audio(dataset_root, raw["wakeup_audio"], "wakeup_audio")
+        command_path = _source_audio(dataset_root, raw["command_audio"], "command_audio")
         wake_digest, command_digest = _sha_file(wake_path), _sha_file(command_path)
+        derived_wake, derived_command = output_root / raw["wakeup_audio"], output_root / raw["command_audio"]
+        derived_wake.parent.mkdir(parents=True, exist_ok=True)
+        derived_command.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(wake_path, derived_wake)
+        shutil.copyfile(command_path, derived_command)
         original = LineageRow(sample_id, sample_id, "original", role, group, source_split, command_digest, wake_digest, raw["wakeup_audio"], raw["command_audio"], {})
         lineage[sample_id] = original
         output_rows[source_split].append({"id": sample_id, "split": source_split, "wakeup_audio": raw["wakeup_audio"], "command_audio": raw["command_audio"]})
@@ -201,7 +222,10 @@ def build_augmented_dataset(
                 augmented, parameters = transform(source_audio, _RATE, augmentation_rng(sample_id, variant))
                 relative = Path(source_split) / f"cmd-{child_id}.wav"
                 destination = output_root / relative
-                sf.write(destination, augmented, _RATE, subtype="FLOAT")
+                # libsndfile's FLOAT WAV writer may add nondeterministic PEAK
+                # metadata despite identical sample values.  PCM_16 produces a
+                # stable byte stream, which is required by lineage SHA-256.
+                sf.write(destination, augmented, _RATE, subtype="PCM_16")
                 child = LineageRow(child_id, sample_id, variant, role, group, source_split, _sha_file(destination), wake_digest, raw["wakeup_audio"], str(relative), parameters)
                 lineage[child_id] = child
                 output_rows[source_split].append({"id": child_id, "split": source_split, "wakeup_audio": raw["wakeup_audio"], "command_audio": str(relative)})

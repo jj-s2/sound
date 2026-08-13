@@ -70,6 +70,21 @@ def test_same_seed_gives_same_lineage_and_safe_child_audio(tmp_path: Path) -> No
     assert np.abs(waveform).max() <= 10 ** (-1 / 20) + 1e-6
 
 
+def test_derived_root_materializes_original_audio_without_touching_raw(tmp_path: Path) -> None:
+    from xh202615.r12_dataa_augmentation import build_augmented_dataset, load_lineage
+
+    raw = tmp_path / "raw"
+    ids, labels, groups = _raw_dataset(raw)
+    split = build_augmented_internal_split(ids, labels, groups)
+    before = (raw / "pos" / "cmd-00-p.wav").read_bytes()
+    summary = build_augmented_dataset(raw, split, tmp_path / "derived")
+    original = load_lineage(summary.lineage_path)["00-p"]
+
+    assert (summary.dataset_root / original.command_audio).is_file()
+    assert (summary.dataset_root / original.wakeup_audio).is_file()
+    assert (raw / "pos" / "cmd-00-p.wav").read_bytes() == before
+
+
 def test_lineage_rejects_a_child_outside_train_role(tmp_path: Path) -> None:
     from xh202615.r12_dataa_augmentation import LineageRow, validate_lineage
 
