@@ -12,6 +12,7 @@ from typing import Any, Mapping
 import numpy as np
 import soundfile as sf
 
+from .data import FIELD_ALIASES
 from .r12_dataa_augmented_split import AugmentedInternalSplitManifest
 
 
@@ -124,10 +125,12 @@ def _raw_rows(root: Path) -> list[dict[str, str]]:
             raw = json.loads(line)
             if not isinstance(raw, dict):
                 raise ValueError(f"{source_split}.jsonl:{number} must be an object")
-            sample_id, wake, command = raw.get("id"), raw.get("wakeup_audio"), raw.get("command_audio")
-            if not all(isinstance(value, str) and value for value in (sample_id, wake, command)):
+            sample_id = raw.get("id")
+            wake = next((raw[key] for key in FIELD_ALIASES["wakeup_audio"] if key in raw), None)
+            command = next((raw[key] for key in FIELD_ALIASES["command_audio"] if key in raw), None)
+            if not isinstance(sample_id, (str, int)) or not all(isinstance(value, str) and value for value in (wake, command)):
                 raise ValueError(f"{source_split}.jsonl:{number} has invalid input fields")
-            rows.append({"id": sample_id, "source_split": source_split, "wakeup_audio": wake, "command_audio": command})
+            rows.append({"id": str(sample_id), "source_split": source_split, "wakeup_audio": wake, "command_audio": command})
     if len({row["id"] for row in rows}) != len(rows):
         raise ValueError("raw Dataset-A has duplicate IDs")
     return rows

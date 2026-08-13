@@ -93,3 +93,32 @@ def test_lineage_rejects_a_child_outside_train_role(tmp_path: Path) -> None:
     }
     with np.testing.assert_raises_regex(ValueError, "train"):
         validate_lineage(rows)
+
+
+def test_augmentation_accepts_project_dataset_audio_field_aliases(tmp_path: Path) -> None:
+    from xh202615.data import FIELD_ALIASES
+    from xh202615.r12_dataa_augmentation import build_augmented_dataset
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    wake_key, command_key = FIELD_ALIASES["wakeup_audio"][2], FIELD_ALIASES["command_audio"][2]
+    ids: list[str] = []
+    labels: dict[str, str | None] = {}
+    groups: dict[str, str] = {}
+    for index in range(20):
+        for suffix, source_split, label in (("p", "pos", f"文本-{index}"), ("n", "neg", None)):
+            sample_id = str(index * 10 + (0 if suffix == "p" else 1))
+            ids.append(sample_id)
+            labels[sample_id], groups[sample_id] = label, f"wake-{index:02d}"
+            directory = raw / source_split
+            directory.mkdir(exist_ok=True)
+            wake, command = directory / f"wake-{sample_id}.wav", directory / f"cmd-{sample_id}.wav"
+            sf.write(wake, np.zeros(160, dtype=np.float32), 16_000)
+            sf.write(command, np.full(160, 0.05, dtype=np.float32), 16_000)
+            with (raw / f"{source_split}.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"id": int(sample_id), wake_key: str(wake.relative_to(raw)), command_key: str(command.relative_to(raw))}, ensure_ascii=False) + "\n")
+
+    split = build_augmented_internal_split(ids, labels, groups)
+    summary = build_augmented_dataset(raw, split, tmp_path / "derived")
+
+    assert summary.row_count > len(ids)
