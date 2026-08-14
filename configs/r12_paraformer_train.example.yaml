@@ -1,0 +1,8 @@
+# Replace every angle-bracket value with a private local path; do not commit it.
+model: paraformer-zh
+mode: lora
+device: cuda:0
+seed: 20260814
+train_manifest: <RUN_ROOT>/asr/private/train.jsonl
+valid_manifest: <RUN_ROOT>/asr/private/inner_valid.jsonl
+output_dir: <RUN_ROOT>/asr_train/fold0

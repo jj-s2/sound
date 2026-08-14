@@ -110,3 +110,6 @@ generated audio, caches, predictions, and evaluation artifacts outside Git.
 
 Use local, explicitly supplied paths for AISHELL and any permitted RIR/noise assets. Do not commit
 datasets, credentials, or generated outputs.
+# R12 speech-command pipeline
+
+For the reproducible Dataset-A train-only Paraformer preparation, training dry run, test boundary, and GitHub export policy, see [R12 training and publishing](docs/r12/r12-train-and-publish.md).
