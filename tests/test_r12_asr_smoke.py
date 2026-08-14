@@ -134,16 +134,27 @@ def test_lora_mode_fails_closed_when_no_lora_parameter() -> None:
         )
 
 
+def test_lora_loader_kwargs_omit_encoder_conf_and_keep_decoder_lora_list() -> None:
+    # FunASR deep_update treats an empty dict as replacement, so encoder_conf={}
+    # would wipe the pretrained Paraformer encoder config. It must be omitted.
+    kwargs = build_loader_kwargs(
+        SmokeConfig(model="paraformer-zh", mode="lora", device="cpu", level="load"),
+    )
+    assert "encoder_conf" not in kwargs
+    assert kwargs["decoder_conf"] == {"lora_list": ["q", "k", "v", "o"]}
+
+
 def test_lora_loader_kwargs_contain_only_asr_arguments() -> None:
     kwargs = build_loader_kwargs(
         SmokeConfig(model="paraformer-zh", mode="lora", device="cpu", level="load"),
     )
-    assert set(kwargs) == {"model", "device", "disable_update", "encoder_conf", "decoder_conf", "lora_only"}
+    assert set(kwargs) == {"model", "device", "disable_update", "decoder_conf", "lora_only"}
     assert kwargs["model"] == "paraformer-zh"
     assert kwargs["device"] == "cpu"
     assert kwargs["disable_update"] is True
     assert kwargs["lora_only"] is True
     assert kwargs["decoder_conf"] == {"lora_list": ["q", "k", "v", "o"]}
+    assert "encoder_conf" not in kwargs
     assert "vad_model" not in kwargs
     assert "punc_model" not in kwargs
 

@@ -63,11 +63,12 @@ def build_loader_kwargs(config: SmokeConfig) -> dict[str, object]:
     """Return only ASR model arguments; never add VAD, punctuation, or a dataset path."""
     _validate_config(config)
     if config.mode == "lora":
+        # Omit encoder_conf entirely: FunASR deep_update treats an empty dict as
+        # replacement and would wipe the pretrained Paraformer encoder config.
         return {
             "model": config.model,
             "device": config.device,
             "disable_update": True,
-            "encoder_conf": {},
             "decoder_conf": {"lora_list": list(config.lora_list)},
             "lora_only": True,
         }
