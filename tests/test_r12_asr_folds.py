@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from xh202615.r12_asr_folds import (
+    _manifest_sha256,
     build_asr_folds,
     load_asr_folds,
     role_for_outer_fold,
@@ -153,6 +154,28 @@ def test_loader_rejects_tampered_child_fold(tmp_path: Path) -> None:
             row["outer_fold"] = (row["outer_fold"] + 1) % 3
     path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     with pytest.raises(ValueError, match="digest|SHA-256"):
+        load_asr_folds(path, lineage)
+
+
+def test_loader_rejects_recomputed_digest_child_fold_split(tmp_path: Path) -> None:
+    # Tamper a single child's fold AND recompute the digest over the tampered
+    # payload, so the digest check passes.  The loader must still reject the
+    # manifest because the child now sits in a fold different from its parent
+    # and wake group (group/parent disjointness), not because of a stale digest.
+    lineage = _balanced_lineage()
+    manifest = build_asr_folds(lineage, fold_count=3, seed=20260814)
+    path = tmp_path / "asr_folds.json"
+    write_asr_folds(path, manifest)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    for row in data["rows"]:
+        if row["id"] == "p0__aug_a":
+            row["outer_fold"] = (row["outer_fold"] + 1) % 3
+    data["manifest_sha256"] = _manifest_sha256(data)
+    path.write_text(
+        json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="spans multiple folds"):
         load_asr_folds(path, lineage)
 
 

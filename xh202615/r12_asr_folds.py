@@ -6,6 +6,10 @@ ASR out-of-fold inference can cover both classes without ever crossing a
 parent/wake group boundary.  The manifest serializes only structural identity
 (``id``, ``parent_id``, ``group``, ``source_split``, ``augmentation_id``) plus
 the ``outer_fold``; no label, target text, or audio path is ever written.
+
+The optional stratification label is derived solely from the public
+``source_split`` metadata (``pos``/``neg``) already present on every lineage
+row; private target/transcription labels are never read or used.
 """
 
 from __future__ import annotations
@@ -28,6 +32,8 @@ _DEFAULT_FOLD_COUNT = 3
 _TRAIN_ROLE = "train"
 _SERIAL_KEYS = frozenset({"schema_version", "seed", "fold_count", "rows", "manifest_sha256"})
 _ROW_KEYS = frozenset({"id", "parent_id", "group", "source_split", "augmentation_id", "outer_fold"})
+# Public structural metadata only: "pos"/"neg" come from the lineage's
+# source_split field, never from any private target/transcription label.
 _SOURCE_CLASSES = {"neg": 0, "pos": 1}
 
 
@@ -116,6 +122,12 @@ def _group_rows(rows: list[LineageRow]) -> dict[str, list[LineageRow]]:
 
 
 def _group_label(rows: list[LineageRow]) -> int | None:
+    """Derive the stratification class from public ``source_split`` metadata only.
+
+    Returns 0/1 when every row in the group shares one recognized
+    ``source_split`` (``neg``/``pos``), and ``None`` otherwise.  No private
+    target/transcription label is inspected.
+    """
     splits = {row.source_split for row in rows}
     if len(splits) != 1:
         return None
