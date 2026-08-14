@@ -6,12 +6,12 @@ from pathlib import Path
 import pytest
 
 
-def _manifest(path: Path, *, key: str = "p") -> Path:
+def _manifest(path: Path, *, key: str = "p", source: str = "private/audio.wav") -> Path:
     path.write_text(
         json.dumps(
             {
                 "key": key,
-                "source": "private/audio.wav",
+                "source": source,
                 "target": "开灯",
                 "parent_id": "p",
                 "augmentation_id": "original",
@@ -59,6 +59,16 @@ def test_training_rejects_internal_test_path_before_runner(tmp_path: Path) -> No
         run_training(
             _config(tmp_path, train_manifest=_manifest(tmp_path / "internal_test.jsonl")),
             runner=fail_if_called,
+        )
+
+
+def test_training_rejects_internal_test_audio_source_before_runner(tmp_path: Path) -> None:
+    from xh202615.r12_asr_train import run_training
+
+    with pytest.raises(ValueError, match="internal-test"):
+        run_training(
+            _config(tmp_path, train_manifest=_manifest(tmp_path / "train.jsonl", source="private/internal_test/p.wav")),
+            dry_run=True,
         )
 
 

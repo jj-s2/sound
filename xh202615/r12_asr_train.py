@@ -57,6 +57,7 @@ def _validate_manifest(path: Path) -> None:
             raise ValueError(f"manifest row has invalid keys at {path}:{line_number}")
         if not all(isinstance(row[key], str) and row[key].strip() for key in _PRIVATE_KEYS):
             raise ValueError(f"manifest row has an empty field at {path}:{line_number}")
+        _reject_internal_test(Path(row["source"]))
 
 
 def _validate_config(config: TrainingConfig) -> None:

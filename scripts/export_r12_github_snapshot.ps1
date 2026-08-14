@@ -19,18 +19,25 @@ if (Test-Path -LiteralPath $Destination) {
 }
 $destinationPath = (Resolve-Path -LiteralPath $Destination).Path
 
-$exact = @('.gitignore', 'README.md', 'requirements-runtime-windows.txt')
+$exact = @(
+    '.gitignore',
+    'README.md',
+    'requirements-runtime-windows.txt',
+    'configs/r12_paraformer_train.example.yaml',
+    'docs/r12/r12-train-and-publish.md',
+    'scripts/export_r12_github_snapshot.ps1',
+    'tests/test_export_r12_github_snapshot.py',
+    'tests/test_r12_publish_contract.py',
+    'xh202615/r12_dataa_augmentation.py'
+)
 $tracked = & git -C $source ls-files
 if ($LASTEXITCODE -ne 0) { throw 'git ls-files failed.' }
 
 $selected = $tracked | Where-Object {
     $_ -in $exact -or
-    $_ -like 'xh202615/*.py' -or
-    $_ -like 'scripts/r12_*.py' -or
-    $_ -like 'tests/test_r12_*.py' -or
-    $_ -like 'configs/r12_*.yaml' -or
-    $_ -like 'configs/r12_*.json' -or
-    $_ -like 'docs/r12/*'
+    $_ -like 'xh202615/r12_asr_*.py' -or
+    $_ -like 'scripts/r12_asr_*.py' -or
+    $_ -like 'tests/test_r12_asr_*.py'
 }
 
 foreach ($relative in $selected) {
