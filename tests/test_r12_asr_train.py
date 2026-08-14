@@ -65,11 +65,10 @@ def test_training_rejects_internal_test_path_before_runner(tmp_path: Path) -> No
 def test_training_rejects_internal_test_audio_source_before_runner(tmp_path: Path) -> None:
     from xh202615.r12_asr_train import run_training
 
+    config = _config(tmp_path)
+    _manifest(config.train_manifest, source="private/internal_test/p.wav")
     with pytest.raises(ValueError, match="internal-test"):
-        run_training(
-            _config(tmp_path, train_manifest=_manifest(tmp_path / "train.jsonl", source="private/internal_test/p.wav")),
-            dry_run=True,
-        )
+        run_training(config, dry_run=True)
 
 
 def test_train_argv_is_lora_only_and_contains_no_vad_or_punctuation(tmp_path: Path) -> None:
