@@ -28,6 +28,8 @@ $exact = @(
     'scripts/export_r12_github_snapshot.ps1',
     'tests/test_export_r12_github_snapshot.py',
     'tests/test_r12_publish_contract.py',
+    'xh202615/data.py',
+    'xh202615/r12_dataa_augmented_split.py',
     'xh202615/r12_dataa_augmentation.py'
 )
 $tracked = & git -C $source ls-files

@@ -8,3 +8,6 @@ def test_export_script_is_copy_only_and_excludes_generated_output() -> None:
     assert "Remove-Item" not in script
     assert "output/" not in script.lower()
     assert "Destination must be empty" in script
+    assert "xh202615/data.py" in script
+    assert "xh202615/r12_dataa_augmented_split.py" in script
+    assert "dataa-augmented-internal-runbook" not in script
