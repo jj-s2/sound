@@ -11,3 +11,5 @@ def test_export_script_is_copy_only_and_excludes_generated_output() -> None:
     assert "xh202615/data.py" in script
     assert "xh202615/r12_dataa_augmented_split.py" in script
     assert "dataa-augmented-internal-runbook" not in script
+    assert "r12_training_bootstrap.py" in script
+    assert "r12_bootstrap_training.py" in script
