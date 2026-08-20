@@ -1,0 +1,35 @@
+{
+  "version": "V3",
+  "name": "BSS/SepReformer prior branch for difficult samples",
+  "audio_probe": {
+    "enabled": true
+  },
+  "router": {
+    "mode": "dynamic_tse",
+    "reject": {
+      "target_probability_max": 0.15,
+      "global_similarity_max": 0.20,
+      "topk_similarity_max": 0.25,
+      "target_frame_ratio_max": 0.05,
+      "audio_quality_min": 0.00,
+      "min_votes": 3
+    },
+    "direct": {
+      "target_probability_min": 0.75,
+      "global_similarity_min": 0.55,
+      "topk_similarity_min": 0.65,
+      "target_frame_ratio_min": 0.50,
+      "noise_score_max": 0.35,
+      "overlap_probability_max": 0.30,
+      "min_votes": 2
+    }
+  },
+  "separator": {
+    "enabled": false,
+    "backend": "sepreformer_or_bss_prior",
+    "use_tf_dominance_prior": false,
+    "use_soft_clustering": false,
+    "use_residual_correction": false,
+    "identity_guard": true
+  }
+}

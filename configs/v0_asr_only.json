@@ -1,0 +1,10 @@
+{
+  "version": "V0",
+  "name": "ASR-Only",
+  "audio_probe": {
+    "enabled": false
+  },
+  "router": {
+    "mode": "asr_only"
+  }
+}

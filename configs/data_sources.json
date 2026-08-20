@@ -1,0 +1,100 @@
+{
+  "rules": {
+    "dataset_a_b_usage": "evaluation_only",
+    "forbid_test_only_for_training": true,
+    "sample_rate": 16000,
+    "mono": true,
+    "speaker_disjoint_split_required": true
+  },
+  "priority_0": [
+    {
+      "name": "AISHELL-2",
+      "role": ["asr", "clean_speech", "command_domain"],
+      "why": "1000h Mandarin; contains wake words, voice control and smart-home related domains.",
+      "url": "https://aishelltech.com/aishell_2",
+      "license_note": "academic research; commercial use requires permission"
+    },
+    {
+      "name": "AISHELL-1",
+      "role": ["asr", "clean_speech", "fast_baseline"],
+      "why": "Open Mandarin corpus, 16kHz, 400 speakers, easy to start.",
+      "url": "https://www.openslr.org/33/",
+      "license_note": "Apache-2.0 on OpenSLR page"
+    },
+    {
+      "name": "CN-Celeb",
+      "role": ["speaker_verification", "hard_negative"],
+      "why": "Large-scale Chinese in-the-wild speaker recognition corpus.",
+      "url": "https://www.openslr.org/82/",
+      "license_note": "CC BY-SA 4.0"
+    },
+    {
+      "name": "HI-MIA",
+      "role": ["wakeup_speaker_verification", "far_field"],
+      "why": "Far-field text-dependent speaker verification; real home environment; wake-up words.",
+      "url": "https://www.openslr.org/85/",
+      "license_note": "Apache-2.0"
+    },
+    {
+      "name": "DNS Challenge",
+      "role": ["noise", "rir", "speech_enhancement"],
+      "why": "Noise, RIR and scripts for noisy speech synthesis.",
+      "url": "https://github.com/microsoft/DNS-Challenge",
+      "license_note": "check challenge/data license before redistribution"
+    }
+  ],
+  "priority_1": [
+    {
+      "name": "WenetSpeech",
+      "role": ["asr_robustness", "multi_domain_mandarin"],
+      "url": "https://www.openslr.org/121/"
+    },
+    {
+      "name": "MAGICDATA Mandarin",
+      "role": ["asr", "home_command_control"],
+      "url": "https://www.openslr.org/68/"
+    },
+    {
+      "name": "AISHELL-4",
+      "role": ["overlap", "speaker_activity", "multi_speaker"],
+      "url": "https://www.openslr.org/111/"
+    },
+    {
+      "name": "AISHELL-3",
+      "role": ["multi_speaker_clean_source", "tse_synthesis"],
+      "url": "https://www.openslr.org/93/"
+    },
+    {
+      "name": "MobvoiHotwords",
+      "role": ["wake_word", "negative_keyword", "home_noise"],
+      "url": "https://www.openslr.org/87/"
+    },
+    {
+      "name": "AISHELL-DMASH",
+      "role": ["smart_home_far_field", "asr", "speaker_verification", "wake_word"],
+      "url": "https://www.aishelltech.com/DMASH_Dataset"
+    }
+  ],
+  "priority_2": [
+    {
+      "name": "LibriMix",
+      "role": ["separation_recipe_reference"],
+      "url": "https://github.com/JorisCos/LibriMix"
+    },
+    {
+      "name": "WHAM/WHAMR",
+      "role": ["noise_reverb_separation_reference"],
+      "url": "https://wham.whisper.ai/"
+    },
+    {
+      "name": "MUSAN",
+      "role": ["noise_music_speech_augmentation"],
+      "url": "https://www.openslr.org/17/"
+    },
+    {
+      "name": "RIRS_NOISES",
+      "role": ["rir_noise_augmentation"],
+      "url": "https://www.openslr.org/28/"
+    }
+  ]
+}
