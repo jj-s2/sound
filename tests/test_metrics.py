@@ -12,6 +12,16 @@ class MetricsTest(unittest.TestCase):
         self.assertEqual(clean_asr_text("<|zh|><|NEUTRAL|>打开空调"), "打开空调")
         self.assertEqual(normalize_text("<|zh|><|NEUTRAL|>打开空调。"), "打开空调")
 
+    def test_clean_asr_text_removes_spaces_between_cjk_characters(self):
+        self.assertEqual(clean_asr_text("洗 碗 机 暂 停 工 作"), "洗碗机暂停工作")
+
+    def test_clean_asr_text_collapses_large_repeated_phrases(self):
+        self.assertEqual(clean_asr_text("空调空调空调打开"), "空调打开")
+        self.assertEqual(clean_asr_text("暂停暂停暂停"), "暂停")
+
+    def test_clean_asr_text_keeps_normal_repetition_and_english_spacing(self):
+        self.assertEqual(clean_asr_text("哈哈 打开 Wi Fi"), "哈哈打开 Wi Fi")
+
     def test_cer_exact(self):
         self.assertEqual(cer_stats("打开空调", "打开空调").cer, 0.0)
 

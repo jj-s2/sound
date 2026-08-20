@@ -57,6 +57,16 @@ def parse_args():
     parser.add_argument("--resume", action="store_true", help="Append and skip ids already present in output")
     parser.add_argument("--device", default="cpu", help='FunASR device, e.g. "cpu" or "cuda:0"')
     parser.add_argument("--model", default="paraformer-zh")
+    parser.add_argument(
+        "--init-param",
+        default=None,
+        help="Optional local FunASR training checkpoint loaded into the model defined by --model",
+    )
+    parser.add_argument(
+        "--smart-cleanup",
+        action="store_true",
+        help="Enable conservative CJK spacing/repetition cleanup (opt-in)",
+    )
     parser.add_argument("--vad-model", default="fsmn-vad")
     parser.add_argument("--punc-model", default="ct-punc")
     parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True to AutoModel")
@@ -151,6 +161,11 @@ def make_model(args):
         "device": args.device,
         "disable_update": True,
     }
+    if args.init_param:
+        checkpoint = Path(args.init_param)
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"ASR init checkpoint does not exist: {checkpoint}")
+        kwargs["init_param"] = str(checkpoint)
     if args.vad_model and args.vad_model.lower() not in {"none", "null", "off"}:
         kwargs["vad_model"] = args.vad_model
     if args.punc_model and args.punc_model.lower() not in {"none", "null", "off"}:
@@ -194,7 +209,7 @@ def transcribe_one(model, audio_path: Path, args) -> tuple[str, float]:
         kwargs["merge_length_s"] = args.merge_length_s
     result = model.generate(**kwargs)
     latency_ms = (time.perf_counter() - start) * 1000
-    return clean_asr_text(extract_text(result)), latency_ms
+    return clean_asr_text(extract_text(result), smart_cleanup=args.smart_cleanup), latency_ms
 
 
 def main() -> None:

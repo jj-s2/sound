@@ -217,3 +217,25 @@ def test_cli_rejects_train_and_validation_label_paths() -> None:
         main(["smoke", "--valid-labels", "valid.json"])
     with pytest.raises(SystemExit):
         main(["smoke", "--internal-test-labels", "internal.json"])
+
+
+def test_funasr_asr_cli_accepts_local_init_checkpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import run_funasr_asr
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_funasr_asr.py", "--model", "local-model", "--init-param", r"F:\model.pt.ep150"],
+    )
+    args = run_funasr_asr.parse_args()
+    assert args.model == "local-model"
+    assert args.init_param == r"F:\model.pt.ep150"
+
+
+def test_funasr_asr_smart_cleanup_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import run_funasr_asr
+
+    monkeypatch.setattr(sys, "argv", ["run_funasr_asr.py"])
+    assert run_funasr_asr.parse_args().smart_cleanup is False
+    monkeypatch.setattr(sys, "argv", ["run_funasr_asr.py", "--smart-cleanup"])
+    assert run_funasr_asr.parse_args().smart_cleanup is True
