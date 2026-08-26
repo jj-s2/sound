@@ -147,8 +147,20 @@ def build_train_argv(config: TrainingConfig) -> tuple[str, ...]:
     return tuple(argv)
 
 
-def _subprocess_runner(argv: Sequence[str]) -> int:
-    return subprocess.run(tuple(argv), check=False).returncode
+def _manifest_source_root(path: Path) -> Path | None:
+    """Find the augmented dataset root for relative manifest audio paths."""
+    resolved = Path(path).resolve(strict=False)
+    for ancestor in resolved.parents:
+        candidate = ancestor / "augmented"
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _subprocess_runner(argv: Sequence[str], *, cwd: Path | None = None) -> int:
+    return subprocess.run(
+        tuple(argv), check=False, cwd=str(cwd) if cwd is not None else None
+    ).returncode
 
 
 def run_training(
@@ -161,5 +173,8 @@ def run_training(
     argv = build_train_argv(config)
     if dry_run:
         return TrainingResult(argv=argv, executed=False, return_code=None)
-    code = (runner or _subprocess_runner)(argv)
+    if runner is None:
+        code = _subprocess_runner(argv, cwd=_manifest_source_root(config.train_manifest))
+    else:
+        code = runner(argv)
     return TrainingResult(argv=argv, executed=True, return_code=code)

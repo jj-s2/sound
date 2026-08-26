@@ -153,3 +153,40 @@ def test_existing_output_directory_is_rejected_before_runner(tmp_path: Path) -> 
     output.mkdir()
     with pytest.raises(ValueError, match="output directory already exists"):
         run_training(_config(tmp_path, output_dir=output), runner=lambda _: 0)
+
+
+def test_training_runs_from_augmented_source_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from xh202615.r12_asr_train import TrainingConfig, run_training
+
+    run_root = tmp_path / "run"
+    private = run_root / "asr" / "private"
+    private.mkdir(parents=True)
+    train_manifest = _manifest(private / "train.jsonl")
+    valid_manifest = _manifest(private / "valid.jsonl", key="v")
+    augmented = run_root / "augmented"
+    augmented.mkdir()
+    seen: dict[str, object] = {}
+
+    def fake_run(argv: tuple[str, ...], *, check: bool, cwd: str) -> SimpleNamespace:
+        seen["argv"] = argv
+        seen["check"] = check
+        seen["cwd"] = cwd
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("xh202615.r12_asr_train.subprocess.run", fake_run)
+    result = run_training(
+        TrainingConfig(
+            train_manifest=train_manifest,
+            valid_manifest=valid_manifest,
+            output_dir=run_root / "asr_train" / "fold0",
+            model="paraformer-zh",
+            device="cuda:0",
+            mode="lora",
+        )
+    )
+
+    assert result.return_code == 0
+    assert seen["check"] is False
+    assert Path(seen["cwd"]) == augmented
