@@ -21,13 +21,13 @@ python scripts/r12_bootstrap_training.py --dataset-root <DATASET_A_ROOT> --label
 Validate the exact training recipe without importing FunASR or using a GPU:
 
 ```powershell
-python scripts/r12_asr_train.py train --train-manifest <RUN_ROOT>/asr/private/train.jsonl --valid-manifest <RUN_ROOT>/asr/private/inner_valid.jsonl --output-dir <RUN_ROOT>/asr_train/fold0
+python scripts/r12_asr_train.py train --train-manifest <RUN_ROOT>/asr/private/asr_train.jsonl --valid-manifest <RUN_ROOT>/asr/private/asr_inner_valid.jsonl --output-dir <RUN_ROOT>/asr_train/fold0
 ```
 
 Run GPU training only when memory is available and the output directory does not exist:
 
 ```powershell
-python scripts/r12_asr_train.py train --execute --device cuda:0 --train-manifest <RUN_ROOT>/asr/private/train.jsonl --valid-manifest <RUN_ROOT>/asr/private/inner_valid.jsonl --output-dir <RUN_ROOT>/asr_train/fold0
+python scripts/r12_asr_train.py train --execute --device cuda:0 --train-manifest <RUN_ROOT>/asr/private/asr_train.jsonl --valid-manifest <RUN_ROOT>/asr/private/asr_inner_valid.jsonl --output-dir <RUN_ROOT>/asr_train/fold0
 ```
 
 For an 8GB Windows GPU, start with a smaller micro-batch and preserve the
@@ -35,10 +35,10 @@ effective batch through gradient accumulation:
 
 ```powershell
 python scripts/r12_asr_train.py train --execute --device cuda:0 `
-  --train-manifest <RUN_ROOT>/asr/private/train.jsonl `
-  --valid-manifest <RUN_ROOT>/asr/private/inner_valid.jsonl `
+  --train-manifest <RUN_ROOT>/asr/private/asr_train.jsonl `
+  --valid-manifest <RUN_ROOT>/asr/private/asr_inner_valid.jsonl `
   --output-dir <RUN_ROOT>/asr_train/fold0 `
-  --batch-size 200 --accum-grad 32 --num-workers 0
+  --batch-size 4 --accum-grad 32 --num-workers 0
 ```
 
 The launcher resolves relative audio paths from the generated `augmented`
@@ -47,7 +47,8 @@ increase it only after the first epoch is healthy.
 
 8GB GPU 的起始配方是 FP16、encoder/decoder q-k-v-o LoRA、rank 8、alpha 16、
 dropout 0.05、learning rate 1e-4、最多30 epoch、保留最佳10个并平均最佳5个。
-从 `batch_size=800` 和 `accum_grad=8` 开始，OOM 时只降低 micro-batch。
+`batch_size=4` 与 `accum_grad=32` 是 8GB Windows GPU 的保守起点；若显存持续充足，
+只逐步增大 micro-batch，并保持 `accum_grad` 不超过每个 epoch 的 batch 数。
 
 Personal VAD 需要单独运行，不与 Paraformer 同时占用 GPU：
 

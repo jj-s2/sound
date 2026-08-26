@@ -112,9 +112,9 @@ def test_lora_argv_exposes_bounded_encoder_decoder_recipe(tmp_path: Path) -> Non
     assert "train_conf.max_epoch=30" in rendered
     assert "train_conf.keep_nbest_models=10" in rendered
     assert "train_conf.avg_nbest_model=5" in rendered
-    assert "dataset_conf.batch_size=800" in rendered
-    assert "dataset_conf.num_workers=2" in rendered
-    assert "+train_conf.accum_grad=8" in rendered
+    assert "dataset_conf.batch_size=4" in rendered
+    assert "dataset_conf.num_workers=0" in rendered
+    assert "+train_conf.accum_grad=32" in rendered
 
 
 @pytest.mark.parametrize(

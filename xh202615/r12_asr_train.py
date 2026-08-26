@@ -35,9 +35,9 @@ class TrainingConfig:
     max_epoch: int = 30
     keep_nbest_models: int = 10
     avg_nbest_model: int = 5
-    batch_size: int = 800
-    accum_grad: int = 8
-    num_workers: int = 2
+    batch_size: int = 4
+    accum_grad: int = 32
+    num_workers: int = 0
 
 
 @dataclass(frozen=True)

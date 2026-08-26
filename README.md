@@ -139,8 +139,8 @@ Dataset-A held-out test      → 选择冻结后只评估一次
 
 Paraformer LoRA 的默认安全配方为 encoder/decoder q-k-v-o、rank=8、alpha=16、
 dropout=0.05、learning rate=1e-4、最多30 epoch、平均最佳5个 checkpoint，8GB
-默认从 `batch_size=800`、`accum_grad=8` 开始；Windows 8GB 建议显式使用
-`--batch-size 200 --accum-grad 32 --num-workers 0`。完整参数见
+默认使用适合 8GB Windows GPU 的 `batch_size=4`、`accum_grad=32`、
+`num_workers=0`；显存充足时再逐步增大 micro-batch。完整参数见
 `configs/r12_paraformer_train.example.yaml`。
 
 `--init-param` 只加载 checkpoint 参数，不包含模型配置和 tokenizer。模型目录中的
