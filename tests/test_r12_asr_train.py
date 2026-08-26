@@ -90,8 +90,8 @@ def test_train_argv_uses_hydra_append_overrides_for_configless_train_ds(tmp_path
 
     assert "+model=paraformer-zh" in argv
     assert "+device=cuda:0" in argv
-    assert any(item.startswith("+dataset_conf.data_list=") for item in argv)
-    assert any(item.startswith("+dataset_conf.data_list_valid=") for item in argv)
+    assert any(item.startswith("+train_data_set_list=") for item in argv)
+    assert any(item.startswith("+valid_data_set_list=") for item in argv)
     assert "+lora_only=true" in argv
 
 

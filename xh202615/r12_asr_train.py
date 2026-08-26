@@ -118,8 +118,8 @@ def build_train_argv(config: TrainingConfig) -> tuple[str, ...]:
         f"+device={config.device}",
         f"+output_dir={config.output_dir}",
         f"+seed={config.seed}",
-        f"+dataset_conf.data_list={config.train_manifest}",
-        f"+dataset_conf.data_list_valid={config.valid_manifest}",
+        f"+train_data_set_list={config.train_manifest}",
+        f"+valid_data_set_list={config.valid_manifest}",
     ]
     if config.mode == "lora":
         argv.extend(
