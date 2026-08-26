@@ -30,6 +30,21 @@ Run GPU training only when memory is available and the output directory does not
 python scripts/r12_asr_train.py train --execute --device cuda:0 --train-manifest <RUN_ROOT>/asr/private/train.jsonl --valid-manifest <RUN_ROOT>/asr/private/inner_valid.jsonl --output-dir <RUN_ROOT>/asr_train/fold0
 ```
 
+For an 8GB Windows GPU, start with a smaller micro-batch and preserve the
+effective batch through gradient accumulation:
+
+```powershell
+python scripts/r12_asr_train.py train --execute --device cuda:0 `
+  --train-manifest <RUN_ROOT>/asr/private/train.jsonl `
+  --valid-manifest <RUN_ROOT>/asr/private/inner_valid.jsonl `
+  --output-dir <RUN_ROOT>/asr_train/fold0 `
+  --batch-size 200 --accum-grad 32 --num-workers 0
+```
+
+The launcher resolves relative audio paths from the generated `augmented`
+directory. `--num-workers 0` is the stable default for Windows CUDA runs;
+increase it only after the first epoch is healthy.
+
 8GB GPU 的起始配方是 FP16、encoder/decoder q-k-v-o LoRA、rank 8、alpha 16、
 dropout 0.05、learning rate 1e-4、最多30 epoch、保留最佳10个并平均最佳5个。
 从 `batch_size=800` 和 `accum_grad=8` 开始，OOM 时只降低 micro-batch。

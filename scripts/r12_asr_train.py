@@ -37,6 +37,9 @@ def main(argv: list[str] | None = None) -> int:
     train_parser.add_argument("--mode", choices=("lora", "freeze_encoder"), default="lora")
     train_parser.add_argument("--device", default="cuda:0")
     train_parser.add_argument("--seed", type=int, default=20260814)
+    train_parser.add_argument("--batch-size", type=int, default=800)
+    train_parser.add_argument("--accum-grad", type=int, default=8)
+    train_parser.add_argument("--num-workers", type=int, default=2)
     train_parser.add_argument("--execute", action="store_true", help="run FunASR; without this flag only validate and print argv")
     args = parser.parse_args(argv)
 
@@ -50,6 +53,9 @@ def main(argv: list[str] | None = None) -> int:
                 device=args.device,
                 mode=args.mode,
                 seed=args.seed,
+                batch_size=args.batch_size,
+                accum_grad=args.accum_grad,
+                num_workers=args.num_workers,
             ),
             dry_run=not args.execute,
         )

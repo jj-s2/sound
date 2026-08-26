@@ -86,11 +86,12 @@ def _validate_config(config: TrainingConfig) -> None:
         "avg_nbest_model",
         "batch_size",
         "accum_grad",
-        "num_workers",
     ):
         value = getattr(config, name)
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(f"{name} must be a positive integer")
+    if isinstance(config.num_workers, bool) or not isinstance(config.num_workers, int) or config.num_workers < 0:
+        raise ValueError("num_workers must be a nonnegative integer")
     if not isinstance(config.lora_dropout, (int, float)) or not math.isfinite(config.lora_dropout):
         raise ValueError("lora_dropout must be finite")
     if not 0.0 <= float(config.lora_dropout) < 1.0:
@@ -139,7 +140,7 @@ def build_train_argv(config: TrainingConfig) -> tuple[str, ...]:
                 f"+train_conf.avg_nbest_model={config.avg_nbest_model}",
                 f"+dataset_conf.batch_size={config.batch_size}",
                 f"+dataset_conf.num_workers={config.num_workers}",
-                f"+accum_grad={config.accum_grad}",
+                f"+train_conf.accum_grad={config.accum_grad}",
             )
         )
     else:

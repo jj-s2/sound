@@ -114,7 +114,7 @@ def test_lora_argv_exposes_bounded_encoder_decoder_recipe(tmp_path: Path) -> Non
     assert "train_conf.avg_nbest_model=5" in rendered
     assert "dataset_conf.batch_size=800" in rendered
     assert "dataset_conf.num_workers=2" in rendered
-    assert "accum_grad=8" in rendered
+    assert "+train_conf.accum_grad=8" in rendered
 
 
 @pytest.mark.parametrize(
@@ -190,3 +190,43 @@ def test_training_runs_from_augmented_source_root(tmp_path: Path, monkeypatch: p
     assert result.return_code == 0
     assert seen["check"] is False
     assert Path(seen["cwd"]) == augmented
+
+
+def test_cli_exposes_memory_safe_training_controls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import r12_asr_train as cli
+    from xh202615.r12_asr_train import TrainingResult
+
+    train_manifest = _manifest(tmp_path / "train.jsonl")
+    valid_manifest = _manifest(tmp_path / "valid.jsonl", key="v")
+    captured: dict[str, object] = {}
+
+    def fake_run(config: object, *, dry_run: bool) -> TrainingResult:
+        captured["config"] = config
+        captured["dry_run"] = dry_run
+        return TrainingResult(argv=(), executed=False, return_code=None)
+
+    monkeypatch.setattr(cli, "run_training", fake_run)
+    result = cli.main(
+        [
+            "train",
+            "--train-manifest",
+            str(train_manifest),
+            "--valid-manifest",
+            str(valid_manifest),
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--batch-size",
+            "200",
+            "--accum-grad",
+            "32",
+            "--num-workers",
+            "0",
+        ]
+    )
+
+    config = captured["config"]
+    assert result == 0
+    assert captured["dry_run"] is True
+    assert config.batch_size == 200
+    assert config.accum_grad == 32
+    assert config.num_workers == 0
