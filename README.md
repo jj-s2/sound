@@ -13,10 +13,13 @@ ASR 候选生成、目标人物语音判断、时序特征、候选路由和拒�
         │
         ├── 多路 ASR
         │       ├── primary ASR
-        │       └── energy ASR
+        │       ├── no-VAD / padding ASR
+        │       ├── Paraformer LoRA ASR
+        │       └── train-only subphrase hotword ASR
         │
         ├── 目标人物语音链路
-        │       ├── pVAD：判断目标人物是否在说话
+        │       ├── Personal VAD：结合 enrollment 判断目标人物是否在说话
+        │       ├── pVAD：通用声学活动特征
         │       └── TSE：提取目标人物语音并计算 speaker/presence 特征
         │
         ├── R3 temporal head
@@ -39,6 +42,10 @@ ASR 候选生成、目标人物语音判断、时序特征、候选路由和拒�
     → CER 与拒识决策
     → Overall
 ```
+
+当前改造目标是 Overall 0.85。8GB 显存采用 FP16、LoRA、分阶段运行和小
+micro-batch；ASR、Personal VAD、TSE 不同时占用 GPU。0.85 是需要真实分组
+validation 和新盲测验证的目标，不是已经完成的结果。
 
 项目中的 Overall 由识别质量和拒识质量共同决定，不能只看 ASR 的训练 loss。
 
@@ -70,6 +77,7 @@ Dataset-A held-out test      → 选择冻结后只评估一次
 - `r12_dataa_canonical.py`：把多路 ASR 和音频特征合成为 canonical 输入
 - `r12_calibrated_gate.py`：训练和冻结门控选择
 - `r12_candidate_router.py`：在多路 ASR 候选之间做路由
+- `r12_personal_vad.py`：enrollment-conditioned 三分类 Personal VAD
 - `r12_text_presence.py`：文本 presence 特征和预测
 - `r11_pvad_oracle.py`：pVAD 特征和目标人物语音证据
 - `temporal_head.py` / `temporal_training.py`：R3 temporal head
@@ -85,6 +93,9 @@ Dataset-A held-out test      → 选择冻结后只评估一次
 - `r12_dataa_augment_audio.py`：执行 train-only 音频增强
 - `r12_asr_train.py`：Paraformer 训练和 smoke 配置检查
 - `run_funasr_asr.py`：运行 FunASR/Paraformer ASR
+- `r12_asr_prepare_subphrase_hotwords.py`：从 train 标签生成短语 hotword
+- `r12_prepare_personal_vad_mixtures.py`：校验 Personal VAD 混合数据 lineage
+- `r12_train_personal_vad.py` / `r12_infer_personal_vad.py`：Personal VAD 训练和推理
 - `run_temporal_head_inference.py`：R3 temporal head 推理
 - `run_tse_inference.py`：TSE 推理和增强音频生成
 - `r12_dataa_rebuild_features.py`：校验并构建 canonical 输入
@@ -116,6 +127,20 @@ Dataset-A held-out test      → 选择冻结后只评估一次
   --vad-model none `
   --punc-model none
 ```
+
+短命令候选可以关闭 VAD 和标点模型，并对命令前后补静音：
+
+```powershell
+.venv\Scripts\python.exe scripts\run_funasr_asr.py `
+  --dataset-root datasetA\datasetA --splits pos,neg `
+  --vad-model off --punc-model off --pad-ms 160 `
+  --output output\asr\pad160_no_vad.jsonl
+```
+
+Paraformer LoRA 的默认安全配方为 encoder/decoder q-k-v-o、rank=8、alpha=16、
+dropout=0.05、learning rate=1e-4、最多30 epoch、平均最佳5个 checkpoint，8GB
+从 `batch_size=800`、`accum_grad=8` 开始。完整参数见
+`configs/r12_paraformer_train.example.yaml`。
 
 `--init-param` 只加载 checkpoint 参数，不包含模型配置和 tokenizer。模型目录中的
 `config.yaml`、`tokens.json`、frontend 和训练时配置必须与 checkpoint 保持一致。
@@ -160,6 +185,16 @@ datasetA\datasetA\neg\*.wav
 
 该步骤会生成冻结 split、train-only augmentation 规划、ASR manifest、hotword 输入和
 训练审计信息。它不会上传音频、标签或权重。
+
+从 train parent labels 生成短语级 hotword 候选：
+
+```powershell
+python scripts/r12_asr_prepare_subphrase_hotwords.py `
+  --train-labels <PRIVATE_TRAIN_LABELS> `
+  --parent-ids <TRAIN_PARENT_IDS> `
+  --output-root <RUN_ROOT>\subphrase_hotwords `
+  --capacities 10,20,40
+```
 
 ## 6. 完整评估原则
 
