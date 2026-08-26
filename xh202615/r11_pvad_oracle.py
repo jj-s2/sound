@@ -11,7 +11,7 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -19,6 +19,7 @@ from sklearn.model_selection import StratifiedGroupKFold
 
 from .firered_pvad import PVAD_GATE_FEATURE_SCHEMA
 from .r10_selector import CandidateRow
+from .r12_personal_vad import PERSONAL_VAD_FEATURE_SCHEMA
 from .r11_gate_oracle import (
     GateModelSpec,
     GATE_FEATURE_SCHEMA,
@@ -252,6 +253,7 @@ class JoinedPvadRow:
     pvad: Mapping[str, float]
     e0: Mapping[str, float]
     source_digest: str
+    personal_vad: Mapping[str, float] = field(default_factory=dict)
 
 
 def join_pvad_e0_rows(
@@ -315,7 +317,24 @@ def join_pvad_e0_rows(
         _sha(row.source_digest, "canonical row source digest")
         full_e0 = dict(zip(GATE_FEATURE_SCHEMA, build_gate_feature_matrix([row])[0].tolist()))
         e0 = {name: full_e0[name] for name in E0_FITTING_FEATURE_SCHEMA}
-        joined.append(JoinedPvadRow(row.id, group, int(labels[row.id] is not None), cache[row.id], e0, row.source_digest))
+        personal_vad: dict[str, float] = {}
+        for name in PERSONAL_VAD_FEATURE_SCHEMA:
+            try:
+                value = float(row.audio_features.get(name, 0.0))
+            except (TypeError, ValueError):
+                value = 0.0
+            personal_vad[name] = value if math.isfinite(value) else 0.0
+        joined.append(
+            JoinedPvadRow(
+                row.id,
+                group,
+                int(labels[row.id] is not None),
+                cache[row.id],
+                e0,
+                row.source_digest,
+                personal_vad,
+            )
+        )
     return joined
 
 

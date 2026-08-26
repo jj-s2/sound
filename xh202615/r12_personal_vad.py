@@ -22,6 +22,17 @@ except ImportError:  # pragma: no cover - exercised only in minimal CPU installs
     F = None  # type: ignore[assignment]
 
 
+PERSONAL_VAD_FEATURE_SCHEMA = (
+    "target_speech_ratio",
+    "target_speech_max",
+    "target_longest_run_frames",
+    "target_longest_run_seconds",
+    "target_to_interferer_ratio",
+    "overlap_probability",
+    "non_target_speech_ratio",
+)
+
+
 @dataclass(frozen=True)
 class PersonalVADConfig:
     mel_bins: int = 80

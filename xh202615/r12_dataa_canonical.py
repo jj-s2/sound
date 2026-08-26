@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Mapping
 
 from .r12_dataa_augmentation import LineageRow, load_lineage
+from .r12_personal_vad import PERSONAL_VAD_FEATURE_SCHEMA
 
 
 @dataclass(frozen=True)
@@ -178,6 +179,7 @@ def build_augmented_canonical(
             "cmd_duration_sec": _finite(audio.get("cmd_duration_sec")),
             "cmd_rms": _finite(audio.get("cmd_rms")),
         }
+        features.update({name: _finite(audio.get(name)) for name in PERSONAL_VAD_FEATURE_SCHEMA})
         digest = _digest([sample_id, source.command_audio_sha256, r3_text, primary, energy, tse_text])
         output_rows.append({
             "id": sample_id, "split": source.role, "r3_text": r3_text,

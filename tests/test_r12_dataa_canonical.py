@@ -34,7 +34,20 @@ def _sources(root: Path, *, mismatch: bool = False) -> tuple[Path, dict[str, Pat
             elif name == "tse":
                 value["text"] = "TSE文本"
             elif name == "audio":
-                value.update({"presence_score": 0.2, "enhanced_cosine": 0.3, "mixture_cosine": 0.4, "max_cosine": 0.4, "latency_ms": 5.0})
+                value.update({
+                    "presence_score": 0.2,
+                    "enhanced_cosine": 0.3,
+                    "mixture_cosine": 0.4,
+                    "max_cosine": 0.4,
+                    "latency_ms": 5.0,
+                    "target_speech_ratio": 0.7,
+                    "target_speech_max": 0.9,
+                    "target_longest_run_frames": 20,
+                    "target_longest_run_seconds": 0.2,
+                    "target_to_interferer_ratio": 3.0,
+                    "overlap_probability": 0.1,
+                    "non_target_speech_ratio": 0.2,
+                })
             else:
                 value["recognition_text"] = "R3文本"
             values.append(value)
@@ -64,6 +77,7 @@ def test_canonical_has_exact_legacy_schema_and_raw_val_test(tmp_path: Path) -> N
     assert all(set(row) == {"id", "split", "r3_text", "primary_text", "energy_text", "tse_text", "audio_features", "source_digest"} for row in records)
     assert all("__aug_" not in row["id"] for row in records if row["split"] != "train")
     assert all("label" not in json.dumps(row, ensure_ascii=False).lower() for row in records)
+    assert all(row["audio_features"]["target_speech_ratio"] == 0.7 for row in records)
 
 
 def test_attestation_binds_original_source_audio_not_tse_enhanced_audio(tmp_path: Path) -> None:
