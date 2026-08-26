@@ -8,6 +8,7 @@ delegates to FunASR only after all local safeguards pass.
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -27,6 +28,16 @@ class TrainingConfig:
     device: str
     mode: TrainMode
     seed: int = 20260814
+    lora_rank: int = 8
+    lora_alpha: int = 16
+    lora_dropout: float = 0.05
+    learning_rate: float = 1e-4
+    max_epoch: int = 30
+    keep_nbest_models: int = 10
+    avg_nbest_model: int = 5
+    batch_size: int = 800
+    accum_grad: int = 8
+    num_workers: int = 2
 
 
 @dataclass(frozen=True)
@@ -67,6 +78,29 @@ def _validate_config(config: TrainingConfig) -> None:
         raise ValueError("model must be nonempty")
     if not config.device.startswith("cuda:"):
         raise ValueError("actual training requires an explicit cuda:N device")
+    for name in (
+        "lora_rank",
+        "lora_alpha",
+        "max_epoch",
+        "keep_nbest_models",
+        "avg_nbest_model",
+        "batch_size",
+        "accum_grad",
+        "num_workers",
+    ):
+        value = getattr(config, name)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+    if not isinstance(config.lora_dropout, (int, float)) or not math.isfinite(config.lora_dropout):
+        raise ValueError("lora_dropout must be finite")
+    if not 0.0 <= float(config.lora_dropout) < 1.0:
+        raise ValueError("lora_dropout must be in [0, 1)")
+    if not isinstance(config.learning_rate, (int, float)) or not math.isfinite(config.learning_rate):
+        raise ValueError("learning_rate must be finite")
+    if float(config.learning_rate) <= 0.0:
+        raise ValueError("learning_rate must be positive")
+    if config.avg_nbest_model > config.keep_nbest_models:
+        raise ValueError("avg_nbest_model cannot exceed keep_nbest_models")
     _validate_manifest(config.train_manifest)
     _validate_manifest(config.valid_manifest)
     if config.output_dir.exists():
@@ -88,7 +122,26 @@ def build_train_argv(config: TrainingConfig) -> tuple[str, ...]:
         f"dataset_conf.data_list_valid={config.valid_manifest}",
     ]
     if config.mode == "lora":
-        argv.extend(("lora_only=true", "decoder_conf.lora_list=[q,k,v,o]"))
+        argv.extend(
+            (
+                "lora_only=true",
+                "encoder_conf.lora_list=[q,k,v,o]",
+                "decoder_conf.lora_list=[q,k,v,o]",
+                f"encoder_conf.lora_rank={config.lora_rank}",
+                f"decoder_conf.lora_rank={config.lora_rank}",
+                f"encoder_conf.lora_alpha={config.lora_alpha}",
+                f"decoder_conf.lora_alpha={config.lora_alpha}",
+                f"encoder_conf.lora_dropout={config.lora_dropout}",
+                f"decoder_conf.lora_dropout={config.lora_dropout}",
+                f"optim_conf.lr={config.learning_rate}",
+                f"train_conf.max_epoch={config.max_epoch}",
+                f"train_conf.keep_nbest_models={config.keep_nbest_models}",
+                f"train_conf.avg_nbest_model={config.avg_nbest_model}",
+                f"dataset_conf.batch_size={config.batch_size}",
+                f"dataset_conf.num_workers={config.num_workers}",
+                f"accum_grad={config.accum_grad}",
+            )
+        )
     else:
         argv.append("freeze_param=encoder")
     return tuple(argv)

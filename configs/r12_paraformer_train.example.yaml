@@ -6,3 +6,13 @@ seed: 20260814
 train_manifest: <RUN_ROOT>/asr/private/train.jsonl
 valid_manifest: <RUN_ROOT>/asr/private/inner_valid.jsonl
 output_dir: <RUN_ROOT>/asr_train/fold0
+lora_rank: 8
+lora_alpha: 16
+lora_dropout: 0.05
+learning_rate: 0.0001
+max_epoch: 30
+keep_nbest_models: 10
+avg_nbest_model: 5
+batch_size: 800
+accum_grad: 8
+num_workers: 2
