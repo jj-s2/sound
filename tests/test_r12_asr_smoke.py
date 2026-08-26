@@ -7,6 +7,7 @@ import json
 import sys
 from typing import Iterator
 
+import numpy as np
 import pytest
 
 from xh202615.r12_asr_smoke import SmokeConfig, build_loader_kwargs, run_smoke
@@ -239,3 +240,37 @@ def test_funasr_asr_smart_cleanup_is_opt_in(monkeypatch: pytest.MonkeyPatch) -> 
     assert run_funasr_asr.parse_args().smart_cleanup is False
     monkeypatch.setattr(sys, "argv", ["run_funasr_asr.py", "--smart-cleanup"])
     assert run_funasr_asr.parse_args().smart_cleanup is True
+
+
+def test_funasr_asr_accepts_off_models_and_padding(monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import run_funasr_asr
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_funasr_asr.py",
+            "--vad-model",
+            "off",
+            "--punc-model",
+            "off",
+            "--pad-ms",
+            "160",
+        ],
+    )
+    args = run_funasr_asr.parse_args()
+    assert args.vad_model == "off"
+    assert args.punc_model == "off"
+    assert args.pad_ms == 160
+
+
+def test_funasr_pad_audio_adds_equal_zero_padding_at_16khz() -> None:
+    from scripts.run_funasr_asr import pad_audio
+
+    audio = np.asarray([0.25, -0.5], dtype=np.float32)
+    padded = pad_audio(audio, 16_000, 160)
+
+    assert padded.shape == (5122,)
+    assert np.array_equal(padded[:2560], np.zeros(2560, dtype=np.float32))
+    assert np.array_equal(padded[2560:-2560], audio)
+    assert np.array_equal(padded[-2560:], np.zeros(2560, dtype=np.float32))

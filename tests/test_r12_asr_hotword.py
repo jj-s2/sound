@@ -126,3 +126,44 @@ def test_cli_prepares_private_hotwords(tmp_path: Path) -> None:
     ]) == 0
     assert (output_root / "private" / "domain_hotwords.json").is_file()
     assert (output_root / "hotword_summary.json").is_file()
+
+
+def test_subphrase_candidates_rank_train_only_contiguous_phrases(tmp_path: Path) -> None:
+    from xh202615.r12_asr_hotword import prepare_subphrase_candidates
+
+    labels_path = _write_labels(
+        tmp_path,
+        {"a": "打开空调", "b": "打开空调", "c": "打开灯", "d": None},
+    )
+    result = prepare_subphrase_candidates(
+        labels_path, {"a", "b", "c", "d"}, tmp_path / "subphrases", capacities=(1, 3)
+    )
+
+    private = json.loads(result.private_hotwords.read_text(encoding="utf-8"))
+    assert private["1"] == "打开"
+    assert len(private["3"].split()) == 3
+    public = result.public_summary.read_text(encoding="utf-8")
+    assert "打开" not in public
+
+
+def test_subphrase_candidates_reject_capacity_larger_than_ranked_list(tmp_path: Path) -> None:
+    from xh202615.r12_asr_hotword import prepare_subphrase_candidates
+
+    labels_path = _write_labels(tmp_path, {"a": "打开", "b": None})
+    with pytest.raises(ValueError, match="exceeds ranked phrase count"):
+        prepare_subphrase_candidates(labels_path, {"a", "b"}, tmp_path / "subphrases", capacities=(2,))
+
+
+def test_cli_prepares_private_subphrase_hotwords(tmp_path: Path) -> None:
+    from scripts.r12_asr_prepare_subphrase_hotwords import main
+
+    labels_path = _write_labels(tmp_path, {"a": "打开空调", "b": "打开空调", "c": "打开灯"})
+    output_root = tmp_path / "subphrases"
+    assert main([
+        "--train-labels", str(labels_path),
+        "--parent-ids", "a,b,c",
+        "--output-root", str(output_root),
+        "--capacities", "1,2",
+    ]) == 0
+    assert (output_root / "private" / "domain_subphrase_hotwords.json").is_file()
+    assert (output_root / "hotword_summary.json").is_file()
