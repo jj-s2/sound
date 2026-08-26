@@ -114,36 +114,36 @@ def build_train_argv(config: TrainingConfig) -> tuple[str, ...]:
         sys.executable,
         "-m",
         "funasr.bin.train_ds",
-        f"model={config.model}",
-        f"device={config.device}",
-        f"output_dir={config.output_dir}",
-        f"seed={config.seed}",
-        f"dataset_conf.data_list={config.train_manifest}",
-        f"dataset_conf.data_list_valid={config.valid_manifest}",
+        f"+model={config.model}",
+        f"+device={config.device}",
+        f"+output_dir={config.output_dir}",
+        f"+seed={config.seed}",
+        f"+dataset_conf.data_list={config.train_manifest}",
+        f"+dataset_conf.data_list_valid={config.valid_manifest}",
     ]
     if config.mode == "lora":
         argv.extend(
             (
-                "lora_only=true",
-                "encoder_conf.lora_list=[q,k,v,o]",
-                "decoder_conf.lora_list=[q,k,v,o]",
-                f"encoder_conf.lora_rank={config.lora_rank}",
-                f"decoder_conf.lora_rank={config.lora_rank}",
-                f"encoder_conf.lora_alpha={config.lora_alpha}",
-                f"decoder_conf.lora_alpha={config.lora_alpha}",
-                f"encoder_conf.lora_dropout={config.lora_dropout}",
-                f"decoder_conf.lora_dropout={config.lora_dropout}",
-                f"optim_conf.lr={config.learning_rate}",
-                f"train_conf.max_epoch={config.max_epoch}",
-                f"train_conf.keep_nbest_models={config.keep_nbest_models}",
-                f"train_conf.avg_nbest_model={config.avg_nbest_model}",
-                f"dataset_conf.batch_size={config.batch_size}",
-                f"dataset_conf.num_workers={config.num_workers}",
-                f"accum_grad={config.accum_grad}",
+                "+lora_only=true",
+                "+encoder_conf.lora_list=[q,k,v,o]",
+                "+decoder_conf.lora_list=[q,k,v,o]",
+                f"+encoder_conf.lora_rank={config.lora_rank}",
+                f"+decoder_conf.lora_rank={config.lora_rank}",
+                f"+encoder_conf.lora_alpha={config.lora_alpha}",
+                f"+decoder_conf.lora_alpha={config.lora_alpha}",
+                f"+encoder_conf.lora_dropout={config.lora_dropout}",
+                f"+decoder_conf.lora_dropout={config.lora_dropout}",
+                f"+optim_conf.lr={config.learning_rate}",
+                f"+train_conf.max_epoch={config.max_epoch}",
+                f"+train_conf.keep_nbest_models={config.keep_nbest_models}",
+                f"+train_conf.avg_nbest_model={config.avg_nbest_model}",
+                f"+dataset_conf.batch_size={config.batch_size}",
+                f"+dataset_conf.num_workers={config.num_workers}",
+                f"+accum_grad={config.accum_grad}",
             )
         )
     else:
-        argv.append("freeze_param=encoder")
+        argv.append("+freeze_param=encoder")
     return tuple(argv)
 
 

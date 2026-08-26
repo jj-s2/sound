@@ -74,12 +74,25 @@ def test_training_rejects_internal_test_audio_source_before_runner(tmp_path: Pat
 def test_train_argv_is_lora_only_and_contains_no_vad_or_punctuation(tmp_path: Path) -> None:
     from xh202615.r12_asr_train import build_train_argv
 
-    rendered = " ".join(build_train_argv(_config(tmp_path)))
+    argv = build_train_argv(_config(tmp_path))
+    rendered = " ".join(argv)
 
-    assert "lora_only=true" in rendered
+    assert "+lora_only=true" in rendered
     assert "decoder_conf.lora_list=[q,k,v,o]" in rendered
     assert "vad" not in rendered.lower()
     assert "punc" not in rendered.lower()
+
+
+def test_train_argv_uses_hydra_append_overrides_for_configless_train_ds(tmp_path: Path) -> None:
+    from xh202615.r12_asr_train import build_train_argv
+
+    argv = build_train_argv(_config(tmp_path))
+
+    assert "+model=paraformer-zh" in argv
+    assert "+device=cuda:0" in argv
+    assert any(item.startswith("+dataset_conf.data_list=") for item in argv)
+    assert any(item.startswith("+dataset_conf.data_list_valid=") for item in argv)
+    assert "+lora_only=true" in argv
 
 
 def test_lora_argv_exposes_bounded_encoder_decoder_recipe(tmp_path: Path) -> None:
@@ -129,8 +142,8 @@ def test_freeze_mode_passes_encoder_freeze_param(tmp_path: Path) -> None:
 
     argv = build_train_argv(_config(tmp_path, mode="freeze_encoder"))
 
-    assert "freeze_param=encoder" in argv
-    assert not any(item == "lora_only=true" for item in argv)
+    assert "+freeze_param=encoder" in argv
+    assert not any(item == "+lora_only=true" for item in argv)
 
 
 def test_existing_output_directory_is_rejected_before_runner(tmp_path: Path) -> None:
