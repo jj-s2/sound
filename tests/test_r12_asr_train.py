@@ -1,0 +1,232 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+
+def _manifest(path: Path, *, key: str = "p", source: str = "private/audio.wav") -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "key": key,
+                "source": source,
+                "target": "开灯",
+                "parent_id": "p",
+                "augmentation_id": "original",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _config(tmp_path: Path, **overrides: object):
+    from xh202615.r12_asr_train import TrainingConfig
+
+    values: dict[str, object] = {
+        "train_manifest": _manifest(tmp_path / "train.jsonl"),
+        "valid_manifest": _manifest(tmp_path / "valid.jsonl", key="v"),
+        "output_dir": tmp_path / "run",
+        "model": "paraformer-zh",
+        "device": "cuda:0",
+        "mode": "lora",
+    }
+    values.update(overrides)
+    return TrainingConfig(**values)
+
+
+def test_dry_run_returns_train_ds_command_without_running_funasr(tmp_path: Path) -> None:
+    from xh202615.r12_asr_train import run_training
+
+    result = run_training(_config(tmp_path), dry_run=True)
+
+    assert result.executed is False
+    assert result.argv[1:3] == ("-m", "funasr.bin.train_ds")
+    assert not (tmp_path / "run").exists()
+
+
+def test_training_rejects_internal_test_path_before_runner(tmp_path: Path) -> None:
+    from xh202615.r12_asr_train import run_training
+
+    def fail_if_called(_: tuple[str, ...]) -> int:
+        raise AssertionError("runner must not be called")
+
+    with pytest.raises(ValueError, match="internal-test"):
+        run_training(
+            _config(tmp_path, train_manifest=_manifest(tmp_path / "internal_test.jsonl")),
+            runner=fail_if_called,
+        )
+
+
+def test_training_rejects_internal_test_audio_source_before_runner(tmp_path: Path) -> None:
+    from xh202615.r12_asr_train import run_training
+
+    config = _config(tmp_path)
+    _manifest(config.train_manifest, source="private/internal_test/p.wav")
+    with pytest.raises(ValueError, match="internal-test"):
+        run_training(config, dry_run=True)
+
+
+def test_train_argv_is_lora_only_and_contains_no_vad_or_punctuation(tmp_path: Path) -> None:
+    from xh202615.r12_asr_train import build_train_argv
+
+    argv = build_train_argv(_config(tmp_path))
+    rendered = " ".join(argv)
+
+    assert "+lora_only=true" in rendered
+    assert "decoder_conf.lora_list=[q,k,v,o]" in rendered
+    assert "vad" not in rendered.lower()
+    assert "punc" not in rendered.lower()
+
+
+def test_train_argv_uses_hydra_append_overrides_for_configless_train_ds(tmp_path: Path) -> None:
+    from xh202615.r12_asr_train import build_train_argv
+
+    argv = build_train_argv(_config(tmp_path))
+
+    assert "+model=paraformer-zh" in argv
+    assert "+device=cuda:0" in argv
+    assert any(item.startswith("+train_data_set_list=") for item in argv)
+    assert any(item.startswith("+valid_data_set_list=") for item in argv)
+    assert "+lora_only=true" in argv
+
+
+def test_lora_argv_exposes_bounded_encoder_decoder_recipe(tmp_path: Path) -> None:
+    from xh202615.r12_asr_train import build_train_argv
+
+    rendered = " ".join(build_train_argv(_config(tmp_path)))
+
+    assert "encoder_conf.lora_list=[q,k,v,o]" in rendered
+    assert "decoder_conf.lora_list=[q,k,v,o]" in rendered
+    assert "encoder_conf.lora_rank=8" in rendered
+    assert "decoder_conf.lora_rank=8" in rendered
+    assert "encoder_conf.lora_alpha=16" in rendered
+    assert "decoder_conf.lora_alpha=16" in rendered
+    assert "encoder_conf.lora_dropout=0.05" in rendered
+    assert "decoder_conf.lora_dropout=0.05" in rendered
+    assert "optim_conf.lr=0.0001" in rendered
+    assert "train_conf.max_epoch=30" in rendered
+    assert "train_conf.keep_nbest_models=10" in rendered
+    assert "train_conf.avg_nbest_model=5" in rendered
+    assert "dataset_conf.batch_size=4" in rendered
+    assert "dataset_conf.num_workers=0" in rendered
+    assert "+train_conf.accum_grad=32" in rendered
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("lora_rank", 0, "lora_rank"),
+        ("lora_alpha", 0, "lora_alpha"),
+        ("lora_dropout", 1.0, "lora_dropout"),
+        ("learning_rate", 0.0, "learning_rate"),
+        ("batch_size", 0, "batch_size"),
+        ("accum_grad", 0, "accum_grad"),
+    ],
+)
+def test_lora_recipe_rejects_invalid_resource_values(
+    tmp_path: Path, field: str, value: object, message: str
+) -> None:
+    from xh202615.r12_asr_train import build_train_argv
+
+    with pytest.raises(ValueError, match=message):
+        build_train_argv(_config(tmp_path, **{field: value}))
+
+
+def test_freeze_mode_passes_encoder_freeze_param(tmp_path: Path) -> None:
+    from xh202615.r12_asr_train import build_train_argv
+
+    argv = build_train_argv(_config(tmp_path, mode="freeze_encoder"))
+
+    assert "+freeze_param=encoder" in argv
+    assert not any(item == "+lora_only=true" for item in argv)
+
+
+def test_existing_output_directory_is_rejected_before_runner(tmp_path: Path) -> None:
+    from xh202615.r12_asr_train import run_training
+
+    output = tmp_path / "run"
+    output.mkdir()
+    with pytest.raises(ValueError, match="output directory already exists"):
+        run_training(_config(tmp_path, output_dir=output), runner=lambda _: 0)
+
+
+def test_training_runs_from_augmented_source_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from xh202615.r12_asr_train import TrainingConfig, run_training
+
+    run_root = tmp_path / "run"
+    private = run_root / "asr" / "private"
+    private.mkdir(parents=True)
+    train_manifest = _manifest(private / "train.jsonl")
+    valid_manifest = _manifest(private / "valid.jsonl", key="v")
+    augmented = run_root / "augmented"
+    augmented.mkdir()
+    seen: dict[str, object] = {}
+
+    def fake_run(argv: tuple[str, ...], *, check: bool, cwd: str) -> SimpleNamespace:
+        seen["argv"] = argv
+        seen["check"] = check
+        seen["cwd"] = cwd
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("xh202615.r12_asr_train.subprocess.run", fake_run)
+    result = run_training(
+        TrainingConfig(
+            train_manifest=train_manifest,
+            valid_manifest=valid_manifest,
+            output_dir=run_root / "asr_train" / "fold0",
+            model="paraformer-zh",
+            device="cuda:0",
+            mode="lora",
+        )
+    )
+
+    assert result.return_code == 0
+    assert seen["check"] is False
+    assert Path(seen["cwd"]) == augmented
+
+
+def test_cli_exposes_memory_safe_training_controls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from scripts import r12_asr_train as cli
+    from xh202615.r12_asr_train import TrainingResult
+
+    train_manifest = _manifest(tmp_path / "train.jsonl")
+    valid_manifest = _manifest(tmp_path / "valid.jsonl", key="v")
+    captured: dict[str, object] = {}
+
+    def fake_run(config: object, *, dry_run: bool) -> TrainingResult:
+        captured["config"] = config
+        captured["dry_run"] = dry_run
+        return TrainingResult(argv=(), executed=False, return_code=None)
+
+    monkeypatch.setattr(cli, "run_training", fake_run)
+    result = cli.main(
+        [
+            "train",
+            "--train-manifest",
+            str(train_manifest),
+            "--valid-manifest",
+            str(valid_manifest),
+            "--output-dir",
+            str(tmp_path / "run"),
+            "--batch-size",
+            "200",
+            "--accum-grad",
+            "32",
+            "--num-workers",
+            "0",
+        ]
+    )
+
+    config = captured["config"]
+    assert result == 0
+    assert captured["dry_run"] is True
+    assert config.batch_size == 200
+    assert config.accum_grad == 32
+    assert config.num_workers == 0

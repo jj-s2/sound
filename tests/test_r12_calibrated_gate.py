@@ -6,6 +6,7 @@ import hashlib
 import inspect
 import json
 import math
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -19,6 +20,7 @@ from xh202615.r11_pvad_oracle import (
     JoinedPvadRow,
     join_pvad_e0_rows,
 )
+from xh202615.r12_personal_vad import PERSONAL_VAD_FEATURE_SCHEMA
 
 
 SEED = 20260812
@@ -205,7 +207,11 @@ class TestTrainCalibration:
 
         joined_train, _, _, _ = split_fixture
         trained = fit_train_calibrated_gate(joined_train, seed=SEED)
-        expected_schema = (*PVAD_FITTING_FEATURE_SCHEMA, *E0_FITTING_FEATURE_SCHEMA)
+        expected_schema = (
+            *PVAD_FITTING_FEATURE_SCHEMA,
+            *E0_FITTING_FEATURE_SCHEMA,
+            *PERSONAL_VAD_FEATURE_SCHEMA,
+        )
         assert trained.feature_schema == expected_schema
         expected_digest = hashlib.sha256(
             (r"\n".join(expected_schema) + r"\n").encode("utf-8")
@@ -230,6 +236,21 @@ class TestTrainCalibration:
                 JoinedPvadRow(row.id, row.group, row.target_present, pvad, row.e0, row.source_digest)
             )
         mutated_matrix = _build_matrix(mutated, trained.feature_schema)
+        assert mutated_matrix.shape == base_matrix.shape
+        assert not np.allclose(mutated_matrix, base_matrix)
+
+    def test_personal_vad_feature_changes_fused_fitting_matrix(self, split_fixture):
+        from xh202615.r12_calibrated_gate import _build_matrix, fit_train_calibrated_gate
+
+        joined_train, _, _, _ = split_fixture
+        trained = fit_train_calibrated_gate(joined_train, seed=SEED)
+        base_matrix = _build_matrix(joined_train, trained.feature_schema)
+        personal = dict(joined_train[0].personal_vad)
+        personal["target_speech_ratio"] = 0.91
+        mutated = [replace(joined_train[0], personal_vad=personal), *joined_train[1:]]
+
+        mutated_matrix = _build_matrix(mutated, trained.feature_schema)
+
         assert mutated_matrix.shape == base_matrix.shape
         assert not np.allclose(mutated_matrix, base_matrix)
 

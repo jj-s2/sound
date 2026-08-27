@@ -89,6 +89,17 @@ def test_fresh_publication_writes_exact_names_and_contents(tmp_path: Path) -> No
     assert {name: path.read_text(encoding="utf-8") for name, path in paths.items()} == contents
 
 
+def test_publication_preserves_utf8_lf_bytes(tmp_path: Path) -> None:
+    """Package digests must be stable on Windows as well as POSIX."""
+    output_root = tmp_path / "out"
+    contents = package("line-endings")
+
+    paths = publish_text_package(output_root, CONTRACT, contents)
+
+    for name, text in contents.items():
+        assert paths[name].read_bytes() == text.encode("utf-8")
+
+
 def test_foreign_root_is_preserved(tmp_path: Path) -> None:
     output_root = tmp_path / "out"
     output_root.mkdir()

@@ -324,7 +324,10 @@ def publish_text_package(
             parent, output_root.name + ".staging"
         )
         for name, text in prepared.items():
-            (staging / name).write_text(text, encoding="utf-8")
+            # Keep package bytes identical to the UTF-8 text used by callers
+            # for content digests.  ``write_text`` translates LF to CRLF on
+            # Windows, which would otherwise make manifest digests unverifiable.
+            (staging / name).write_bytes(text.encode("utf-8"))
         staged_package = _package_bytes(staging, contract)
         if staged_package is None:
             raise ValueError("staged package does not satisfy its artifact contract")

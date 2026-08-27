@@ -19,6 +19,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import soundfile as sf
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -57,8 +60,19 @@ def parse_args():
     parser.add_argument("--resume", action="store_true", help="Append and skip ids already present in output")
     parser.add_argument("--device", default="cpu", help='FunASR device, e.g. "cpu" or "cuda:0"')
     parser.add_argument("--model", default="paraformer-zh")
+    parser.add_argument(
+        "--init-param",
+        default=None,
+        help="Optional local FunASR training checkpoint loaded into the model defined by --model",
+    )
+    parser.add_argument(
+        "--smart-cleanup",
+        action="store_true",
+        help="Enable conservative CJK spacing/repetition cleanup (opt-in)",
+    )
     parser.add_argument("--vad-model", default="fsmn-vad")
     parser.add_argument("--punc-model", default="ct-punc")
+    parser.add_argument("--pad-ms", type=int, default=0, help="Symmetric zero padding before ASR")
     parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True to AutoModel")
     parser.add_argument("--batch-size-s", type=int, default=300)
     parser.add_argument("--hotword", default=None, help="Optional FunASR hotword string")
@@ -79,6 +93,21 @@ def parse_args():
         help="Write empty text on per-sample errors, or stop immediately",
     )
     return parser.parse_args()
+
+
+def pad_audio(audio: np.ndarray, rate: int, pad_ms: int) -> np.ndarray:
+    """Return mono audio with symmetric zero padding for short commands."""
+    if rate <= 0:
+        raise ValueError("sample rate must be positive")
+    if isinstance(pad_ms, bool) or not isinstance(pad_ms, int) or pad_ms < 0:
+        raise ValueError("pad_ms must be a non-negative integer")
+    array = np.asarray(audio, dtype=np.float32)
+    if array.ndim != 1 or array.size == 0 or not np.isfinite(array).all():
+        raise ValueError("audio must be a non-empty finite mono array")
+    samples = int(round(rate * pad_ms / 1000.0))
+    if samples == 0:
+        return np.ascontiguousarray(array)
+    return np.pad(array, (samples, samples), mode="constant")
 
 
 def parse_bool(value: str) -> bool:
@@ -151,6 +180,11 @@ def make_model(args):
         "device": args.device,
         "disable_update": True,
     }
+    if args.init_param:
+        checkpoint = Path(args.init_param)
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"ASR init checkpoint does not exist: {checkpoint}")
+        kwargs["init_param"] = str(checkpoint)
     if args.vad_model and args.vad_model.lower() not in {"none", "null", "off"}:
         kwargs["vad_model"] = args.vad_model
     if args.punc_model and args.punc_model.lower() not in {"none", "null", "off"}:
@@ -178,7 +212,11 @@ def extract_text(result: Any) -> str:
 
 def transcribe_one(model, audio_path: Path, args) -> tuple[str, float]:
     start = time.perf_counter()
-    kwargs = {"input": str(audio_path), "batch_size_s": args.batch_size_s}
+    input_value: str | np.ndarray = str(audio_path)
+    if args.pad_ms:
+        waveform, rate = sf.read(audio_path, dtype="float32", always_2d=True)
+        input_value = pad_audio(np.mean(waveform, axis=1, dtype=np.float32), rate, args.pad_ms)
+    kwargs = {"input": input_value, "batch_size_s": args.batch_size_s}
     hotword = args.hotword or ""
     if args.hotword_preset == "assistant":
         hotword = (hotword + " " + ASSISTANT_HOTWORD).strip()
@@ -194,7 +232,7 @@ def transcribe_one(model, audio_path: Path, args) -> tuple[str, float]:
         kwargs["merge_length_s"] = args.merge_length_s
     result = model.generate(**kwargs)
     latency_ms = (time.perf_counter() - start) * 1000
-    return clean_asr_text(extract_text(result)), latency_ms
+    return clean_asr_text(extract_text(result), smart_cleanup=args.smart_cleanup), latency_ms
 
 
 def main() -> None:

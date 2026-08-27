@@ -15,6 +15,7 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from .metrics import cer_stats
 from .r10_selector import CandidateRow
 from .r11_pvad_oracle import JoinedPvadRow
+from .r12_personal_vad import PERSONAL_VAD_FEATURE_SCHEMA
 
 
 ROUTER_ACTIONS = ("primary", "r3", "tse", "energy")
@@ -87,9 +88,15 @@ def _features(row: CandidateRow, joined: JoinedPvadRow, action: str) -> dict[str
         "candidate_length_from_mean": float(abs(len(text) - np.mean(lengths))),
         "candidate_length_range": float(max(lengths) - min(lengths)),
     }
-    for prefix, mapping in (("pvad", joined.pvad), ("e0", joined.e0)):
+    for prefix, mapping in (
+        ("pvad", joined.pvad),
+        ("e0", joined.e0),
+        ("personal", joined.personal_vad),
+    ):
         for name in sorted(mapping):
             features[f"{prefix}_{name}"] = _finite(mapping[name])
+    for name in PERSONAL_VAD_FEATURE_SCHEMA:
+        features.setdefault(f"personal_{name}", _finite(joined.personal_vad.get(name)))
     return features
 
 

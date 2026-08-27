@@ -22,6 +22,7 @@ import numpy as np
 from .data import Sample
 from .evaluation import evaluate_rows
 from .metrics import cer_stats, is_rejection
+from .r12_personal_vad import PERSONAL_VAD_FEATURE_SCHEMA
 from .text import normalize_text
 
 try:
@@ -207,6 +208,8 @@ def load_candidate_bundle(
         audio_features["cmd_duration_sec"] = duration
         # RMS is omitted from cached features to keep loading fast; missing flag handles it.
         audio_features["cmd_rms"] = math.nan
+        for name in PERSONAL_VAD_FEATURE_SCHEMA:
+            audio_features[name] = _finite_or_nan(audio.get(name))
 
         # Deduplicate candidate texts while remembering source identities.
         text_to_sources: dict[str, list[str]] = defaultdict(list)

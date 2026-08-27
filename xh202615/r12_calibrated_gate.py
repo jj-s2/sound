@@ -27,6 +27,7 @@ from .r11_pvad_oracle import (
     JoinedPvadRow,
     canonical_json,
 )
+from .r12_personal_vad import PERSONAL_VAD_FEATURE_SCHEMA
 
 
 BASE_MODELS = (
@@ -42,7 +43,11 @@ _RAW_RR_FLOOR = 0.95
 _BOOTSTRAP_RR_FLOOR = 0.93
 _N_SPLITS = 3
 
-FITTING_FEATURE_SCHEMA = (*PVAD_FITTING_FEATURE_SCHEMA, *E0_FITTING_FEATURE_SCHEMA)
+FITTING_FEATURE_SCHEMA = (
+    *PVAD_FITTING_FEATURE_SCHEMA,
+    *E0_FITTING_FEATURE_SCHEMA,
+    *PERSONAL_VAD_FEATURE_SCHEMA,
+)
 
 
 class BootstrapFeasibilityError(ValueError):
@@ -87,12 +92,20 @@ def _parameters_digest(specs: Sequence[GateModelSpec]) -> str:
 
 
 _PVAD_FEATURE_SET = set(PVAD_FITTING_FEATURE_SCHEMA)
+_PERSONAL_FEATURE_SET = set(PERSONAL_VAD_FEATURE_SCHEMA)
 
 
 def _build_matrix(rows: Sequence[JoinedPvadRow], schema: Sequence[str]) -> np.ndarray:
     return np.asarray(
         [
-            [row.pvad[name] if name in _PVAD_FEATURE_SET else row.e0[name] for name in schema]
+            [
+                row.pvad[name]
+                if name in _PVAD_FEATURE_SET
+                else row.personal_vad.get(name, 0.0)
+                if name in _PERSONAL_FEATURE_SET
+                else row.e0[name]
+                for name in schema
+            ]
             for row in rows
         ],
         dtype=np.float64,
@@ -248,7 +261,7 @@ def fit_train_calibrated_gate(
     if len(joined_train) == 0:
         raise ValueError("at least one joined training row is required")
 
-    feature_schema = (*PVAD_FITTING_FEATURE_SCHEMA, *E0_FITTING_FEATURE_SCHEMA)
+    feature_schema = FITTING_FEATURE_SCHEMA
     X_train = _build_matrix(joined_train, feature_schema)
     target = np.asarray([row.target_present for row in joined_train], dtype=np.int64)
     groups = [row.group for row in joined_train]
